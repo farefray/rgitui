@@ -12,6 +12,7 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{GitProject, GitProjectEvent, StashEntry};
+use rgitui_i18n::t;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
     Badge, ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, Label, LabelSize,
@@ -124,15 +125,7 @@ impl StashesPanel {
         };
         ws.update(cx, |ws, cx| {
             ws.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                cd.show_visible(
-                    "Drop Stash",
-                    format!(
-                        "Are you sure you want to drop stash@{{{}}}? This cannot be undone.",
-                        index
-                    ),
-                    crate::ConfirmAction::StashDrop(index),
-                    cx,
-                );
+                cd.show_visible(crate::ConfirmAction::StashDrop(index), cx);
             });
         });
     }
@@ -153,6 +146,7 @@ impl StashesPanel {
 impl Render for StashesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.colors().clone();
+
         let panel_bg = colors.panel_background;
         let stashes = self.stashes.clone();
 
@@ -179,6 +173,7 @@ impl Render for StashesPanel {
 impl StashesPanel {
     fn render_toolbar(&self, cx: &mut Context<Self>, empty: bool) -> gpui::AnyElement {
         let colors = cx.colors();
+
         let count: SharedString = format!("{}", self.stashes.len()).into();
 
         div()
@@ -198,7 +193,7 @@ impl StashesPanel {
                     .color(Color::Accent),
             )
             .child(
-                Label::new("Stashes")
+                Label::new(t!("common.stashes"))
                     .size(LabelSize::Small)
                     .weight(gpui::FontWeight::SEMIBOLD)
                     .color(Color::Default),
@@ -218,6 +213,7 @@ impl StashesPanel {
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = cx.colors();
+
         div()
             .flex_1()
             .flex()
@@ -238,13 +234,13 @@ impl StashesPanel {
                             .color(Color::Placeholder),
                     )
                     .child(
-                        Label::new("No stashes")
+                        Label::new(t!("common.no_stashes"))
                             .size(LabelSize::Small)
                             .weight(gpui::FontWeight::SEMIBOLD)
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new("Use the toolbar to stash changes")
+                        Label::new(t!("stashes.empty_hint"))
                             .size(LabelSize::XSmall)
                             .color(Color::Placeholder),
                     ),
@@ -331,7 +327,7 @@ impl StashesPanel {
                                 .size(btn_size)
                                 .style(btn_style)
                                 .color(Color::Success)
-                                .tooltip("Apply stash (keep)")
+                                .tooltip(t!("stashes.apply_keep.tooltip"))
                                 .on_click(
                                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                                         let _ = w.update(cx, |this: &mut StashesPanel, cx| {
@@ -353,7 +349,7 @@ impl StashesPanel {
                                 .size(btn_size)
                                 .style(btn_style)
                                 .color(Color::Accent)
-                                .tooltip("Pop stash (remove)")
+                                .tooltip(t!("stashes.pop_remove.tooltip"))
                                 .on_click(
                                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                                         let _ = w.update(cx, |this: &mut StashesPanel, cx| {
@@ -375,7 +371,7 @@ impl StashesPanel {
                                 .size(btn_size)
                                 .style(btn_style)
                                 .color(Color::Default)
-                                .tooltip("Create branch from stash")
+                                .tooltip(t!("common.stash_branch.tooltip"))
                                 .on_click(
                                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                                         let _ = w.update(cx, |this: &mut StashesPanel, cx| {
@@ -397,7 +393,7 @@ impl StashesPanel {
                                 .size(btn_size)
                                 .style(btn_style)
                                 .color(Color::Error)
-                                .tooltip("Drop stash")
+                                .tooltip(t!("common.drop_stash.tooltip"))
                                 .on_click(
                                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                                         let _ = w.update(cx, |this: &mut StashesPanel, cx| {

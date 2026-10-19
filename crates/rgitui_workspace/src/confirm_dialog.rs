@@ -1,5 +1,7 @@
 use gpui::prelude::*;
 use gpui::{div, px, ClickEvent, Context, EventEmitter, FocusHandle, Render, SharedString, Window};
+use rgitui_git::RepoState;
+use rgitui_i18n::t;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{Button, ButtonSize, ButtonStyle, Icon, IconName, IconSize, Label, LabelSize};
 
@@ -20,7 +22,8 @@ pub enum ConfirmAction {
     ResetHard(String),
     ResetSoft(String),
     ResetMixed(String),
-    AbortMerge,
+    /// Abort the merge, rebase or other operation the repository is in.
+    AbortOperation(RepoState),
     WorktreeRemove(String),
 }
 
@@ -31,11 +34,10 @@ pub enum ConfirmDialogEvent {
     Cancelled,
 }
 
-/// A modal confirmation dialog for destructive operations.
+/// A modal confirmation dialog for destructive operations. Its title and
+/// warning come from the action and are translated when drawn.
 pub struct ConfirmDialog {
     visible: bool,
-    title: String,
-    message: String,
     action: Option<ConfirmAction>,
     focus_handle: FocusHandle,
     pending_focus: bool,
@@ -47,41 +49,14 @@ impl ConfirmDialog {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             visible: false,
-            title: String::new(),
-            message: String::new(),
             action: None,
             focus_handle: cx.focus_handle(),
             pending_focus: false,
         }
     }
 
-    /// Show the dialog with the given title, message, and action to confirm.
-    pub fn show(
-        &mut self,
-        title: impl Into<String>,
-        message: impl Into<String>,
-        action: ConfirmAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.title = title.into();
-        self.message = message.into();
-        self.action = Some(action);
-        self.visible = true;
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    /// Show the dialog without focusing (for contexts where Window is unavailable).
-    pub fn show_visible(
-        &mut self,
-        title: impl Into<String>,
-        message: impl Into<String>,
-        action: ConfirmAction,
-        cx: &mut Context<Self>,
-    ) {
-        self.title = title.into();
-        self.message = message.into();
+    /// Ask to confirm `action`. Focus moves to the dialog on its next draw.
+    pub fn show_visible(&mut self, action: ConfirmAction, cx: &mut Context<Self>) {
         self.action = Some(action);
         self.visible = true;
         self.pending_focus = true;
@@ -128,7 +103,7 @@ impl ConfirmDialog {
                     | ConfirmAction::RemoveRemote(_)
                     | ConfirmAction::StashDrop(_)
                     | ConfirmAction::ResetHard(_)
-                    | ConfirmAction::AbortMerge
+                    | ConfirmAction::AbortOperation(_)
                     | ConfirmAction::WorktreeRemove(_)
             )
         )
@@ -150,22 +125,110 @@ impl ConfirmDialog {
         }
     }
 
-    fn confirm_label(&self) -> &'static str {
-        match &self.action {
-            Some(ConfirmAction::DiscardFile(_) | ConfirmAction::DiscardAll) => "Discard",
-            Some(ConfirmAction::CleanUntracked) => "Clean",
-            Some(ConfirmAction::BranchDelete(_)) => "Delete Branch",
-            Some(ConfirmAction::TagDelete(_)) => "Delete Tag",
-            Some(ConfirmAction::RemoveRemote(_)) => "Remove",
-            Some(ConfirmAction::StashDrop(_)) => "Drop Stash",
-            Some(ConfirmAction::ResetHard(_)) => "Reset",
-            Some(ConfirmAction::ResetSoft(_)) => "Reset",
-            Some(ConfirmAction::ResetMixed(_)) => "Reset",
-            Some(ConfirmAction::AbortMerge) => "Abort",
-            Some(ConfirmAction::ForcePush) => "Force Push",
-            Some(ConfirmAction::WorktreeRemove(_)) => "Remove Worktree",
-            None => "Confirm",
+    /// The confirm button's label for `action`, in the active language.
+    fn confirm_label(action: &Option<ConfirmAction>) -> SharedString {
+        match action {
+            Some(ConfirmAction::DiscardFile(_) | ConfirmAction::DiscardAll) => {
+                t!("confirm.discard")
+            }
+            Some(ConfirmAction::CleanUntracked) => t!("confirm.clean"),
+            Some(ConfirmAction::BranchDelete(_)) => t!("confirm.delete_branch"),
+            Some(ConfirmAction::TagDelete(_)) => t!("confirm.delete_tag"),
+            Some(ConfirmAction::RemoveRemote(_)) => t!("confirm.remove"),
+            Some(ConfirmAction::StashDrop(_)) => t!("confirm.drop_stash"),
+            Some(ConfirmAction::ResetHard(_)) => t!("confirm.reset"),
+            Some(ConfirmAction::ResetSoft(_)) => t!("confirm.reset"),
+            Some(ConfirmAction::ResetMixed(_)) => t!("confirm.reset"),
+            Some(ConfirmAction::AbortOperation(_)) => t!("common.abort"),
+            Some(ConfirmAction::ForcePush) => t!("confirm.force_push"),
+            Some(ConfirmAction::WorktreeRemove(_)) => t!("confirm.remove_worktree"),
+            None => t!("confirm.confirm"),
         }
+    }
+
+    /// The title and warning for `action`, in the active language.
+    fn text(action: &ConfirmAction) -> (SharedString, SharedString) {
+        match action {
+            ConfirmAction::DiscardFile(path) => (
+                t!("confirm.title.discard_file"),
+                t!("confirm.body.discard_file", path = path),
+            ),
+            ConfirmAction::DiscardAll => (
+                t!("confirm.title.discard_all"),
+                t!("confirm.body.discard_all"),
+            ),
+            ConfirmAction::CleanUntracked => (
+                t!("confirm.title.clean_untracked"),
+                t!("confirm.body.clean_untracked"),
+            ),
+            ConfirmAction::ForcePush => (
+                t!("confirm.title.force_push"),
+                t!("confirm.body.force_push"),
+            ),
+            ConfirmAction::StashDrop(index) => (
+                t!("confirm.title.drop_stash"),
+                t!(
+                    "confirm.body.drop_stash",
+                    stash = format!("stash@{{{index}}}")
+                ),
+            ),
+            ConfirmAction::BranchDelete(name) => (
+                t!("confirm.title.delete_branch"),
+                t!("confirm.body.delete_branch", branch = name),
+            ),
+            ConfirmAction::TagDelete(name) => (
+                t!("confirm.title.delete_tag"),
+                t!("confirm.body.delete_tag", tag = name),
+            ),
+            ConfirmAction::RemoveRemote(name) => (
+                t!("confirm.title.remove_remote"),
+                t!("confirm.body.remove_remote", remote = name),
+            ),
+            ConfirmAction::ResetHard(target) if target == "HEAD" => (
+                t!("confirm.title.reset_hard"),
+                t!("confirm.body.reset_hard_head"),
+            ),
+            ConfirmAction::ResetHard(target) => (
+                t!("confirm.title.reset_hard"),
+                t!("confirm.body.reset_hard", commit = short_target(target)),
+            ),
+            ConfirmAction::ResetSoft(target) => (
+                t!("confirm.title.reset_soft"),
+                t!("confirm.body.reset_soft", commit = short_target(target)),
+            ),
+            ConfirmAction::ResetMixed(target) => (
+                t!("confirm.title.reset_mixed"),
+                t!("confirm.body.reset_mixed", commit = short_target(target)),
+            ),
+            ConfirmAction::AbortOperation(state) => (abort_title(*state), t!("confirm.body.abort")),
+            ConfirmAction::WorktreeRemove(path) => (
+                t!("confirm.title.remove_worktree"),
+                t!("confirm.body.remove_worktree", path = path),
+            ),
+        }
+    }
+}
+
+/// A commit id cut to the seven characters the graph shows.
+fn short_target(target: &str) -> &str {
+    target.get(..7).unwrap_or(target)
+}
+
+fn abort_title(state: RepoState) -> SharedString {
+    match state {
+        RepoState::Merge => t!("confirm.title.abort_merge"),
+        RepoState::Rebase | RepoState::RebaseInteractive | RepoState::RebaseMerge => {
+            t!("confirm.title.abort_rebase")
+        }
+        RepoState::CherryPick | RepoState::CherryPickSequence => {
+            t!("confirm.title.abort_cherry_pick")
+        }
+        RepoState::Revert | RepoState::RevertSequence => t!("confirm.title.abort_revert"),
+        RepoState::Bisect => t!("confirm.title.abort_bisect"),
+        RepoState::ApplyMailbox | RepoState::ApplyMailboxOrRebase => {
+            t!("confirm.title.abort_apply")
+        }
+        RepoState::Clean => t!("confirm.title.abort"),
     }
 }
 
@@ -181,11 +244,10 @@ impl Render for ConfirmDialog {
         }
 
         let colors = cx.colors().clone();
-        let title: SharedString = self.title.clone().into();
-        let message: SharedString = self.message.clone().into();
+        let (title, message) = self.action.as_ref().map(Self::text).unwrap_or_default();
         let icon = self.severity_icon();
         let color = self.severity_color();
-        let confirm_label = self.confirm_label();
+        let confirm_label = Self::confirm_label(&self.action);
         let is_destructive = self.is_destructive();
 
         let icon_bg = color.color(cx);
@@ -268,7 +330,7 @@ impl Render for ConfirmDialog {
                             .w_full()
                             .gap_2()
                             .child(
-                                Label::new("Enter to confirm | Esc to cancel")
+                                Label::new(t!("common.confirm_hint"))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Placeholder),
                             )
@@ -280,7 +342,7 @@ impl Render for ConfirmDialog {
                                     .justify_end()
                                     .w_full()
                                     .child(
-                                        Button::new("confirm-cancel", "Cancel")
+                                        Button::new("confirm-cancel", t!("common.cancel"))
                                             .size(ButtonSize::Default)
                                             .style(ButtonStyle::Subtle)
                                             .on_click(cx.listener(
@@ -332,7 +394,7 @@ mod tests {
             ConfirmAction::ResetHard("HEAD~1".into()),
             ConfirmAction::ResetSoft("HEAD~1".into()),
             ConfirmAction::ResetMixed("HEAD~1".into()),
-            ConfirmAction::AbortMerge,
+            ConfirmAction::AbortOperation(RepoState::Merge),
             ConfirmAction::WorktreeRemove("/path/to/worktree".into()),
         ];
         for a in actions {
@@ -379,7 +441,7 @@ mod tests {
                     | ConfirmAction::RemoveRemote(_)
                     | ConfirmAction::StashDrop(_)
                     | ConfirmAction::ResetHard(_)
-                    | ConfirmAction::AbortMerge
+                    | ConfirmAction::AbortOperation(_)
                     | ConfirmAction::WorktreeRemove(_)
             )
         }
@@ -396,29 +458,34 @@ mod tests {
 
     #[test]
     fn confirm_label_matches_action() {
-        fn label_for(action: &ConfirmAction) -> &'static str {
-            match action {
-                ConfirmAction::DiscardFile(_) | ConfirmAction::DiscardAll => "Discard",
-                ConfirmAction::CleanUntracked => "Clean",
-                ConfirmAction::BranchDelete(_) => "Delete Branch",
-                ConfirmAction::TagDelete(_) => "Delete Tag",
-                ConfirmAction::RemoveRemote(_) => "Remove",
-                ConfirmAction::StashDrop(_) => "Drop Stash",
-                ConfirmAction::ResetHard(_)
-                | ConfirmAction::ResetSoft(_)
-                | ConfirmAction::ResetMixed(_) => "Reset",
-                ConfirmAction::AbortMerge => "Abort",
-                ConfirmAction::ForcePush => "Force Push",
-                ConfirmAction::WorktreeRemove(_) => "Remove Worktree",
-            }
+        let cases: Vec<(Option<ConfirmAction>, &'static str)> = vec![
+            (Some(ConfirmAction::DiscardFile("a".into())), "Discard"),
+            (Some(ConfirmAction::DiscardAll), "Discard"),
+            (Some(ConfirmAction::CleanUntracked), "Clean"),
+            (
+                Some(ConfirmAction::BranchDelete("x".into())),
+                "Delete Branch",
+            ),
+            (Some(ConfirmAction::TagDelete("v".into())), "Delete Tag"),
+            (Some(ConfirmAction::RemoveRemote("o".into())), "Remove"),
+            (Some(ConfirmAction::StashDrop(0)), "Drop Stash"),
+            (Some(ConfirmAction::ResetHard("HEAD".into())), "Reset"),
+            (Some(ConfirmAction::ResetSoft("HEAD".into())), "Reset"),
+            (Some(ConfirmAction::ResetMixed("HEAD".into())), "Reset"),
+            (
+                Some(ConfirmAction::AbortOperation(RepoState::Rebase)),
+                "Abort",
+            ),
+            (Some(ConfirmAction::ForcePush), "Force Push"),
+            (
+                Some(ConfirmAction::WorktreeRemove("/tmp/wt".into())),
+                "Remove Worktree",
+            ),
+            (None, "Confirm"),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(ConfirmDialog::confirm_label(&action).as_ref(), expected);
         }
-        assert_eq!(label_for(&ConfirmAction::StashDrop(0)), "Drop Stash");
-        assert_eq!(
-            label_for(&ConfirmAction::BranchDelete("x".into())),
-            "Delete Branch"
-        );
-        assert_eq!(label_for(&ConfirmAction::ForcePush), "Force Push");
-        assert_eq!(label_for(&ConfirmAction::ResetHard("HEAD".into())), "Reset");
     }
 
     // severity_icon
@@ -457,7 +524,7 @@ mod tests {
                             | ConfirmAction::RemoveRemote(_)
                             | ConfirmAction::StashDrop(_)
                             | ConfirmAction::ResetHard(_)
-                            | ConfirmAction::AbortMerge
+                            | ConfirmAction::AbortOperation(_)
                             | ConfirmAction::WorktreeRemove(_)
                     ) {
                         Color::Error
@@ -469,6 +536,43 @@ mod tests {
         }
         assert_eq!(color_for(&ConfirmAction::ForcePush), Color::Warning);
         assert_eq!(color_for(&ConfirmAction::StashDrop(0)), Color::Error);
-        assert_eq!(color_for(&ConfirmAction::AbortMerge), Color::Error);
+        assert_eq!(
+            color_for(&ConfirmAction::AbortOperation(RepoState::Merge)),
+            Color::Error
+        );
+    }
+
+    // text
+
+    #[test]
+    fn text_names_what_the_action_touches() {
+        let text = |action| ConfirmDialog::text(&action);
+        assert_eq!(
+            text(ConfirmAction::StashDrop(2)).1.as_ref(),
+            "Are you sure you want to drop stash@{2}? This cannot be undone."
+        );
+        assert_eq!(
+            text(ConfirmAction::ResetHard("HEAD".into())).1.as_ref(),
+            "Hard reset to HEAD? All staged and unstaged changes will be permanently discarded."
+        );
+        assert_eq!(
+            text(ConfirmAction::ResetHard("0123456789abcdef".into()))
+                .1
+                .as_ref(),
+            "Hard reset the current branch to 0123456? All uncommitted changes and commits \
+             after this point will be lost."
+        );
+        assert_eq!(
+            text(ConfirmAction::AbortOperation(RepoState::RebaseInteractive))
+                .0
+                .as_ref(),
+            "Abort Rebase"
+        );
+        assert_eq!(
+            text(ConfirmAction::BranchDelete("feature".into()))
+                .1
+                .as_ref(),
+            "Are you sure you want to delete branch 'feature'?"
+        );
     }
 }
