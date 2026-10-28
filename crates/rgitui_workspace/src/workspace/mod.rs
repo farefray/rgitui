@@ -1051,7 +1051,8 @@ impl Workspace {
 
 /// Fallback families for the UI font.
 ///
-/// The monospace families cover Latin text the configured font lacks. A
+/// Proportional UI families cover Latin text the configured font lacks, followed
+/// by the bundled monospace families for additional glyph coverage. A
 /// Simplified Chinese UI adds that script's fonts at the end, so Han characters
 /// get Simplified glyph shapes rather than whatever the platform picks first.
 /// They are left out for every other language: the platform's own fallback
@@ -1060,6 +1061,13 @@ impl Workspace {
 /// families are skipped, so listing fonts an install lacks is harmless.
 fn ui_font_fallbacks(locale_id: &str) -> Vec<&'static str> {
     let mut families = vec![
+        rgitui_theme::DEFAULT_UI_FONT_FAMILY,
+        #[cfg(target_os = "windows")]
+        "Segoe UI",
+        #[cfg(target_os = "macos")]
+        ".AppleSystemUIFont",
+        #[cfg(target_os = "linux")]
+        "DejaVu Sans",
         "JetBrains Mono",
         "JetBrainsMono Nerd Font",
         "Lilex",
@@ -1101,6 +1109,7 @@ mod tests {
     #[test]
     fn ui_font_fallbacks_add_chinese_fonts_only_for_a_simplified_chinese_ui() {
         let english = ui_font_fallbacks("en");
+        assert_eq!(english.first(), Some(&rgitui_theme::DEFAULT_UI_FONT_FAMILY));
         assert!(!english.contains(&"Noto Sans CJK SC"));
         assert_eq!(english.last(), Some(&"Courier New"));
 

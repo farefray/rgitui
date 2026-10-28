@@ -1682,6 +1682,7 @@ impl Sidebar {
         div()
             .id(ElementId::Name(format!("{id}-trigger").into()))
             .relative()
+            .flex_shrink_0()
             // Keeps the press from reaching the section header, which would
             // expand or collapse the section.
             .on_mouse_down(
@@ -1977,7 +1978,7 @@ impl Render for Sidebar {
         let colors = cx.colors().clone();
         let compactness = cx.global::<SettingsState>().settings().compactness;
         let item_h = compactness.spacing(24.0);
-        let header_h = compactness.spacing(26.0);
+        let header_h = compactness.spacing(32.0);
         let list_heights = self.plan_list_heights(item_h, header_h, compactness);
         let show_line_stats = cx
             .global::<SettingsState>()
@@ -2051,10 +2052,11 @@ impl Render for Sidebar {
                     .h_flex()
                     .w_full()
                     .h(px(header_h))
-                    .px(px(8.))
-                    .gap(px(4.))
+                    .px(px(10.))
+                    .gap(px(6.))
                     .items_center()
-                    .bg(colors.toolbar_background)
+                    .bg(colors.surface_background)
+                    .tooltip(Tooltip::text(repo_label.clone()))
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .child(
@@ -2115,7 +2117,7 @@ impl Render for Sidebar {
                 .px(px(8.))
                 .gap(px(4.))
                 .items_center()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -2137,9 +2139,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("sidebar.branches"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(self.render_popover_trigger(
@@ -2256,7 +2257,19 @@ impl Render for Sidebar {
 
                         if is_head {
                             item = item
-                                .bg(colors.ghost_element_selected)
+                                .relative()
+                                .bg(colors.element_selected)
+                                // Separate current-branch identity from the keyboard focus border.
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(4.))
+                                        .top(px(4.))
+                                        .bottom(px(4.))
+                                        .w(px(2.))
+                                        .rounded(px(1.))
+                                        .bg(colors.border_selected),
+                                )
                                 .child(
                                     div()
                                         .w(px(14.))
@@ -2286,9 +2299,9 @@ impl Render for Sidebar {
                                 .child(
                                     div().flex_1().min_w_0().child(
                                         Label::new(name.clone())
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Small)
                                             .color(Color::Accent)
-                                            .weight(gpui::FontWeight::BOLD)
+                                            .weight(gpui::FontWeight::SEMIBOLD)
                                             .truncate(),
                                     ),
                                 );
@@ -2323,8 +2336,7 @@ impl Render for Sidebar {
                                 .child(
                                     div().flex_1().min_w_0().child(
                                         Label::new(name.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
+                                            .size(LabelSize::Small)
                                             .truncate(),
                                     ),
                                 );
@@ -2504,7 +2516,7 @@ impl Render for Sidebar {
                 .px(px(8.))
                 .gap(px(4.))
                 .items_center()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -2526,9 +2538,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("sidebar.remotes"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(
@@ -2769,7 +2780,7 @@ impl Render for Sidebar {
                 .px(px(8.))
                 .gap(px(4.))
                 .items_center()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -2786,9 +2797,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("sidebar.remote_branches"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(self.render_popover_trigger(
@@ -2916,12 +2926,7 @@ impl Render for Sidebar {
                                                 .color(Color::Muted),
                                         ),
                                 )
-                                .child(
-                                    Label::new(name)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                )
+                                .child(Label::new(name).size(LabelSize::Small).truncate())
                         })
                         .collect()
                 },
@@ -2964,7 +2969,7 @@ impl Render for Sidebar {
                 .px(px(8.))
                 .gap(px(4.))
                 .items_center()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -2986,9 +2991,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("sidebar.tags"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(
@@ -3192,7 +3196,7 @@ impl Render for Sidebar {
                 .px(px(8.))
                 .gap(px(4.))
                 .items_center()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -3214,9 +3218,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("common.stashes"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(
@@ -3467,7 +3470,7 @@ impl Render for Sidebar {
                 .gap(px(4.))
                 .items_center()
                 .overflow_hidden()
-                .bg(colors.toolbar_background)
+                .bg(colors.surface_background)
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -3489,9 +3492,8 @@ impl Render for Sidebar {
                 )
                 .child(
                     Label::new(t!("sidebar.worktrees"))
-                        .size(LabelSize::XSmall)
-                        .weight(gpui::FontWeight::SEMIBOLD)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD),
                 )
                 .child(div().flex_1())
                 .child(
@@ -3612,7 +3614,7 @@ impl Render for Sidebar {
                                                 Color::Muted
                                             }),
                                     )
-                                    .child(Label::new(name.clone()).size(LabelSize::XSmall).color(
+                                    .child(Label::new(name.clone()).size(LabelSize::Small).color(
                                         if worktree.is_current {
                                             Color::Info
                                         } else {
@@ -3697,7 +3699,7 @@ impl Render for Sidebar {
             .px(px(8.))
             .gap(px(4.))
             .items_center()
-            .bg(colors.toolbar_background)
+            .bg(colors.surface_background)
             .border_b_1()
             .border_color(colors.border_variant)
             .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -3714,18 +3716,9 @@ impl Render for Sidebar {
             )
             .child(
                 Label::new(t!("sidebar.staged"))
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .weight(gpui::FontWeight::SEMIBOLD)
-                    .color(Color::Muted),
-            )
-            .child(
-                rgitui_ui::Icon::new(IconName::Check)
-                    .size(rgitui_ui::IconSize::XSmall)
-                    .color(if has_staged {
-                        Color::Added
-                    } else {
-                        Color::Muted
-                    }),
+                    .truncate(),
             );
 
         if has_staged {
@@ -3739,7 +3732,7 @@ impl Render for Sidebar {
                 FileChangeKind::Untracked,
                 FileChangeKind::Conflicted,
             ];
-            let mut breakdown = div().h_flex().gap(px(4.));
+            let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
             for kind in &kind_order {
                 if let Some(&count) = staged_kind_counts.get(kind) {
                     if count > 0 {
@@ -3762,7 +3755,7 @@ impl Render for Sidebar {
             .child(div().flex_1())
             .when(has_staged, |el| {
                 el.child(
-                    div().id("unstage-all-btn").child(
+                    div().id("unstage-all-btn").flex_shrink_0().child(
                         Button::new("unstage-all", t!("sidebar.unstage_all"))
                             .icon(IconName::Minus)
                             .size(ButtonSize::Compact)
@@ -3788,6 +3781,7 @@ impl Render for Sidebar {
                     .min_w(px(20.))
                     .px(px(6.))
                     .rounded(px(5.))
+                    .flex_shrink_0()
                     .bg(if staged_count > 0 {
                         colors.ghost_element_selected
                     } else {
@@ -4033,7 +4027,7 @@ impl Render for Sidebar {
             .px(px(8.))
             .gap(px(4.))
             .items_center()
-            .bg(colors.toolbar_background)
+            .bg(colors.surface_background)
             .border_b_1()
             .border_color(colors.border_variant)
             .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
@@ -4050,18 +4044,9 @@ impl Render for Sidebar {
             )
             .child(
                 Label::new(t!("sidebar.unstaged"))
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .weight(gpui::FontWeight::SEMIBOLD)
-                    .color(Color::Muted),
-            )
-            .child(
-                rgitui_ui::Icon::new(IconName::Edit)
-                    .size(rgitui_ui::IconSize::XSmall)
-                    .color(if has_unstaged {
-                        Color::Modified
-                    } else {
-                        Color::Muted
-                    }),
+                    .truncate(),
             );
 
         if has_unstaged {
@@ -4075,7 +4060,7 @@ impl Render for Sidebar {
                 FileChangeKind::Untracked,
                 FileChangeKind::Conflicted,
             ];
-            let mut breakdown = div().h_flex().gap(px(4.));
+            let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
             for kind in &kind_order {
                 if let Some(&count) = unstaged_kind_counts.get(kind) {
                     if count > 0 {
@@ -4110,7 +4095,7 @@ impl Render for Sidebar {
             .child(div().flex_1())
             .when(has_unstaged, |el| {
                 el.child(
-                    div().id("stage-all-btn").child(
+                    div().id("stage-all-btn").flex_shrink_0().child(
                         Button::new("stage-all", t!("sidebar.stage_all"))
                             .icon(IconName::Plus)
                             .size(ButtonSize::Compact)
@@ -4136,6 +4121,7 @@ impl Render for Sidebar {
                     .min_w(px(20.))
                     .px(px(6.))
                     .rounded(px(5.))
+                    .flex_shrink_0()
                     .bg(if unstaged_count > 0 {
                         colors.ghost_element_selected
                     } else {

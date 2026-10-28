@@ -10,6 +10,7 @@ use crate::colors::{
     github_dark_colors, github_dark_status, high_contrast_dark_colors, high_contrast_dark_status,
     one_dark_colors, one_dark_status, StatusColors, ThemeColors,
 };
+use crate::{forest_colors, forest_status};
 
 /// Visual appearance mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,6 +126,12 @@ impl ActiveTheme for App {
 pub fn builtin_themes() -> Vec<Arc<Theme>> {
     vec![
         Arc::new(Theme {
+            name: "Forest".into(),
+            appearance: Appearance::Dark,
+            colors: forest_colors(),
+            status: forest_status(),
+        }),
+        Arc::new(Theme {
             name: "Catppuccin Mocha".into(),
             appearance: Appearance::Dark,
             colors: catppuccin_mocha_colors(),
@@ -196,7 +203,7 @@ pub fn init(cx: &mut App) {
         }
     }
 
-    let active = available[0].clone(); // Catppuccin Mocha default
+    let active = available[0].clone(); // Forest is the fork's default; saved choices win at startup.
     cx.set_global(ThemeState { active, available });
 }
 
@@ -356,6 +363,48 @@ impl<E: Styled> StyledExt for E {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_theme_matches_settings_and_saved_choices_remain_available() {
+        let available = builtin_themes();
+        assert_eq!(
+            available[0].name,
+            rgitui_settings::AppSettings::default().theme
+        );
+        let mut state = ThemeState {
+            active: available[0].clone(),
+            available,
+        };
+        state.set_theme_by_name("One Dark");
+        assert_eq!(state.theme().name, "One Dark");
+        state.set_theme_by_name("missing-custom-theme");
+        assert_eq!(state.theme().name, "One Dark");
+        assert!(state
+            .themes_for_appearance(AppearanceMode::Dark)
+            .iter()
+            .any(|t| t.name == "Forest"));
+        assert!(!state
+            .themes_for_appearance(AppearanceMode::Light)
+            .iter()
+            .any(|t| t.name == "Forest"));
+    }
+
+    #[test]
+    fn forest_export_round_trips_without_new_required_theme_keys() {
+        let forest = builtin_themes()
+            .into_iter()
+            .find(|t| t.name == "Forest")
+            .unwrap();
+        let json = crate::json_theme::serialize_theme_to_json(&forest).unwrap();
+        let restored = crate::json_theme::load_theme_from_json(&json).unwrap();
+        assert_eq!(restored.name, forest.name);
+        assert_eq!(restored.appearance, Appearance::Dark);
+        // Hex conversion quantizes floats, so compare the serializable palette.
+        assert_eq!(
+            crate::json_theme::serialize_theme_to_json(&restored).unwrap(),
+            json
+        );
+    }
 
     #[test]
     fn upsert_theme_by_name_replaces_existing_theme() {

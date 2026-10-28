@@ -1,10 +1,10 @@
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, px, rems, size, App, Bounds, Context, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    HighlightStyle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Render, SharedString, Size, StyledText, TextLayout, Window,
 };
-use rgitui_theme::{ActiveTheme, Color};
+use rgitui_theme::{ActiveTheme, ThemeColors};
 use std::ops::Range;
 
 #[derive(Debug, Clone)]
@@ -518,6 +518,48 @@ impl Focusable for TextInput {
     }
 }
 
+/// Appearance only: read-only inputs retain their selection/copy behavior.
+struct InputAppearance {
+    background: Hsla,
+    border: Hsla,
+    hover_border: Option<Hsla>,
+    text: Hsla,
+    show_caret: bool,
+}
+
+fn input_appearance(
+    colors: &ThemeColors,
+    disabled: bool,
+    read_only: bool,
+    focused: bool,
+    empty: bool,
+) -> InputAppearance {
+    InputAppearance {
+        background: if disabled {
+            colors.element_disabled
+        } else {
+            colors.editor_background
+        },
+        border: if disabled {
+            colors.border_disabled
+        } else if focused {
+            colors.border_focused
+        } else {
+            colors.border
+        },
+        // A neutral hover boundary must not masquerade as keyboard focus.
+        hover_border: (!disabled && !read_only && !focused).then_some(colors.text_muted),
+        text: if disabled {
+            colors.text_disabled
+        } else if empty {
+            colors.text_placeholder
+        } else {
+            colors.text
+        },
+        show_caret: focused && !disabled && !read_only,
+    }
+}
+
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.focus_out_subscription.is_none() {
@@ -538,20 +580,10 @@ impl Render for TextInput {
             self.selection = None;
             self.dragging = false;
         }
-        let inactive = self.disabled || self.read_only;
-        let border_color = if is_focused && !self.disabled {
-            colors.border_focused
-        } else {
-            colors.border
-        };
-        let hover_border = colors.border_focused;
-        let bg = if inactive {
-            colors.element_disabled
-        } else if is_focused {
-            colors.ghost_element_selected
-        } else {
-            colors.editor_background
-        };
+        let is_empty = self.text.is_empty();
+        let appearance =
+            input_appearance(colors, self.disabled, self.read_only, is_focused, is_empty);
+        let show_caret = appearance.show_caret;
         let cursor_color = colors.text_accent;
         let selection_hl = HighlightStyle {
             color: Some(colors.text),
@@ -562,16 +594,8 @@ impl Render for TextInput {
             ..Default::default()
         };
 
-        let is_empty = self.text.is_empty();
         let cursor_idx = self.cursor;
-
-        let text_color_val = if inactive {
-            colors.text_disabled
-        } else if is_empty {
-            Color::Placeholder.color(cx)
-        } else {
-            colors.text
-        };
+        let text_color_val = appearance.text;
 
         let mut text_style = window.text_style();
         text_style.color = text_color_val;
@@ -613,7 +637,7 @@ impl Render for TextInput {
         let cursor_overlay = canvas(
             move |_, _, _| Size::<Pixels>::default(),
             move |bounds, _, window, _cx| {
-                if !is_focused {
+                if !show_caret {
                     return;
                 }
                 let idx = if is_empty { 0 } else { cursor_idx };
@@ -666,9 +690,9 @@ impl Render for TextInput {
             .py(if self.compact { px(2.) } else { px(5.) })
             .rounded(px(6.))
             .border_1()
-            .border_color(border_color)
-            .bg(bg)
-            .when(!is_focused && !inactive, move |el| {
+            .border_color(appearance.border)
+            .bg(appearance.background)
+            .when_some(appearance.hover_border, |el, hover_border| {
                 el.hover(move |s| s.border_color(hover_border))
             })
             .when(self.disabled, |el| el.cursor_not_allowed())
@@ -695,5 +719,81 @@ impl Render for TextInput {
         }
 
         container
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgitui_theme::builtin_themes;
+
+    #[test]
+    fn focus_changes_boundary_not_editor_surface() {
+        for theme in builtin_themes() {
+            let normal = input_appearance(&theme.colors, false, false, false, false);
+            let focused = input_appearance(&theme.colors, false, false, true, false);
+            assert_eq!(normal.background, theme.colors.editor_background);
+            assert_eq!(focused.background, normal.background);
+            assert_eq!(normal.border, theme.colors.border);
+            assert_eq!(normal.hover_border, Some(theme.colors.text_muted));
+            assert_eq!(focused.border, theme.colors.border_focused);
+            assert_eq!(focused.hover_border, None);
+            assert!(!normal.show_caret);
+            assert!(focused.show_caret);
+        }
+    }
+
+    #[test]
+    fn read_only_content_stays_readable_without_an_editable_caret() {
+        for theme in builtin_themes() {
+            for focused in [false, true] {
+                let appearance = input_appearance(&theme.colors, false, true, focused, false);
+                assert_eq!(appearance.background, theme.colors.editor_background);
+                assert_eq!(appearance.text, theme.colors.text);
+                assert_eq!(
+                    appearance.border,
+                    if focused {
+                        theme.colors.border_focused
+                    } else {
+                        theme.colors.border
+                    }
+                );
+                assert_eq!(appearance.hover_border, None);
+                assert!(!appearance.show_caret);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_appearance_wins_even_when_still_focused() {
+        for theme in builtin_themes() {
+            for focused in [false, true] {
+                for read_only in [false, true] {
+                    for empty in [false, true] {
+                        let appearance =
+                            input_appearance(&theme.colors, true, read_only, focused, empty);
+                        assert_eq!(appearance.background, theme.colors.element_disabled);
+                        assert_eq!(appearance.border, theme.colors.border_disabled);
+                        assert_eq!(appearance.text, theme.colors.text_disabled);
+                        assert_eq!(appearance.hover_border, None);
+                        assert!(!appearance.show_caret);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_enabled_inputs_use_placeholder_not_disabled_text() {
+        for theme in builtin_themes() {
+            for read_only in [false, true] {
+                for focused in [false, true] {
+                    let appearance =
+                        input_appearance(&theme.colors, false, read_only, focused, true);
+                    assert_eq!(appearance.text, theme.colors.text_placeholder);
+                    assert_eq!(appearance.show_caret, focused && !read_only);
+                }
+            }
+        }
     }
 }

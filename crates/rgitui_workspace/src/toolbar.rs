@@ -5,8 +5,8 @@ use rgitui_i18n::{key, t};
 use rgitui_settings::SettingsState;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
-    Badge, Button, Icon, IconButton, IconName, IconSize, Indicator, Label, LabelSize, Tooltip,
-    VerticalDivider,
+    Badge, Button, ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, Indicator, Label,
+    LabelSize, Tooltip, VerticalDivider,
 };
 
 use crate::keymap;
@@ -138,6 +138,18 @@ impl Toolbar {
         cx.notify();
     }
 
+    fn fetch_enabled(&self) -> bool {
+        !self.is_fetching
+    }
+
+    fn pull_enabled(&self) -> bool {
+        self.can_pull && !self.is_pulling
+    }
+
+    fn push_enabled(&self) -> bool {
+        self.can_push && !self.is_pushing
+    }
+
     fn build_tooltip(tooltip_text: SharedString, command: Option<CommandId>) -> TooltipFactory {
         match command {
             Some(command) => Box::new(keymap::command_tooltip(tooltip_text, command)),
@@ -188,13 +200,17 @@ impl Toolbar {
         div()
             .id(id)
             .h_flex()
-            .h(px(26.))
-            .px(px(6.))
-            .gap(px(4.))
+            .h(px(30.))
+            .min_h(gpui::rems(1.875))
+            .flex_shrink_0()
+            .px(px(8.))
+            .gap(px(5.))
             .items_center()
             .justify_center()
             .rounded(px(4.))
-            .when(disabled && !loading, |el| el.opacity(0.5))
+            .bg(colors.element_background)
+            .border_1()
+            .border_color(colors.border)
             .when(!is_inactive, move |el| {
                 el.hover(move |s| s.bg(hover_bg))
                     .active(move |s| s.bg(active_bg))
@@ -202,7 +218,7 @@ impl Toolbar {
             })
             .tooltip(move |window, cx| tooltip_fn(window, cx))
             .child(Icon::new(icon).size(IconSize::Small).color(icon_color))
-            .child(Label::new(label).size(LabelSize::XSmall).color(text_color))
+            .child(Label::new(label).size(LabelSize::Small).color(text_color))
     }
 
     fn render_left_group(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -224,30 +240,35 @@ impl Toolbar {
 
         div()
             .h_flex()
+            .flex_shrink_0()
             .items_center()
-            .gap(px(2.))
+            .gap(px(6.))
             // Network operations group
             .child(
                 div()
                     .h_flex()
                     .items_center()
-                    .gap(px(2.))
+                    .gap(px(4.))
                     .child(
                         self.icon_button(
                             "tb-fetch",
                             IconName::Refresh,
                             fetch_label,
                             ToolbarButtonState {
-                                disabled: self.is_fetching,
+                                disabled: !self.fetch_enabled(),
                                 loading: self.is_fetching,
                                 tooltip_text: key!("common.fetch_remote.tooltip"),
                                 command: Some(CommandId::Fetch),
                             },
                             cx,
                         )
-                        .on_click(
-                            cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Fetch)),
-                        ),
+                        .on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                if this.fetch_enabled() {
+                                    cx.emit(ToolbarEvent::Fetch);
+                                }
+                            },
+                        )),
                     )
                     .child({
                         let mut btn = self
@@ -256,16 +277,18 @@ impl Toolbar {
                                 IconName::ArrowDown,
                                 pull_label,
                                 ToolbarButtonState {
-                                    disabled: !self.can_pull,
+                                    disabled: !self.pull_enabled(),
                                     loading: self.is_pulling,
                                     tooltip_text: key!("common.pull_remote.tooltip"),
                                     command: Some(CommandId::Pull),
                                 },
                                 cx,
                             )
-                            .on_click(
-                                cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Pull)),
-                            );
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if this.pull_enabled() {
+                                    cx.emit(ToolbarEvent::Pull);
+                                }
+                            }));
                         if self.behind > 0 && !self.is_pulling {
                             btn = btn.child(
                                 Badge::new(SharedString::from(self.behind.to_string()))
@@ -281,16 +304,18 @@ impl Toolbar {
                                 IconName::ArrowUp,
                                 push_label,
                                 ToolbarButtonState {
-                                    disabled: !self.can_push,
+                                    disabled: !self.push_enabled(),
                                     loading: self.is_pushing,
                                     tooltip_text: key!("common.push_remote.tooltip"),
                                     command: Some(CommandId::Push),
                                 },
                                 cx,
                             )
-                            .on_click(
-                                cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Push)),
-                            );
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if this.push_enabled() {
+                                    cx.emit(ToolbarEvent::Push);
+                                }
+                            }));
                         if self.ahead > 0 && !self.is_pushing {
                             btn = btn.child(
                                 Badge::new(SharedString::from(self.ahead.to_string()))
@@ -313,6 +338,8 @@ impl Toolbar {
             // Branch operations group
             .child(
                 Button::new("tb-branch", t!("toolbar.branch"))
+                    .size(ButtonSize::Default)
+                    .style(ButtonStyle::Outlined)
                     .icon(IconName::GitBranch)
                     .tooltip_fn(keymap::command_tooltip(
                         "Create new branch",
@@ -331,6 +358,7 @@ impl Toolbar {
                     .gap(px(2.))
                     .child(
                         Button::new("tb-stash", t!("toolbar.stash"))
+                            .size(ButtonSize::Default)
                             .icon(IconName::Stash)
                             .disabled(!self.has_changes)
                             .tooltip_fn(keymap::command_tooltip(
@@ -343,6 +371,7 @@ impl Toolbar {
                     )
                     .child(
                         Button::new("tb-pop", t!("toolbar.pop"))
+                            .size(ButtonSize::Default)
                             .icon(IconName::Undo)
                             .disabled(!self.has_stashes)
                             .tooltip_fn(keymap::command_tooltip(
@@ -358,6 +387,8 @@ impl Toolbar {
             // PR creation group
             .child(
                 Button::new("tb-pr", t!("toolbar.create_pr"))
+                    .size(ButtonSize::Default)
+                    .style(ButtonStyle::Outlined)
                     .icon(IconName::GitPullRequest)
                     .disabled(!self.has_github_token)
                     .tooltip_fn(keymap::command_tooltip(
@@ -373,8 +404,9 @@ impl Toolbar {
     fn render_right_group(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .h_flex()
+            .flex_shrink_0()
             .items_center()
-            .gap(px(2.))
+            .gap(px(6.))
             // External tools group
             .child(
                 div()
@@ -453,7 +485,7 @@ impl Toolbar {
 impl Render for Toolbar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let compactness = cx.global::<SettingsState>().settings().compactness;
-        let toolbar_h = compactness.spacing(36.0);
+        let toolbar_h = compactness.spacing(44.0).max(36.0);
         let toolbar_bg = cx.colors().toolbar_background;
         let border_color = cx.colors().border_variant;
 
@@ -461,10 +493,17 @@ impl Render for Toolbar {
         let right = self.render_right_group(cx);
 
         div()
+            .id("repository-toolbar")
             .h_flex()
             .w_full()
+            .min_w_0()
             .h(px(toolbar_h))
-            .px(px(8.))
+            .min_h(gpui::rems(2.375))
+            .flex_shrink_0()
+            // Keep one action row; narrow windows can scroll to utilities.
+            .overflow_x_scroll()
+            .gap(px(12.))
+            .px(px(10.))
             .items_center()
             .justify_between()
             .bg(toolbar_bg)
@@ -478,6 +517,29 @@ impl Render for Toolbar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_actions_respect_availability_and_loading() {
+        let mut toolbar = Toolbar::new();
+        assert!(toolbar.fetch_enabled());
+        assert!(toolbar.pull_enabled());
+        assert!(toolbar.push_enabled());
+
+        toolbar.can_pull = false;
+        toolbar.can_push = false;
+        assert!(!toolbar.pull_enabled());
+        assert!(!toolbar.push_enabled());
+        assert!(toolbar.fetch_enabled());
+
+        toolbar.can_pull = true;
+        toolbar.can_push = true;
+        toolbar.is_fetching = true;
+        toolbar.is_pulling = true;
+        toolbar.is_pushing = true;
+        assert!(!toolbar.fetch_enabled());
+        assert!(!toolbar.pull_enabled());
+        assert!(!toolbar.push_enabled());
+    }
 
     #[test]
     fn test_toolbar_event_debug() {

@@ -299,7 +299,7 @@ fn default_settings_version() -> u32 {
 }
 
 fn default_theme() -> String {
-    "Catppuccin Mocha".into()
+    "Forest".into()
 }
 
 /// New installs follow the OS language; existing settings files without the
@@ -1848,6 +1848,17 @@ mod tests {
     /// The bug this guards is not hypothetical: the shipped default was
     /// `gemini-2.0-flash`, which appeared in no picker, so a fresh install
     /// rendered the Model row with nothing selected at all.
+    #[test]
+    fn forest_is_a_default_not_a_migration_of_saved_theme_choices() {
+        let fresh: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(fresh.theme, "Forest");
+        assert_eq!(AppSettings::default().theme, "Forest");
+        let existing: AppSettings =
+            serde_json::from_str(r#"{"theme":"One Dark","ui_font":"Lilex"}"#).unwrap();
+        assert_eq!(existing.theme, "One Dark");
+        assert_eq!(existing.ui_font, "Lilex");
+    }
+
     #[test]
     fn default_model_is_the_default_provider_model() {
         assert_eq!(default_ai_model(), default_ai_provider().default_model());

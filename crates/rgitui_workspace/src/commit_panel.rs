@@ -240,7 +240,6 @@ impl CheckoutDraft {
         let description_editor = cx.new(|cx| {
             let mut ti = TextInput::new(cx).multiline();
             ti.set_placeholder_message(key!("commit.description.placeholder"));
-            ti.set_font_size(px(12.0));
             ti
         });
         let new_author_name = cx.new(|cx| {
@@ -974,9 +973,9 @@ impl Render for CommitPanel {
                             )
                             .child(
                                 Label::new(t!("commit.commit"))
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .weight(gpui::FontWeight::SEMIBOLD)
-                                    .color(Color::Muted),
+                                    .color(Color::Default),
                             )
                             .child(
                                 div()
@@ -1016,6 +1015,7 @@ impl Render for CommitPanel {
                         div()
                             .id("commit-scroll-area")
                             .v_flex()
+                            .bg(colors.surface_background)
                             .flex_1()
                             .px(px(12.))
                             .pt(px(10.))
@@ -1033,8 +1033,8 @@ impl Render for CommitPanel {
                                             .items_center()
                                             .child(
                                                 Label::new(t!("commit.summary"))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Default)
                                                     .weight(gpui::FontWeight::MEDIUM),
                                             )
                                             .child(div().flex_1())
@@ -1060,8 +1060,8 @@ impl Render for CommitPanel {
                                             .items_center()
                                             .child(
                                                 Label::new(t!("common.description"))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Default)
                                                     .weight(gpui::FontWeight::MEDIUM),
                                             )
                                             .child(div().flex_1())
@@ -1226,99 +1226,134 @@ impl Render for CommitPanel {
                                     }),
                             ),
                     )
-                    // Action row pinned at bottom (never scrolls away)
+                    // Two-row footer pinned at bottom (never scrolls away).
                     .child(
                         div()
-                            .h_flex()
+                            .v_flex()
                             .w_full()
                             .gap(px(8.))
-                            .items_center()
                             .flex_shrink_0()
                             .px(px(12.))
                             .py(px(6.))
+                            .bg(colors.panel_background)
                             .border_t_1()
                             .border_color(colors.border_variant)
                             .child(
                                 div()
-                                    .id("amend-toggle")
                                     .h_flex()
-                                    .gap(px(4.))
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.amend = !this.amend;
-                                        cx.notify();
-                                    }))
-                                    .child(Checkbox::new(
-                                        "amend-checkbox",
-                                        if self.amend {
-                                            CheckState::Checked
-                                        } else {
-                                            CheckState::Unchecked
-                                        },
-                                    ))
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap(px(8.))
                                     .child(
-                                        Label::new(t!("commit.amend"))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    ),
-                            )
-                            .when(
-                                !summary_empty || !self.description_editor.read(cx).is_empty(),
-                                |el| {
-                                    el.child(
-                                        Button::new("clear-btn", t!("common.clear"))
-                                            .icon(IconName::X)
-                                            .size(ButtonSize::Compact)
-                                            .style(ButtonStyle::Subtle)
-                                            .color(Color::Muted)
-                                            .on_click(cx.listener(
-                                                |this, _: &ClickEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.summary_editor
-                                                        .update(cx, |e: &mut TextInput, cx| {
-                                                            e.clear(cx)
-                                                        });
-                                                    this.description_editor
-                                                        .update(cx, |e: &mut TextInput, cx| {
-                                                            e.clear(cx)
-                                                        });
-                                                    this.co_authors.clear();
-                                                    cx.notify();
+                                        div()
+                                            .h_flex()
+                                            .flex_shrink_0()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .id("amend-toggle")
+                                                    .h_flex()
+                                                    .gap(px(4.))
+                                                    .items_center()
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.amend = !this.amend;
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(Checkbox::new(
+                                                        "amend-checkbox",
+                                                        if self.amend {
+                                                            CheckState::Checked
+                                                        } else {
+                                                            CheckState::Unchecked
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        Label::new(t!("commit.amend"))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    ),
+                                            )
+                                            .when(
+                                                !summary_empty
+                                                    || !self.description_editor.read(cx).is_empty(),
+                                                |el| {
+                                                    el.child(
+                                                        Button::new(
+                                                            "clear-btn",
+                                                            t!("common.clear"),
+                                                        )
+                                                        .icon(IconName::X)
+                                                        .size(ButtonSize::Compact)
+                                                        .style(ButtonStyle::Subtle)
+                                                        .color(Color::Muted)
+                                                        .on_click(cx.listener(
+                                                            |this, _: &ClickEvent, _, cx| {
+                                                                cx.stop_propagation();
+                                                                this.summary_editor.update(
+                                                                    cx,
+                                                                    |e: &mut TextInput, cx| {
+                                                                        e.clear(cx)
+                                                                    },
+                                                                );
+                                                                this.description_editor.update(
+                                                                    cx,
+                                                                    |e: &mut TextInput, cx| {
+                                                                        e.clear(cx)
+                                                                    },
+                                                                );
+                                                                this.co_authors.clear();
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                    )
                                                 },
-                                            )),
+                                            ),
                                     )
-                                },
-                            )
-                            .child(div().flex_1())
-                            .when(self.staged_count == 0, |el| {
-                                el.child(
-                                    Label::new(t!("commit.no_staged_hint"))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Warning),
-                                )
-                            })
-                            .when_some(
-                                crate::keymap::shortcut(crate::CommandId::Commit, cx)
-                                    .filter(|_| can_commit),
-                                |el, keystrokes| {
-                                    el.child(
-                                        Label::new(SharedString::from(keystrokes))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                },
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .justify_end()
+                                            .when(self.staged_count == 0, |el| {
+                                                el.child(
+                                                    Label::new(t!("commit.no_staged_hint"))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Warning)
+                                                        .truncate(),
+                                                )
+                                            })
+                                            .when_some(
+                                                crate::keymap::shortcut(
+                                                    crate::CommandId::Commit,
+                                                    cx,
+                                                )
+                                                .filter(|_| can_commit),
+                                                |el, keystrokes| {
+                                                    el.child(
+                                                        Label::new(SharedString::from(keystrokes))
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted)
+                                                            .truncate(),
+                                                    )
+                                                },
+                                            ),
+                                    ),
                             )
                             .child(
                                 Button::new("commit-btn", commit_label)
                                     .icon(IconName::GitCommit)
                                     .style(if can_commit {
-                                        ButtonStyle::Filled
+                                        ButtonStyle::Primary
                                     } else {
                                         ButtonStyle::Outlined
                                     })
-                                    .size(ButtonSize::Default)
+                                    .size(ButtonSize::Large)
+                                    .full_width()
                                     .disabled(!can_commit)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         cx.stop_propagation();

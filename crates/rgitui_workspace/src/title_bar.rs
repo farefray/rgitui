@@ -124,7 +124,7 @@ impl RenderOnce for TitleBar {
         };
 
         let hover_bg = colors.ghost_element_active;
-        let branch_bg = colors.ghost_element_hover;
+        let branch_bg = colors.element_background;
         let tooltip = if self.head_detached {
             t!("workspace.detached.title", commit = self.branch_name)
         } else {
@@ -134,11 +134,16 @@ impl RenderOnce for TitleBar {
         let mut branch_pill = div()
             .id("title-branch-pill")
             .h_flex()
-            .h(px(22.))
+            .h(px(28.))
+            .min_h(gpui::rems(1.75))
+            .min_w_0()
+            .max_w(px(280.))
             .px(px(8.))
-            .gap(px(4.))
+            .gap(px(6.))
             .items_center()
             .rounded(px(4.))
+            .border_1()
+            .border_color(colors.border_variant)
             .bg(branch_bg)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
@@ -167,6 +172,7 @@ impl RenderOnce for TitleBar {
                     div()
                         .w(px(6.))
                         .h(px(6.))
+                        .flex_shrink_0()
                         .rounded_full()
                         .bg(colors.vc_modified),
                 )
@@ -179,7 +185,9 @@ impl RenderOnce for TitleBar {
         let mut bar = div()
             .h_flex()
             .w_full()
-            .h(px(34.))
+            .h(px(38.))
+            .min_h(gpui::rems(2.375))
+            .flex_shrink_0()
             .bg(colors.title_bar_background)
             .border_b_1()
             .border_color(colors.border)
@@ -237,9 +245,13 @@ impl RenderOnce for TitleBar {
             .child(Self::render_separator(&colors))
             .child(
                 div()
+                    .id("title-repository")
                     .h_flex()
-                    .gap(px(5.))
+                    .min_w_0()
+                    .max_w(px(320.))
+                    .gap(px(6.))
                     .items_center()
+                    .tooltip(Tooltip::text(self.repo_name.clone()))
                     .child(
                         Icon::new(IconName::Folder)
                             .size(IconSize::Small)
@@ -247,8 +259,9 @@ impl RenderOnce for TitleBar {
                     )
                     .child(
                         Label::new(self.repo_name)
-                            .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::SEMIBOLD),
+                            .size(LabelSize::Default)
+                            .weight(gpui::FontWeight::SEMIBOLD)
+                            .truncate(),
                     ),
             )
             .child(Self::render_separator(&colors))
@@ -258,7 +271,9 @@ impl RenderOnce for TitleBar {
             bar = bar.child(
                 div()
                     .h_flex()
-                    .h(px(20.))
+                    .h(px(22.))
+                    .min_h(gpui::rems(1.375))
+                    .flex_shrink_0()
                     .px(px(6.))
                     .gap(px(4.))
                     .items_center()

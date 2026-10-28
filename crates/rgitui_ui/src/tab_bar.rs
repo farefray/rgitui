@@ -1,12 +1,46 @@
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, ClickEvent, CursorStyle, ElementId, ScrollHandle, SharedString,
-    Window,
+    div, px, rems, AnyElement, App, ClickEvent, CursorStyle, ElementId, FontWeight, Hsla,
+    ScrollHandle, SharedString, Window,
 };
-use rgitui_theme::{ActiveTheme, Color, StyledExt};
+use rgitui_theme::{ActiveTheme, Color, StyledExt, ThemeColors};
 use smallvec::SmallVec;
 
 use crate::{IconButton, IconName, Label, LabelSize, Tooltip};
+
+struct TabColors {
+    background: Hsla,
+    hover: Hsla,
+    pressed: Hsla,
+    border: Hsla,
+}
+
+fn tab_colors(colors: &ThemeColors, active: bool) -> TabColors {
+    if active {
+        TabColors {
+            background: colors.tab_active_background,
+            // Keep the active surface and selected boundary through interaction.
+            hover: colors
+                .tab_active_background
+                .blend(colors.ghost_element_hover.opacity(0.35)),
+            pressed: colors
+                .tab_active_background
+                .blend(colors.ghost_element_active.opacity(0.50)),
+            border: colors.border_selected,
+        }
+    } else {
+        TabColors {
+            background: colors.tab_inactive_background,
+            hover: colors
+                .tab_inactive_background
+                .blend(colors.ghost_element_hover),
+            pressed: colors
+                .tab_inactive_background
+                .blend(colors.ghost_element_active),
+            border: colors.border,
+        }
+    }
+}
 
 /// A single tab in a tab bar.
 #[derive(IntoElement)]
@@ -76,11 +110,7 @@ impl Tab {
 impl RenderOnce for Tab {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.colors();
-        let bg = if self.active {
-            colors.tab_active_background
-        } else {
-            colors.tab_inactive_background
-        };
+        let resolved = tab_colors(colors, self.active);
 
         let label_color = if self.active {
             Color::Default
@@ -88,29 +118,33 @@ impl RenderOnce for Tab {
             Color::Muted
         };
 
-        let active_bg = colors.ghost_element_active;
+        let label_weight = if self.active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
 
         let mut tab = div()
             .id(self.id.clone())
             .group("tab")
             .h_flex()
-            .h(px(28.))
+            .h(rems(2.125))
             .flex_shrink_0()
             .min_w(px(100.))
             .max_w(px(240.))
             .px_2()
             .gap_1()
-            .bg(bg)
+            .bg(resolved.background)
+            // Reserve the underline for every tab; activation never shifts text.
+            .border_b_2()
+            .border_r_1()
+            .border_color(resolved.border)
             .cursor(CursorStyle::PointingHand)
-            .hover(|s| s.bg(colors.ghost_element_hover))
-            .active(move |s| s.bg(active_bg));
+            .hover(move |s| s.bg(resolved.hover))
+            .active(move |s| s.bg(resolved.pressed));
 
         if let Some(tooltip) = self.tooltip {
             tab = tab.tooltip(Tooltip::text(tooltip));
-        }
-
-        if self.active {
-            tab = tab.border_b_2().border_color(colors.text_accent);
         }
 
         if let Some(on_click) = self.on_click {
@@ -133,6 +167,7 @@ impl RenderOnce for Tab {
             div().flex_1().min_w_0().child(
                 Label::new(self.label)
                     .size(LabelSize::Small)
+                    .weight(label_weight)
                     .color(label_color)
                     .truncate(),
             ),
@@ -220,10 +255,10 @@ impl RenderOnce for TabBar {
         let mut bar = div()
             .h_flex()
             .w_full()
-            .h(px(30.))
+            .h(rems(2.25))
             .bg(colors.tab_bar_background)
             .border_b_1()
-            .border_color(colors.border_variant)
+            .border_color(colors.border)
             .overflow_x_hidden();
 
         // Scrollable tab area
@@ -248,5 +283,42 @@ impl RenderOnce for TabBar {
         }
 
         bar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgitui_theme::{builtin_themes, hex_to_hsla};
+
+    #[test]
+    fn tab_surfaces_and_boundaries_follow_theme_roles() {
+        for theme in builtin_themes() {
+            let active = tab_colors(&theme.colors, true);
+            let inactive = tab_colors(&theme.colors, false);
+            assert_eq!(active.background, theme.colors.tab_active_background);
+            assert_eq!(active.border, theme.colors.border_selected);
+            assert_eq!(inactive.background, theme.colors.tab_inactive_background);
+            assert_eq!(inactive.border, theme.colors.border);
+        }
+    }
+
+    #[test]
+    fn opaque_hover_tokens_do_not_erase_the_active_tab_surface() {
+        let theme = builtin_themes().remove(0);
+        let mut colors = theme.colors.clone();
+        colors.tab_active_background = hex_to_hsla("#203020");
+        colors.tab_inactive_background = hex_to_hsla("#101810");
+        colors.ghost_element_hover = hex_to_hsla("#506050");
+        colors.ghost_element_active = hex_to_hsla("#607060");
+        let active = tab_colors(&colors, true);
+        let inactive = tab_colors(&colors, false);
+        assert_ne!(active.hover, colors.ghost_element_hover);
+        assert_ne!(active.pressed, colors.ghost_element_active);
+        assert_ne!(active.hover, inactive.hover);
+        assert_ne!(active.pressed, inactive.pressed);
+        assert_ne!(active.background, active.hover);
+        assert_ne!(active.hover, active.pressed);
+        assert_eq!(active.border, colors.border_selected);
     }
 }

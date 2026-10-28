@@ -84,10 +84,16 @@
 
 Built-in themes:
 
-- **Catppuccin Mocha** (default)
-- **Catppuccin Latte**
-- **One Dark**
+- **Forest** (fork default for new settings): green-charcoal surfaces, olive actions,
+  muted-blue selection, and higher-contrast text
+- **Catppuccin Mocha**, **Catppuccin Latte**, **Cream & Blue**
+- **One Dark**, **GitHub Dark**, **Dracula**, **High Contrast Dark**
 - Custom JSON themes via the config directory
+
+Existing theme choices are preserved. Select **Forest** in Settings → Appearance
+to try it. Interface text defaults to embedded **IBM Plex Sans**; code and hashes
+remain monospace, and an explicit `ui_font` setting still takes precedence.
+See [UX and theming](docs/UX_THEMING.md) for the visual hierarchy and review checklist.
 
 ### Performance
 

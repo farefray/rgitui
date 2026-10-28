@@ -153,6 +153,7 @@ impl Workspace {
             .key_context(self.workspace_key_context(cx))
             .size_full()
             .font(ui_font)
+            .text_color(cx.colors().text)
             .bg(background);
 
         root = keymap::attach_actions(root, "Workspace", cx, |workspace, cmd, window, cx| {
@@ -256,7 +257,8 @@ impl Render for Workspace {
                     }
                 });
 
-            let primary = configured.unwrap_or_else(|| "Lilex".to_string());
+            let primary =
+                configured.unwrap_or_else(|| rgitui_theme::DEFAULT_UI_FONT_FAMILY.to_string());
             let locale_id = cx
                 .try_global::<rgitui_i18n::ActiveLanguage>()
                 .map(|language| language.locale().id.clone())
@@ -488,8 +490,8 @@ impl Render for Workspace {
                 .gap_1()
                 .child(
                     Button::new("tab-bar-repositories", t!("workspace.repositories"))
-                        .size(ButtonSize::Compact)
-                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Default)
+                        .style(ButtonStyle::Outlined)
                         .icon(IconName::Folder)
                         .on_click(move |_, window, cx| {
                             let _ = ws_switch
@@ -500,6 +502,7 @@ impl Render for Workspace {
                     IconButton::new("tab-bar-home", IconName::Folder)
                         .size(ButtonSize::Compact)
                         .color(Color::Muted)
+                        .tooltip(t!("workspace.home.tooltip"))
                         .on_click(move |_: &gpui::ClickEvent, _, cx| {
                             ws_home
                                 .update(cx, |ws, cx| {
@@ -512,6 +515,7 @@ impl Render for Workspace {
                     IconButton::new("tab-bar-add", IconName::Plus)
                         .size(ButtonSize::Compact)
                         .color(Color::Muted)
+                        .tooltip(t!("common.open_repository"))
                         .on_click(move |_: &gpui::ClickEvent, window, cx| {
                             ws_open
                                 .update(cx, |ws, cx| {
@@ -1027,9 +1031,9 @@ impl Render for Workspace {
                             })
                             // Bottom panel tabs + content
                             .child({
-                                let tab_bar_bg = colors.toolbar_background;
+                                let tab_bar_bg = colors.tab_bar_background;
                                 let tab_border = colors.border_variant;
-                                let tab_active_bg = colors.element_selected;
+                                let tab_active_bg = colors.tab_active_background;
                                 let tab_hover = colors.ghost_element_hover;
 
                                 let make_tab =
@@ -1042,7 +1046,8 @@ impl Render for Workspace {
                                         let active = mode == current;
                                         div()
                                             .id(SharedString::from(id))
-                                            .h(px(24.))
+                                            .h_full()
+                                            .flex_shrink_0()
                                             .px(px(10.))
                                             .flex()
                                             .items_center()
@@ -1054,12 +1059,17 @@ impl Render for Workspace {
                                             .rounded_t(px(4.))
                                             .text_xs()
                                             .tooltip(Tooltip::text(tooltip))
-                                            .when(!enabled, |el| el.opacity(0.45))
-                                            .when(active, |el| el.bg(tab_active_bg))
+                                            .border_b_2()
+                                            .border_color(colors.border_transparent)
+                                            .when(active, |el| {
+                                                el.bg(tab_active_bg)
+                                                    .border_b_2()
+                                                    .border_color(colors.border_selected)
+                                            })
                                             .when(enabled && !active, |el| {
                                                 el.hover(move |s| s.bg(tab_hover))
                                             })
-                                            .child(Label::new(label).size(LabelSize::XSmall).color(
+                                            .child(Label::new(label).size(LabelSize::Small).color(
                                                 if !enabled {
                                                     Color::Disabled
                                                 } else if active {
@@ -1101,40 +1111,48 @@ impl Render for Workspace {
                                 // graph is toggled, so the one control for both
                                 // directions lives here rather than on the graph.
                                 let graph_toggle = div().h_full().flex().items_center().child(
-                                    IconButton::new(
-                                        "toggle-commit-graph",
-                                        if graph_hidden {
+                                    Button::new("toggle-commit-graph", t!("graph.title"))
+                                        .icon(if graph_hidden {
                                             IconName::ChevronDown
                                         } else {
                                             IconName::ChevronUp
-                                        },
-                                    )
-                                    .size(ButtonSize::Compact)
-                                    .color(Color::Muted)
-                                    .tooltip_fn(keymap::command_tooltip(
-                                        if graph_hidden {
-                                            t!("workspace.graph.show.tooltip")
-                                        } else {
-                                            t!("workspace.graph.hide.tooltip")
-                                        },
-                                        CommandId::ToggleGraph,
-                                    ))
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, _, cx| {
+                                        })
+                                        .size(ButtonSize::Compact)
+                                        .color(Color::Muted)
+                                        .tooltip_fn(keymap::command_tooltip(
+                                            if graph_hidden {
+                                                t!("workspace.graph.show.tooltip")
+                                            } else {
+                                                t!("workspace.graph.hide.tooltip")
+                                            },
+                                            CommandId::ToggleGraph,
+                                        ))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                             cx.stop_propagation();
                                             this.execute_command(CommandId::ToggleGraph, cx);
-                                        },
-                                    )),
+                                        })),
                                 );
 
                                 let ws = cx.entity().downgrade();
                                 let ws2 = cx.entity().downgrade();
                                 let ws3 = cx.entity().downgrade();
 
+                                // Command-only views still need an identifiable active mode.
+                                let contextual_title = match bottom_panel_mode {
+                                    BottomPanelMode::Reflog => Some(t!("reflog.title")),
+                                    BottomPanelMode::Submodules => Some(t!("submodules.title")),
+                                    BottomPanelMode::Bisect => Some(t!("bisect.title")),
+                                    BottomPanelMode::GlobalSearch => Some(t!("search.title")),
+                                    _ => None,
+                                };
                                 let tab_bar = div()
+                                    .id("bottom-panel-tabs")
                                     .h_flex()
                                     .w_full()
-                                    .h(px(26.))
+                                    .h(px(32.))
+                                    .min_h(gpui::rems(2.0))
+                                    .flex_shrink_0()
+                                    .overflow_x_scroll()
                                     .bg(tab_bar_bg)
                                     .border_b_1()
                                     .border_color(tab_border)
@@ -1245,6 +1263,23 @@ impl Render for Workspace {
                                             },
                                         ),
                                     )
+                                    .when_some(contextual_title, |el, title| {
+                                        el.child(
+                                            div()
+                                                .h_full()
+                                                .h_flex()
+                                                .flex_shrink_0()
+                                                .px(px(10.))
+                                                .bg(tab_active_bg)
+                                                .border_b_2()
+                                                .border_color(colors.border_selected)
+                                                .child(
+                                                    Label::new(title)
+                                                        .size(LabelSize::Small)
+                                                        .weight(gpui::FontWeight::SEMIBOLD),
+                                                ),
+                                        )
+                                    })
                                     .child(div().flex_1())
                                     .child(graph_toggle);
 
@@ -1325,7 +1360,7 @@ impl Render for Workspace {
                                 .absolute()
                                 .size_full(),
                             )
-                            // Right panel tab bar (Details / Issues / PRs)
+                            // Right panel navigation; scroll rather than squeeze labels at narrow widths.
                             .child({
                                 let is_details =
                                     active_tab.right_panel_mode == RightPanelMode::Details;
@@ -1340,24 +1375,34 @@ impl Render for Workspace {
                                 let ws_prs = cx.entity().downgrade();
                                 let ws_bh = cx.entity().downgrade();
                                 div()
+                                    .id("right-panel-tabs")
                                     .h_flex()
                                     .w_full()
-                                    .h(px(26.))
-                                    .bg(colors.toolbar_background)
+                                    .h(px(32.))
+                                    .min_h(gpui::rems(2.0))
+                                    .flex_shrink_0()
+                                    .overflow_x_scroll()
+                                    .bg(colors.tab_bar_background)
                                     .border_b_1()
                                     .border_color(colors.border_variant)
                                     .child(
                                         div()
                                             .id("right-tab-details")
+                                            .flex_shrink_0()
                                             .h_flex()
                                             .h_full()
                                             .px(px(10.))
                                             .items_center()
                                             .cursor_pointer()
+                                            .border_b_2()
+                                            .border_color(colors.border_transparent)
                                             .when(is_details, |el| {
-                                                el.border_b_2().border_color(colors.text_accent)
+                                                el.bg(colors.tab_active_background)
+                                                    .border_color(colors.border_selected)
                                             })
-                                            .hover(|s| s.bg(colors.ghost_element_hover))
+                                            .when(!is_details, |el| {
+                                                el.hover(|s| s.bg(colors.ghost_element_hover))
+                                            })
                                             .on_click(move |_: &ClickEvent, _, cx| {
                                                 ws_details
                                                     .update(cx, |ws, cx| {
@@ -1373,7 +1418,7 @@ impl Render for Workspace {
                                             })
                                             .child(
                                                 Label::new(t!("common.details"))
-                                                    .size(LabelSize::XSmall)
+                                                    .size(LabelSize::Small)
                                                     .weight(gpui::FontWeight::SEMIBOLD)
                                                     .color(if is_details {
                                                         Color::Default
@@ -1385,15 +1430,21 @@ impl Render for Workspace {
                                     .child(
                                         div()
                                             .id("right-tab-issues")
+                                            .flex_shrink_0()
                                             .h_flex()
                                             .h_full()
                                             .px(px(10.))
                                             .items_center()
                                             .cursor_pointer()
+                                            .border_b_2()
+                                            .border_color(colors.border_transparent)
                                             .when(is_issues, |el| {
-                                                el.border_b_2().border_color(colors.text_accent)
+                                                el.bg(colors.tab_active_background)
+                                                    .border_color(colors.border_selected)
                                             })
-                                            .hover(|s| s.bg(colors.ghost_element_hover))
+                                            .when(!is_issues, |el| {
+                                                el.hover(|s| s.bg(colors.ghost_element_hover))
+                                            })
                                             .on_click(move |_: &ClickEvent, _, cx| {
                                                 ws_issues
                                                     .update(cx, |ws, cx| {
@@ -1417,7 +1468,7 @@ impl Render for Workspace {
                                             })
                                             .child(
                                                 Label::new(t!("common.issues"))
-                                                    .size(LabelSize::XSmall)
+                                                    .size(LabelSize::Small)
                                                     .weight(gpui::FontWeight::SEMIBOLD)
                                                     .color(if is_issues {
                                                         Color::Default
@@ -1429,15 +1480,21 @@ impl Render for Workspace {
                                     .child(
                                         div()
                                             .id("right-tab-prs")
+                                            .flex_shrink_0()
                                             .h_flex()
                                             .h_full()
                                             .px(px(10.))
                                             .items_center()
                                             .cursor_pointer()
+                                            .border_b_2()
+                                            .border_color(colors.border_transparent)
                                             .when(is_prs, |el| {
-                                                el.border_b_2().border_color(colors.text_accent)
+                                                el.bg(colors.tab_active_background)
+                                                    .border_color(colors.border_selected)
                                             })
-                                            .hover(|s| s.bg(colors.ghost_element_hover))
+                                            .when(!is_prs, |el| {
+                                                el.hover(|s| s.bg(colors.ghost_element_hover))
+                                            })
                                             .on_click(move |_: &ClickEvent, _, cx| {
                                                 ws_prs
                                                     .update(cx, |ws, cx| {
@@ -1461,7 +1518,7 @@ impl Render for Workspace {
                                             })
                                             .child(
                                                 Label::new(t!("workspace.prs_tab"))
-                                                    .size(LabelSize::XSmall)
+                                                    .size(LabelSize::Small)
                                                     .weight(gpui::FontWeight::SEMIBOLD)
                                                     .color(if is_prs {
                                                         Color::Default
@@ -1473,15 +1530,21 @@ impl Render for Workspace {
                                     .child(
                                         div()
                                             .id("right-tab-branch-health")
+                                            .flex_shrink_0()
                                             .h_flex()
                                             .h_full()
                                             .px(px(10.))
                                             .items_center()
                                             .cursor_pointer()
+                                            .border_b_2()
+                                            .border_color(colors.border_transparent)
                                             .when(is_bh, |el| {
-                                                el.border_b_2().border_color(colors.text_accent)
+                                                el.bg(colors.tab_active_background)
+                                                    .border_color(colors.border_selected)
                                             })
-                                            .hover(|s| s.bg(colors.ghost_element_hover))
+                                            .when(!is_bh, |el| {
+                                                el.hover(|s| s.bg(colors.ghost_element_hover))
+                                            })
                                             .on_click(move |_: &ClickEvent, _, cx| {
                                                 ws_bh
                                                     .update(cx, |ws, cx| {
@@ -1497,7 +1560,7 @@ impl Render for Workspace {
                                             })
                                             .child(
                                                 Label::new(t!("workspace.branch_health_tab"))
-                                                    .size(LabelSize::XSmall)
+                                                    .size(LabelSize::Small)
                                                     .weight(gpui::FontWeight::SEMIBOLD)
                                                     .color(if is_bh {
                                                         Color::Default
@@ -1507,7 +1570,30 @@ impl Render for Workspace {
                                             ),
                                     )
                             })
-                            // Panel content area — shows either details or issues
+                            // Panel content area — shows the selected repository view
+                            .when(
+                                active_tab.right_panel_mode == RightPanelMode::Stashes,
+                                |el| {
+                                    el.child(
+                                        div()
+                                            .h_flex()
+                                            .h(px(28.))
+                                            .min_h(gpui::rems(1.75))
+                                            .flex_shrink_0()
+                                            .px(px(10.))
+                                            .gap(px(6.))
+                                            .bg(colors.tab_active_background)
+                                            .border_b_1()
+                                            .border_color(colors.border_selected)
+                                            .child(Icon::new(IconName::Stash).size(IconSize::Small))
+                                            .child(
+                                                Label::new(t!("common.stashes"))
+                                                    .size(LabelSize::Small)
+                                                    .weight(gpui::FontWeight::SEMIBOLD),
+                                            ),
+                                    )
+                                },
+                            )
                             .child(
                                 div()
                                     .id("right-panel-content")

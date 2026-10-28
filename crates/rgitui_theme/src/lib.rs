@@ -1,9 +1,16 @@
 mod colors;
+mod contrast;
+mod forest;
 pub mod json_theme;
 mod theme;
 
 pub use colors::*;
+pub use contrast::{contrast_ratio, contrast_text_on};
+pub use forest::{forest_colors, forest_status};
 pub use theme::*;
+
+/// Embedded proportional font for interface chrome; code and hashes stay monospace.
+pub const DEFAULT_UI_FONT_FAMILY: &str = "IBM Plex Sans";
 
 /// Set the active theme by name. Convenience wrapper around ThemeState.
 pub fn set_theme(name: &str, cx: &mut gpui::App) {

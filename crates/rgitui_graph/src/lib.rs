@@ -1801,7 +1801,7 @@ impl Render for GraphView {
                 .id("graph-view")
                 .v_flex()
                 .size_full()
-                .bg(colors.panel_background)
+                .bg(colors.editor_background)
                 // Header bar — consistent with other panels
                 .child(
                     div()
@@ -1823,7 +1823,7 @@ impl Render for GraphView {
                         .child(
                             Label::new(t!("graph.title"))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted)
+                                .color(Color::Default)
                                 .weight(gpui::FontWeight::SEMIBOLD),
                         ),
                 )
@@ -1852,10 +1852,10 @@ impl Render for GraphView {
         let selected_bg = colors.element_selected;
         let hover_bg = colors.ghost_element_hover;
         let active_bg = colors.ghost_element_active;
-        let panel_bg = colors.panel_background;
+        let panel_bg = colors.editor_background;
         let border_color = colors.border_variant;
         let accent_border = colors.border_focused;
-        let selected_border = colors.border_focused;
+        let selected_border = colors.border_selected;
 
         // Search highlight colors (derived from theme accent with adjusted alpha)
         let search_match_bg = gpui::Hsla {
@@ -2003,7 +2003,7 @@ impl Render for GraphView {
                         .child(
                             Label::new(t!("graph.title"))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted)
+                                .color(Color::Default)
                                 .weight(gpui::FontWeight::SEMIBOLD),
                         ),
                 )
@@ -2024,7 +2024,7 @@ impl Render for GraphView {
                     div().flex_1().child(
                         Label::new(t!("graph.column.message"))
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted)
+                            .color(Color::Default)
                             .weight(gpui::FontWeight::SEMIBOLD),
                     ),
                 )
@@ -2421,8 +2421,10 @@ impl Render for GraphView {
                         } else if selected {
                             selected_border
                         } else {
+                            // Reserve the edge marker for selection and HEAD;
+                            // lane colours already identify the other commits.
                             gpui::Hsla {
-                                a: 0.4,
+                                a: 0.0,
                                 ..node_color
                             }
                         };
@@ -2810,7 +2812,7 @@ impl Render for GraphView {
                         );
 
                         row = row.child(
-                            div().w(px(80.)).flex_shrink_0().child(
+                            div().w(px(80.)).flex_shrink_0().font_family("Lilex").child(
                                 Label::new(hash_display)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
@@ -2843,13 +2845,15 @@ impl Render for GraphView {
                                 );
                             }
 
-                            let summary_label = if is_head_row {
+                            let summary_label = if is_head_row || selected {
                                 Label::new(summary)
                                     .size(LabelSize::Small)
                                     .weight(gpui::FontWeight::SEMIBOLD)
                                     .truncate()
                             } else {
-                                Label::new(summary).size(LabelSize::Small).truncate()
+                                Label::new(summary)
+                                    .size(LabelSize::Small)
+                                    .truncate()
                             };
                             message_col = message_col.child(summary_label);
 

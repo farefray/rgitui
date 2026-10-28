@@ -131,6 +131,16 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.persist_bounds_if_changed(window, cx);
 
+        let family = cx
+            .try_global::<SettingsState>()
+            .map(|state| state.settings().ui_font.as_str())
+            .filter(|family| !family.is_empty())
+            .unwrap_or(rgitui_theme::DEFAULT_UI_FONT_FAMILY);
+        let locale = cx
+            .try_global::<rgitui_i18n::ActiveLanguage>()
+            .map(|language| language.locale().id.as_str())
+            .unwrap_or("en");
+        let ui_font = crate::Workspace::build_ui_font(family, locale);
         let background = cx.colors().background;
         let border_variant = cx.colors().border_variant;
         let body = self
@@ -145,6 +155,7 @@ impl Render for SettingsWindow {
             })
             .v_flex()
             .size_full()
+            .font(ui_font)
             .bg(background)
             .child(div().flex_1().min_h_0().child(body))
             .child(
