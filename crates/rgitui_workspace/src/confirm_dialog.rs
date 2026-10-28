@@ -224,7 +224,10 @@ impl ConfirmDialog {
             ConfirmAction::AbortOperation(state) => (abort_title(*state), t!("confirm.body.abort")),
             ConfirmAction::WorktreeRemove(path) => (
                 t!("confirm.title.remove_worktree"),
-                t!("confirm.body.remove_worktree", path = path),
+                t!(
+                    "confirm.body.remove_worktree",
+                    path = rgitui_git::display_path(std::path::Path::new(path))
+                ),
             ),
         }
     }

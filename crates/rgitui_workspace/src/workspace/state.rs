@@ -76,6 +76,8 @@ pub(crate) struct OperationState {
     pub active_git_operation_target: Option<GitOperationTarget>,
     pub last_failed_git_operation: Option<GitOperationUpdate>,
     pub last_failed_git_operation_target: Option<GitOperationTarget>,
+    /// Whether the failure banner shows its details in full.
+    pub failure_details_expanded: bool,
     pub active_operations: Vec<ActiveOperation>,
     pub last_operation_output: Option<OperationOutput>,
     /// The panel the in-flight AI generation writes to. The generator refuses

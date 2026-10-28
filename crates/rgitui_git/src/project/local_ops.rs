@@ -309,6 +309,69 @@ fn merge_branch_in_worktree(operation_path: &Path, branch_name: &str) -> Result<
     })
 }
 
+/// Whether `worktree_path` is a linked worktree registered with the repository
+/// at `repo_path`. The main checkout never is.
+fn is_registered_worktree(repo_path: &Path, worktree_path: &Path) -> Result<bool> {
+    let repo = Repository::open(repo_path)?;
+    let wanted = super::refresh::worktree_identity(worktree_path);
+    let names = repo.worktrees()?;
+    Ok(names
+        .iter()
+        .flatten()
+        .filter_map(|name| repo.find_worktree(name).ok())
+        .any(|worktree| super::refresh::worktree_identity(worktree.path()) == wanted))
+}
+
+/// Delete the linked worktree at `worktree_path` and everything in it.
+///
+/// Git for Windows cannot delete a path longer than `MAX_PATH` unless
+/// `core.longpaths` is set. And once `git worktree remove` starts deleting, it
+/// unregisters the worktree even if some files could not be deleted, leaving a
+/// folder that no list shows any more. So the folder of a worktree that was
+/// registered when this started is finished off here, and only reported when
+/// that fails too. Anything not registered is left alone.
+fn remove_linked_worktree(repo_path: &Path, worktree_path: &Path, name: &str) -> Result<()> {
+    if !is_registered_worktree(repo_path, worktree_path)? {
+        return Err(error(msg!(
+            "git.remove_worktree.not_registered",
+            name = name
+        )));
+    }
+    let mut command = super::git_command();
+    if cfg!(windows) {
+        command.args(["-c", "core.longpaths=true"]);
+    }
+    let output = command
+        .current_dir(repo_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
+        .output()
+        .context("Failed to execute git worktree remove")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if is_registered_worktree(repo_path, worktree_path)? {
+        // Git stopped before deleting anything, at a locked worktree for
+        // example. Its own explanation is the most useful thing to show.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            anyhow::bail!("git worktree remove exited with {}", output.status);
+        }
+        anyhow::bail!("{stderr}");
+    }
+    match std::fs::remove_dir_all(worktree_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(error(msg!(
+            "git.remove_worktree.leftover_files",
+            name = name,
+            path = super::display_path(worktree_path),
+            error = e.to_string()
+        ))),
+    }
+}
+
 impl GitProject {
     /// Stage specific files in the given worktree.
     pub fn stage_files_at(
@@ -3437,63 +3500,70 @@ impl GitProject {
         })
     }
 
-    /// Remove a Git worktree.
+    /// Remove a linked Git worktree: its folder, uncommitted changes included,
+    /// and its registration. The branch it had checked out is kept.
     pub fn remove_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) -> Task<Result<()>> {
         log::info!("remove_worktree: path={}", path.display());
-        let display_path = path.display().to_string();
+        let name = self
+            .worktree_at(&path)
+            .map(|worktree| worktree.name.clone())
+            .unwrap_or_else(|| super::checkout_display_name(&path));
         let operation_id = self.begin_operation(
             GitOperationKind::Worktree,
-            msg!("git.remove_worktree.running", path = &display_path),
+            msg!("git.remove_worktree.running", name = &name),
             None,
             self.head_branch.clone(),
             cx,
         );
         let repo_path = self.repo_path.clone();
         let commit_limit = self.commit_limit;
-        let display_path_async = display_path.clone();
+        let name_async = name.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = cx
+            let (removal, refresh) = cx
                 .background_executor()
                 .spawn(async move {
-                    let output = super::git_command()
-                        .current_dir(&repo_path)
-                        .args(["worktree", "remove", "--force", &display_path_async])
-                        .output()
-                        .context("Failed to execute git worktree remove")?;
-
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !output.status.success() {
-                        anyhow::bail!("git worktree remove failed: {}", stderr.trim());
-                    }
-
-                    gather_refresh_data(&repo_path, commit_limit)
+                    let removal = remove_linked_worktree(&repo_path, &path, &name_async);
+                    // Refresh either way: a failed removal can still have
+                    // unregistered the worktree, and the list must say so.
+                    (removal, gather_refresh_data(&repo_path, commit_limit))
                 })
                 .await;
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
-                    match result {
+                    let refreshed = match refresh {
                         Ok(data) => {
                             this.apply_refresh_data(data);
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!("refresh after removing worktree failed: {e:#}");
+                            false
+                        }
+                    };
+                    match removal {
+                        Ok(()) => {
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Worktree,
-                                msg!("git.remove_worktree.done", path = &display_path),
+                                msg!("git.remove_worktree.done", name = &name),
                                 (None, None, this.head_branch.clone()),
                                 cx,
                             );
-                            cx.emit(GitProjectEvent::RepositoryChanged);
                         }
                         Err(e) => {
                             this.fail_op(
                                 operation_id,
                                 GitOperationKind::Worktree,
-                                msg!("git.remove_worktree.failed", path = &display_path),
+                                msg!("git.remove_worktree.failed", name = &name),
                                 error_message(&e),
                                 (None, this.head_branch.clone(), false),
                                 cx,
                             );
                         }
+                    }
+                    if refreshed {
+                        cx.emit(GitProjectEvent::RepositoryChanged);
                     }
                     cx.notify();
                     Ok(())
@@ -7923,6 +7993,52 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert!(!worktree_path.exists());
+    }
+
+    /// Git for Windows fails to delete paths beyond `MAX_PATH` without
+    /// `core.longpaths`, and then leaves an unregistered folder behind.
+    #[test]
+    fn removing_a_worktree_deletes_deep_paths_and_uncommitted_files() {
+        let fixture = make_test_repo();
+        let path = fixture.path();
+        let parent = tempfile::TempDir::new().unwrap();
+        let worktree_path = parent.path().join("deep-worktree");
+        fixture
+            .repo()
+            .worktree("deep-worktree", &worktree_path, None)
+            .unwrap();
+        let mut deep = worktree_path.clone();
+        for _ in 0..10 {
+            deep.push("a-directory-name-of-some-length");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("untracked.txt"), "work in progress").unwrap();
+        fs::write(worktree_path.join("notes.txt"), "uncommitted").unwrap();
+        assert!(deep.join("untracked.txt").as_os_str().len() > 300);
+
+        super::remove_linked_worktree(path, &worktree_path, "deep-worktree").unwrap();
+
+        assert!(!worktree_path.exists());
+        assert!(!super::is_registered_worktree(path, &worktree_path).unwrap());
+    }
+
+    #[test]
+    fn removing_an_unregistered_folder_deletes_nothing() {
+        let fixture = make_test_repo();
+        let stray = tempfile::TempDir::new().unwrap();
+        fs::write(stray.path().join("keep.txt"), "not a worktree").unwrap();
+
+        let error =
+            super::remove_linked_worktree(fixture.path(), stray.path(), "stray").unwrap_err();
+
+        assert!(
+            error.to_string().contains("no longer a worktree"),
+            "{error}"
+        );
+        assert!(stray.path().join("keep.txt").exists());
+        // Nor can the main checkout be removed this way.
+        assert!(super::remove_linked_worktree(fixture.path(), fixture.path(), "main").is_err());
+        assert!(fixture.path().join(".git").exists());
     }
 
     // -------------------------------------------------------------------------

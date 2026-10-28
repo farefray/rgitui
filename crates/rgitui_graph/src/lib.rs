@@ -82,28 +82,149 @@ fn lane_center(lane: usize, lane_width: f32, padding: f32) -> f32 {
     padding + (lane as f32 + 0.5) * lane_width
 }
 
-/// One primary label plus a bounded +N affordance; all full names remain available.
-fn ref_presentation(refs: &[RefLabel]) -> (Option<RefLabel>, usize, Vec<String>) {
-    let compact = compact_ref_labels(refs);
-    let primary = compact
+/// The checkout a local branch is checked out in.
+#[derive(Clone, Debug, PartialEq)]
+struct BranchCheckout {
+    name: String,
+    path: PathBuf,
+    /// The checkout whose HEAD the graph marks.
+    is_current: bool,
+}
+
+/// Which checkout has each local branch out. Git allows a branch in only one.
+fn branch_checkouts(worktrees: &[WorktreeGraphInfo]) -> HashMap<String, BranchCheckout> {
+    worktrees
         .iter()
-        .min_by_key(|entry| match entry.label {
-            RefLabel::LocalBranch(_) => 0,
-            RefLabel::Tag(_) => 1,
-            RefLabel::RemoteBranch(_) => 2,
-            RefLabel::Head => 3,
+        .filter_map(|info| {
+            let branch = info.branch.clone().filter(|branch| !branch.is_empty())?;
+            Some((
+                branch,
+                BranchCheckout {
+                    name: info.name.clone(),
+                    path: info.worktree_path.clone(),
+                    is_current: info.is_current,
+                },
+            ))
         })
-        .map(|entry| entry.label.clone());
-    let names = refs
+        .collect()
+}
+
+/// One entry of a commit's ref badge.
+#[derive(Clone, Debug, PartialEq)]
+struct RefEntry {
+    label: RefLabel,
+    /// Remote-tracking refs at the same commit, folded into this local branch.
+    remotes: Vec<String>,
+    /// HEAD is on this branch, so HEAD is not listed separately.
+    is_head: bool,
+    /// The linked worktree that has this branch checked out: name and path.
+    worktree: Option<(String, PathBuf)>,
+}
+
+impl RefEntry {
+    fn icon(&self) -> IconName {
+        match &self.label {
+            RefLabel::Tag(_) => IconName::Tag,
+            RefLabel::Head => IconName::Check,
+            _ if self.worktree.is_some() => IconName::Folder,
+            _ => IconName::GitBranch,
+        }
+    }
+
+    /// The badge text. `head_text` names a HEAD with no branch of its own.
+    fn name(&self, head_text: &SharedString) -> SharedString {
+        match &self.label {
+            RefLabel::Head => head_text.clone(),
+            label => label.display_name().to_owned().into(),
+        }
+    }
+
+    /// What else is true of this ref, each a short phrase of its own.
+    fn notes(&self) -> Vec<SharedString> {
+        let mut notes = Vec::new();
+        if self.is_head {
+            notes.push(SharedString::new_static("HEAD"));
+        }
+        match &self.label {
+            RefLabel::LocalBranch(name) => {
+                notes.extend(
+                    self.remotes
+                        .iter()
+                        .map(|remote| SharedString::from(format!("{remote}/{name}"))),
+                );
+            }
+            RefLabel::RemoteBranch(_) => notes.push(t!("graph.refs.remote")),
+            RefLabel::Tag(_) => notes.push(t!("graph.refs.tag")),
+            RefLabel::Head => {}
+        }
+        if let Some((worktree, _)) = &self.worktree {
+            notes.push(t!("graph.refs.in_worktree", name = worktree));
+        }
+        notes
+    }
+
+    fn summary(&self, head_text: &SharedString) -> String {
+        std::iter::once(self.name(head_text))
+            .chain(self.notes())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+/// A commit's refs in badge order: the branch HEAD is on, other local
+/// branches, tags, remote-only branches, then a detached HEAD. The first is
+/// the badge; the rest are its `+N`.
+///
+/// A remote branch matching a local one, and an attached HEAD, are folded into
+/// that branch rather than counted again.
+fn ref_entries(refs: &[RefLabel], checkouts: &HashMap<String, BranchCheckout>) -> Vec<RefEntry> {
+    let compact = compact_ref_labels(refs);
+    let head_branch = compact
         .iter()
-        .map(|label| match label {
-            RefLabel::Head => "HEAD".to_owned(),
-            RefLabel::LocalBranch(name) => format!("refs/heads/{name}"),
-            RefLabel::RemoteBranch(name) => format!("refs/remotes/{name}"),
-            RefLabel::Tag(name) => format!("refs/tags/{name}"),
+        .any(|entry| entry.label == RefLabel::Head)
+        .then(|| {
+            compact.iter().find_map(|entry| match &entry.label {
+                RefLabel::LocalBranch(name)
+                    if checkouts
+                        .get(name)
+                        .is_some_and(|checkout| checkout.is_current) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+        })
+        .flatten();
+    let mut entries: Vec<RefEntry> = compact
+        .into_iter()
+        .filter(|entry| head_branch.is_none() || entry.label != RefLabel::Head)
+        .map(|entry| {
+            let (is_head, worktree) = match &entry.label {
+                RefLabel::LocalBranch(name) => (
+                    head_branch.as_ref() == Some(name),
+                    checkouts
+                        .get(name)
+                        .filter(|checkout| !checkout.is_current)
+                        .map(|checkout| (checkout.name.clone(), checkout.path.clone())),
+                ),
+                _ => (false, None),
+            };
+            RefEntry {
+                label: entry.label,
+                remotes: entry.remotes,
+                is_head,
+                worktree,
+            }
         })
         .collect();
-    (primary, refs.len().saturating_sub(1), names)
+    entries.sort_by_key(|entry| match entry.label {
+        RefLabel::LocalBranch(_) if entry.is_head => 0,
+        RefLabel::LocalBranch(_) => 1,
+        RefLabel::Tag(_) => 2,
+        RefLabel::RemoteBranch(_) => 3,
+        RefLabel::Head => 4,
+    });
+    entries
 }
 
 /// Width of the commit graph context menu.
@@ -431,11 +552,32 @@ pub struct WorktreeGraphInfo {
     pub head_unborn: bool,
     pub staged_count: usize,
     pub unstaged_count: usize,
+    /// Whether the counts come from a scan. Zero counts without one do not
+    /// mean the checkout is clean.
+    pub status_known: bool,
     pub combined_breakdown: HashMap<FileChangeKind, usize>,
     pub worktree_path: PathBuf,
     /// Checked-out branch, or `None` when HEAD is detached.
     pub branch: Option<String>,
     pub head_detached: bool,
+}
+
+/// Whether a checkout gets a row of its own in the graph.
+///
+/// A clean checkout is fully described by its branch badge, which names the
+/// worktree that has the branch out, so a row would only repeat it. Rows are
+/// kept for what a badge cannot show: uncommitted changes, a confirmed unborn
+/// HEAD, and the linked checkout being viewed. `show_all` restores every row.
+fn worktree_gets_row(
+    info: &WorktreeGraphInfo,
+    viewed: Option<&std::path::Path>,
+    show_all: bool,
+) -> bool {
+    show_all
+        || info.staged_count > 0
+        || info.unstaged_count > 0
+        || (info.head_oid.is_none() && info.head_unborn)
+        || (!info.is_current && viewed == Some(info.worktree_path.as_path()))
 }
 
 #[derive(Clone, Debug)]
@@ -887,8 +1029,12 @@ pub struct GraphView {
     /// list-index ↔ commit-index mapping.
     worktree_rows: Vec<usize>,
     virtual_rows_prefix: Arc<Vec<usize>>,
+    /// The linked checkout the window is showing, or `None` for the opened one.
+    viewed_checkout: Option<PathBuf>,
+    /// Give every checkout a row, clean ones included.
+    show_all_worktrees: bool,
     show_settings_popover: bool,
-    ref_details: Option<Arc<Vec<String>>>,
+    ref_details: Option<Arc<Vec<RefEntry>>>,
     ref_details_scroll: ScrollHandle,
     /// SHA display length: 0 = default short (7), or specific length (7/8/10/12/40).
     sha_display_length: u8,
@@ -967,6 +1113,8 @@ impl GraphView {
             worktree_row_positions: Vec::new(),
             worktree_rows: Vec::new(),
             virtual_rows_prefix: Arc::new(Vec::new()),
+            viewed_checkout: None,
+            show_all_worktrees: false,
             show_settings_popover: false,
             ref_details: None,
             ref_details_scroll: ScrollHandle::new(),
@@ -1212,8 +1360,34 @@ impl GraphView {
     /// Update the worktree node data shown in the graph.
     pub fn set_worktree_statuses(&mut self, infos: Vec<WorktreeGraphInfo>, cx: &mut Context<Self>) {
         let selected_worktree = self.selected_worktree_path().map(PathBuf::from);
-        // A checkout is a navigation target even when clean or not yet scanned.
         self.worktree_infos = infos;
+        self.relayout_worktree_rows(selected_worktree, cx);
+    }
+
+    /// Record the linked checkout the window is showing (`None` for the opened
+    /// one). A clean worktree keeps its row while viewed, to show where you are.
+    pub fn set_viewed_checkout(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.viewed_checkout == path {
+            return;
+        }
+        let selected_worktree = self.selected_worktree_path().map(PathBuf::from);
+        self.viewed_checkout = path;
+        self.relayout_worktree_rows(selected_worktree, cx);
+    }
+
+    fn set_show_all_worktrees(&mut self, show_all: bool, cx: &mut Context<Self>) {
+        let selected_worktree = self.selected_worktree_path().map(PathBuf::from);
+        self.show_all_worktrees = show_all;
+        self.relayout_worktree_rows(selected_worktree, cx);
+    }
+
+    /// Lay the worktree rows out again, keeping the cursor on the same
+    /// checkout or commit rather than the same visual index.
+    fn relayout_worktree_rows(
+        &mut self,
+        selected_worktree: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         self.recompute_worktree_positions();
         // Worktree discovery/removal can shift rows. Keep selection attached to
         // the checkout path, never to its previous visual index.
@@ -1234,12 +1408,29 @@ impl GraphView {
     }
 
     fn recompute_worktree_positions(&mut self) {
-        self.worktree_row_positions = compute_worktree_row_positions(
+        let viewed = self.viewed_checkout.as_deref();
+        let shown: Vec<usize> = self
+            .worktree_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| worktree_gets_row(info, viewed, self.show_all_worktrees))
+            .map(|(index, _)| index)
+            .collect();
+        let shown_infos: Vec<WorktreeGraphInfo> = shown
+            .iter()
+            .map(|&index| self.worktree_infos[index].clone())
+            .collect();
+        let mut positions = compute_worktree_row_positions(
             &self.commits,
             &self.graph_rows,
-            &self.worktree_infos,
+            &shown_infos,
             self.global_max_lane,
         );
+        // Positions index the shown subset; point them back at the full list.
+        for position in &mut positions {
+            position.worktree_idx = shown[position.worktree_idx];
+        }
+        self.worktree_row_positions = positions;
         // `compute_worktree_row_positions` returns positions sorted by list index,
         // which is what the mapping helpers rely on.
         self.worktree_rows = self
@@ -2049,6 +2240,7 @@ impl Render for GraphView {
         } else {
             SharedString::new_static("HEAD")
         };
+        let popup_head_text = head_badge_text.clone();
         let working_tree_bg = gpui::Hsla {
             a: 0.06,
             ..status_colors.warning
@@ -2065,6 +2257,7 @@ impl Render for GraphView {
         let selected_index = self.selected_index;
         let selected_rows = Arc::clone(&self.selected_rows);
         let worktree_infos = self.worktree_infos.clone();
+        let branch_checkouts = Arc::new(branch_checkouts(&worktree_infos));
         let worktree_row_positions = self.worktree_row_positions.clone();
         let virtual_rows_prefix = self.virtual_rows_prefix.clone();
         let view: WeakEntity<GraphView> = cx.weak_entity();
@@ -2453,6 +2646,7 @@ impl Render for GraphView {
                                 selected: selected_index == Some(i),
                                 staged_count: info.staged_count,
                                 unstaged_count: info.unstaged_count,
+                                status_known: info.status_known,
                                 combined_breakdown: info.combined_breakdown.clone(),
                                 worktree_name: info.name.clone(),
                                 worktree_path: info.worktree_path.clone(),
@@ -2536,12 +2730,12 @@ impl Render for GraphView {
                         );
                         let has_incoming = graph_row.has_incoming || has_virtual_parent_above;
 
-                        let (primary_ref, ref_overflow, ref_names) = if show_ref_badges {
-                            ref_presentation(&commit.refs)
+                        let ref_entries = if show_ref_badges {
+                            ref_entries(&commit.refs, &branch_checkouts)
                         } else {
-                            (None, 0, Vec::new())
+                            Vec::new()
                         };
-                        let has_ref_connector = primary_ref.is_some();
+                        let has_ref_connector = !ref_entries.is_empty();
 
                         let hash_display: SharedString = match sha_display_length {
                             0 => commit.short_id.clone().into(),
@@ -2642,18 +2836,17 @@ impl Render for GraphView {
 
                         if show_ref_badges {
                             let mut ref_column = div().w(px(ref_col_width)).flex_shrink_0().h_flex().justify_end();
-                            if let Some(label) = primary_ref {
-                                let text: SharedString = if matches!(label, RefLabel::Head) {
-                                    head_badge_text.clone()
-                                } else {
-                                    label.display_name().to_owned().into()
-                                };
-                                let icon = match label {
-                                    RefLabel::Tag(_) => IconName::Tag,
-                                    RefLabel::Head => IconName::Check,
-                                    _ => IconName::GitBranch,
-                                };
-                                let details = Arc::new(ref_names);
+                            if let Some(primary) = ref_entries.first() {
+                                let text = primary.name(&head_badge_text);
+                                let icon = primary.icon();
+                                let is_head_branch = primary.is_head;
+                                let ref_overflow = ref_entries.len() - 1;
+                                let tooltip_text = ref_entries
+                                    .iter()
+                                    .map(|entry| entry.summary(&head_badge_text))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let details = Arc::new(ref_entries);
                                 let key_details = details.clone();
                                 let ref_view = view.clone();
                                 let key_view = view.clone();
@@ -2665,7 +2858,7 @@ impl Render for GraphView {
                                         .bg(gpui::Hsla { a: 0.12, ..node_color })
                                         .border_1().border_color(gpui::Hsla { a: 0.65, ..node_color })
                                         .focus_visible(move |s| s.border_color(selected_border))
-                                        .tooltip(Tooltip::text(details.join("\n")))
+                                        .tooltip(Tooltip::text(tooltip_text))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .on_click(move |_: &ClickEvent, _, cx| {
                                             cx.stop_propagation();
@@ -2687,7 +2880,9 @@ impl Render for GraphView {
                                         })
                                         .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(node_color)))
                                         .child(div().min_w_0().overflow_hidden().child(
-                                            Label::new(text).size(LabelSize::XSmall).color(Color::Custom(node_color)).truncate(),
+                                            Label::new(text).size(LabelSize::XSmall).color(Color::Custom(node_color))
+                                                .when(is_head_branch, |label| label.weight(gpui::FontWeight::SEMIBOLD))
+                                                .truncate(),
                                         ))
                                         .when(ref_overflow > 0, |el| el.child(
                                             div().flex_shrink_0().child(Label::new(format!("+{ref_overflow}")).size(LabelSize::XSmall).color(Color::Custom(node_color))),
@@ -3477,7 +3672,75 @@ impl Render for GraphView {
             }
         }
 
-        if let Some(details) = &self.ref_details {
+        if let Some(details) = self.ref_details.clone() {
+            let entries = details.iter().enumerate().map(|(index, entry)| {
+                let notes = entry.notes();
+                let mut row = div()
+                    .id(ElementId::NamedInteger(
+                        "graph-ref-detail".into(),
+                        index as u64,
+                    ))
+                    .h_flex()
+                    .flex_shrink_0()
+                    .gap(px(8.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(px(3.))
+                    .child(
+                        Icon::new(entry.icon())
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Label::new(entry.name(&popup_head_text))
+                                    .size(LabelSize::Small)
+                                    .when(entry.is_head, |label| {
+                                        label.weight(gpui::FontWeight::SEMIBOLD)
+                                    })
+                                    .truncate(),
+                            )
+                            .when(!notes.is_empty(), |el| {
+                                el.child(
+                                    Label::new(notes.join(" · "))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                            }),
+                    );
+                // A branch with its own checkout is the way into that checkout.
+                if let Some((name, path)) = entry.worktree.clone() {
+                    let view_open = cx.weak_entity();
+                    row = row
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |s| s.bg(hover_bg))
+                        .tooltip(Tooltip::text(t!("graph.refs.open_worktree", name = &name)))
+                        .on_click(move |_: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            view_open
+                                .update(cx, |this, cx| {
+                                    this.ref_details = None;
+                                    cx.emit(GraphViewEvent::WorktreeNodeSelected {
+                                        worktree_path: path.clone(),
+                                        name: name.clone(),
+                                    });
+                                    cx.notify();
+                                })
+                                .ok();
+                        })
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                }
+                row
+            });
             container = container.child(
                 div()
                     .id("graph-ref-details")
@@ -3491,19 +3754,13 @@ impl Render for GraphView {
                     .overflow_scroll()
                     .track_scroll(&self.ref_details_scroll)
                     .occlude()
-                    .p(px(8.))
+                    .p(px(4.))
                     .rounded(px(4.))
                     .bg(colors.elevated_surface_background)
                     .border_1()
                     .border_color(border_color)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .children(details.iter().map(|name| {
-                        div()
-                            .py(px(3.))
-                            .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .child(Label::new(name.clone()).size(LabelSize::Small))
-                    })),
+                    .children(entries),
             );
         }
 
@@ -3574,6 +3831,12 @@ impl Render for GraphView {
             } else {
                 CheckState::Unchecked
             };
+            let all_worktrees_state = if self.show_all_worktrees {
+                CheckState::Checked
+            } else {
+                CheckState::Unchecked
+            };
+            let view_all_worktrees = cx.weak_entity();
 
             let popover = div()
                 .id("graph-settings-popover")
@@ -3885,6 +4148,31 @@ impl Render for GraphView {
                         })
                         .child(Checkbox::new("cb-ref-badges", ref_badges_state))
                         .child(Label::new(t!("graph.display.badges")).size(LabelSize::XSmall)),
+                )
+                .child(
+                    div()
+                        .id("toggle-all-worktrees")
+                        .h_flex()
+                        .w_full()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .gap(px(8.))
+                        .items_center()
+                        .cursor(CursorStyle::PointingHand)
+                        .rounded(px(3.))
+                        .hover(move |s| s.bg(popover_hover))
+                        .tooltip(Tooltip::text(t!("graph.display.all_worktrees.tooltip")))
+                        .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                            view_all_worktrees
+                                .update(cx, |this: &mut GraphView, cx| {
+                                    this.set_show_all_worktrees(!this.show_all_worktrees, cx);
+                                })
+                                .ok();
+                        })
+                        .child(Checkbox::new("cb-all-worktrees", all_worktrees_state))
+                        .child(
+                            Label::new(t!("graph.display.all_worktrees")).size(LabelSize::XSmall),
+                        ),
                 );
 
             container = container.child(popover);
@@ -3901,6 +4189,7 @@ struct WorkingTreeRowParams {
     selected: bool,
     staged_count: usize,
     unstaged_count: usize,
+    status_known: bool,
     combined_breakdown: HashMap<FileChangeKind, usize>,
     worktree_name: String,
     worktree_path: PathBuf,
@@ -3952,6 +4241,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         selected,
         staged_count,
         unstaged_count,
+        status_known,
         combined_breakdown,
         worktree_name,
         worktree_path,
@@ -4042,11 +4332,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
     // the row would otherwise read identically to a worktree whose branch simply
     // failed to load.
     let branch_name = branch_name.filter(|branch| !branch.is_empty());
-    let worktree_label = if is_current_worktree {
-        t!("graph.worktree.working_directory", name = worktree_name)
-    } else {
-        t!("graph.worktree.label", name = worktree_name)
-    };
+    let worktree_label = SharedString::from(worktree_name);
     let branch_label = branch_name
         .clone()
         .map(SharedString::from)
@@ -4058,18 +4344,22 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
             }
         });
     let enter_tooltip = t!(
-        "graph.worktree.enter_tooltip",
-        label = worktree_label.clone(),
+        "graph.worktree.tooltip",
+        name = worktree_label.clone(),
         branch = branch_label.clone(),
-        path = worktree_path.display().to_string(),
+        path = rgitui_git::display_path(&worktree_path),
     );
-    // Zero counts can also mean status has not loaded. A branch-only title is
-    // accurate for both cases; never claim pending changes or confirmed clean.
+    // Zero counts can also mean status has not loaded. Then a branch-only title
+    // is accurate either way; never claim pending changes or confirmed clean.
     let is_unborn_worktree = confirmed_unborn_worktree(is_orphan_worktree, head_unborn);
     let row_title = if is_orphan_worktree && !is_unborn_worktree {
         t!("graph.worktree.details_unavailable")
     } else if !has_changes && !is_orphan_worktree {
-        branch_label
+        match (status_known, branch_name) {
+            (false, _) => branch_label,
+            (true, Some(branch)) => t!("graph.worktree.clean_on", branch = branch),
+            (true, None) => t!("graph.worktree.clean"),
+        }
     } else {
         match (is_orphan_worktree, branch_name, head_detached) {
             (true, Some(branch), _) => t!("graph.no_commits_on", branch = branch),
@@ -4131,6 +4421,8 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                     .flex_shrink_0()
                     .h_flex()
                     .justify_end()
+                    // Shaped like a ref badge, but dashed like the node it
+                    // labels: a checkout, not a ref.
                     .child(
                         div()
                             .id(ElementId::NamedInteger(
@@ -4141,18 +4433,33 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                             .max_w_full()
                             .overflow_hidden()
                             .h_flex()
+                            .h(px(20.0 * compact_mul))
+                            .px(px(5.))
                             .gap(px(4.))
+                            .rounded(px(3.))
+                            .bg(gpui::Hsla {
+                                a: 0.08,
+                                ..node_color
+                            })
+                            .border_1()
+                            .border_dashed()
+                            .border_color(gpui::Hsla {
+                                a: 0.7,
+                                ..node_color
+                            })
                             .child(
                                 Icon::new(IconName::Folder)
-                                    .size(IconSize::Small)
+                                    .size(IconSize::XSmall)
                                     .color(Color::Custom(node_color)),
                             )
                             .child(
-                                Label::new(worktree_label.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Custom(node_color))
-                                    .weight(gpui::FontWeight::SEMIBOLD)
-                                    .truncate(),
+                                div().min_w_0().overflow_hidden().child(
+                                    Label::new(worktree_label.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Custom(node_color))
+                                        .weight(gpui::FontWeight::SEMIBOLD)
+                                        .truncate(),
+                                ),
                             ),
                     ),
             )
@@ -4554,41 +4861,130 @@ mod tests {
         assert!(hash.date <= no_hash.date);
     }
 
+    fn checkout(name: &str, branch: &str, is_current: bool) -> WorktreeGraphInfo {
+        WorktreeGraphInfo {
+            name: name.to_string(),
+            is_current,
+            head_oid: Some(make_oid(1)),
+            head_unborn: false,
+            staged_count: 0,
+            unstaged_count: 0,
+            status_known: true,
+            combined_breakdown: HashMap::new(),
+            worktree_path: PathBuf::from(format!("/work/{name}")),
+            branch: Some(branch.to_string()),
+            head_detached: false,
+        }
+    }
+
+    /// The commit from the screenshot that showed `master +4`: HEAD, its
+    /// remote, and two branches that linked worktrees have out.
     #[test]
-    fn ref_layout_prefers_branch_and_preserves_every_full_name() {
+    fn head_and_tracking_refs_fold_into_their_branch() {
         let refs = vec![
             RefLabel::Head,
-            RefLabel::Tag("v1".into()),
-            RefLabel::RemoteBranch("origin/main".into()),
-            RefLabel::LocalBranch("main".into()),
+            RefLabel::LocalBranch("master".into()),
+            RefLabel::LocalBranch("art-proposals".into()),
+            RefLabel::LocalBranch("claude/next".into()),
+            RefLabel::RemoteBranch("origin/master".into()),
         ];
-        let (primary, overflow, names) = ref_presentation(&refs);
-        assert_eq!(primary, Some(RefLabel::LocalBranch("main".into())));
-        assert_eq!(overflow, 3);
+        let checkouts = branch_checkouts(&[
+            checkout("thegame", "master", true),
+            checkout("art-proposals", "art-proposals", false),
+            checkout("next", "claude/next", false),
+        ]);
+
+        let entries = ref_entries(&refs, &checkouts);
+
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].label, RefLabel::LocalBranch("master".into()));
+        assert!(entries[0].is_head);
+        assert_eq!(entries[0].remotes, ["origin"]);
         assert_eq!(
-            names,
-            [
-                "HEAD",
-                "refs/tags/v1",
-                "refs/remotes/origin/main",
-                "refs/heads/main"
-            ]
+            entries[0].worktree, None,
+            "the opened checkout is HEAD, not a worktree"
+        );
+        assert_eq!(
+            entries[1].worktree,
+            Some(("art-proposals".into(), PathBuf::from("/work/art-proposals")))
+        );
+        assert_eq!(entries[1].icon(), IconName::Folder);
+        assert_eq!(
+            entries[2].worktree.as_ref().map(|(name, _)| name.as_str()),
+            Some("next")
         );
     }
 
     #[test]
-    fn ref_layout_is_bounded_for_empty_single_and_many_refs() {
-        assert_eq!(ref_presentation(&[]), (None, 0, Vec::new()));
-        let single = ref_presentation(&[RefLabel::Head]);
-        assert_eq!(single.0, Some(RefLabel::Head));
-        assert_eq!(single.1, 0);
+    fn a_detached_head_stays_listed_after_everything_else() {
+        let refs = vec![
+            RefLabel::Head,
+            RefLabel::Tag("v1".into()),
+            RefLabel::RemoteBranch("origin/feature".into()),
+            RefLabel::LocalBranch("main".into()),
+        ];
+        let entries = ref_entries(&refs, &HashMap::new());
+        let labels: Vec<_> = entries.iter().map(|entry| entry.label.clone()).collect();
+        assert_eq!(
+            labels,
+            [
+                RefLabel::LocalBranch("main".into()),
+                RefLabel::Tag("v1".into()),
+                RefLabel::RemoteBranch("origin/feature".into()),
+                RefLabel::Head,
+            ]
+        );
+        assert!(entries.iter().all(|entry| !entry.is_head));
+    }
+
+    #[test]
+    fn ref_entries_are_bounded_for_empty_single_and_many_refs() {
+        assert!(ref_entries(&[], &HashMap::new()).is_empty());
+        let single = ref_entries(&[RefLabel::Head], &HashMap::new());
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].label, RefLabel::Head);
         let refs: Vec<_> = (0..1000)
             .map(|i| RefLabel::Tag(format!("release/{i}")))
             .collect();
-        let (primary, overflow, names) = ref_presentation(&refs);
-        assert!(primary.is_some());
-        assert_eq!(overflow, 999);
-        assert_eq!(names.len(), 1000);
+        assert_eq!(ref_entries(&refs, &HashMap::new()).len(), 1000);
+    }
+
+    #[test]
+    fn clean_worktrees_are_left_to_their_branch_badge() {
+        let clean = checkout("art-proposals", "art-proposals", false);
+        assert!(!worktree_gets_row(&clean, None, false));
+        assert!(
+            worktree_gets_row(&clean, None, true),
+            "the display toggle shows it"
+        );
+        assert!(
+            worktree_gets_row(&clean, Some(&clean.worktree_path), false),
+            "the checkout being viewed keeps its row"
+        );
+
+        let dirty = WorktreeGraphInfo {
+            unstaged_count: 3,
+            ..clean.clone()
+        };
+        assert!(worktree_gets_row(&dirty, None, false));
+
+        let opened = checkout("thegame", "master", true);
+        assert!(
+            !worktree_gets_row(&opened, Some(&opened.worktree_path), false),
+            "a clean opened checkout is already marked by HEAD"
+        );
+
+        let unborn = WorktreeGraphInfo {
+            head_oid: None,
+            head_unborn: true,
+            ..clean.clone()
+        };
+        assert!(worktree_gets_row(&unborn, None, false));
+        let unavailable = WorktreeGraphInfo {
+            head_oid: None,
+            ..clean
+        };
+        assert!(!worktree_gets_row(&unavailable, None, false));
     }
 
     fn make_oid(byte: u8) -> git2::Oid {
@@ -4747,6 +5143,7 @@ mod tests {
             head_unborn: head_oid.is_none(),
             staged_count: 0,
             unstaged_count: 1,
+            status_known: true,
             combined_breakdown: HashMap::new(),
             worktree_path: PathBuf::from(name),
             branch: Some(name.to_string()),
