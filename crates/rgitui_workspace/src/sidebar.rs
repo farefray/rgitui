@@ -11,8 +11,8 @@ use gpui::prelude::*;
 use gpui::{
     anchored, canvas, deferred, div, px, relative, uniform_list, Anchor, App, Bounds, ClickEvent,
     Context, ElementId, Entity, EventEmitter, FocusHandle, ListSizingBehavior, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
-    UniformListScrollHandle, WeakEntity, Window,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollHandle, ScrollStrategy,
+    SharedString, Size, UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{
     BranchInfo, FileChangeKind, FileStatus, RemoteInfo, StashEntry, TagInfo, WorktreeInfo,
@@ -57,6 +57,18 @@ pub enum SidebarEvent {
         path: String,
         staged: bool,
     },
+    /// Forwarded inspector selections must keep their checkout until consumed.
+    FileSelectedAt {
+        path: String,
+        staged: bool,
+        checkout: std::path::PathBuf,
+    },
+    ConflictFileSelectedAt {
+        path: String,
+        checkout: std::path::PathBuf,
+    },
+    /// Open the working-tree inspector without selecting an individual file.
+    WorkingChangesSelected,
     StageFile(String),
     UnstageFile(String),
     StageAll,
@@ -116,9 +128,10 @@ pub enum FlatFileItem {
 }
 
 /// Represents a navigable item in the sidebar's flat list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarItem {
     SectionHeader(SidebarSection),
+    WorkingChanges,
     LocalBranch(usize),  // index into local branches
     Remote(usize),       // index into remotes
     RemoteBranch(usize), // index into remote branches
@@ -129,6 +142,109 @@ enum SidebarItem {
     StagedDir(String),   // collapsed_dirs key for a staged directory row
     UnstagedFile(usize), // index into unstaged files
     UnstagedDir(String), // collapsed_dirs key for an unstaged directory row
+}
+
+/// `is_current` identifies the checkout the project was opened on, not the
+/// checkout currently being inspected. Only one row should claim "viewing".
+fn viewed_worktree(selected: Option<usize>, index: usize, is_current: bool) -> bool {
+    selected.map_or(is_current, |selected| selected == index)
+}
+
+fn section_is_visible(section: SidebarSection, show_change_sections: bool) -> bool {
+    show_change_sections
+        || !matches!(
+            section,
+            SidebarSection::StagedChanges | SidebarSection::UnstagedChanges
+        )
+}
+
+/// Append filtered/collapsed trees after refs in classic mode. Focused mode
+/// prepends Working changes before refs, even for a clean or fully filtered tree.
+fn add_change_nav_items(
+    items: &mut Vec<SidebarItem>,
+    show_change_sections: bool,
+    expanded: &[SidebarSection],
+    staged: &[FlatFileItem],
+    unstaged: &[FlatFileItem],
+) {
+    if !show_change_sections {
+        items.insert(0, SidebarItem::WorkingChanges);
+        return;
+    }
+    for (section, files) in [
+        (SidebarSection::StagedChanges, staged),
+        (SidebarSection::UnstagedChanges, unstaged),
+    ] {
+        items.push(SidebarItem::SectionHeader(section));
+        if !expanded.contains(&section) {
+            continue;
+        }
+        for item in files {
+            let staged = section == SidebarSection::StagedChanges;
+            items.push(match item {
+                FlatFileItem::File { file_idx, .. } if staged => SidebarItem::StagedFile(*file_idx),
+                FlatFileItem::File { file_idx, .. } => SidebarItem::UnstagedFile(*file_idx),
+                FlatFileItem::Dir { dir_key, .. } if staged => {
+                    SidebarItem::StagedDir(dir_key.clone())
+                }
+                FlatFileItem::Dir { dir_key, .. } => SidebarItem::UnstagedDir(dir_key.clone()),
+            });
+        }
+    }
+}
+
+/// Keep the same navigation target when filters or layout move its row. Hidden
+/// file targets map to Working changes; switching back selects the staged header,
+/// never an arbitrary file that staging/discard shortcuts might act on.
+fn remap_keyboard_index(
+    old: &[SidebarItem],
+    new: &[SidebarItem],
+    index: Option<usize>,
+) -> Option<usize> {
+    let selected = old.get(index?)?;
+    if let Some(index) = new.iter().position(|item| item == selected) {
+        return Some(index);
+    }
+    let replacement = match selected {
+        SidebarItem::WorkingChanges => SidebarItem::SectionHeader(SidebarSection::StagedChanges),
+        SidebarItem::SectionHeader(
+            SidebarSection::StagedChanges | SidebarSection::UnstagedChanges,
+        )
+        | SidebarItem::StagedFile(_)
+        | SidebarItem::UnstagedFile(_)
+        | SidebarItem::StagedDir(_)
+        | SidebarItem::UnstagedDir(_) => SidebarItem::WorkingChanges,
+        _ => return None,
+    };
+    new.iter().position(|item| *item == replacement)
+}
+
+/// A file changed in both the index and worktree counts once. This deliberately
+/// uses raw status paths, independent of classic-mode kind/directory filters.
+fn unique_changed_file_count(staged: &[FileStatus], unstaged: &[FileStatus]) -> usize {
+    staged
+        .iter()
+        .chain(unstaged)
+        .map(|file| &file.path)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Only child rows belong to a section's virtual list; headers and the standalone
+/// Working changes row must not scroll the preceding section's list.
+fn section_list_row(items: &[SidebarItem], index: usize) -> Option<(SidebarSection, usize)> {
+    match items.get(index)? {
+        SidebarItem::SectionHeader(_) | SidebarItem::WorkingChanges => return None,
+        _ => {}
+    }
+    items[..index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(header_index, item)| match item {
+            SidebarItem::SectionHeader(section) => Some((*section, index - header_index - 1)),
+            _ => None,
+        })
 }
 
 /// State for the right-click stash context menu.
@@ -341,6 +457,10 @@ fn stash_menu_size() -> Size<Pixels> {
 /// The left sidebar panel with branches, tags, stashes, and working tree status.
 pub struct Sidebar {
     expanded_sections: Vec<SidebarSection>,
+    /// Classic layout shows file lists; focused layout delegates them to the inspector.
+    show_change_sections: bool,
+    working_change_count: usize,
+    outer_scroll: ScrollHandle,
     tags: Vec<TagInfo>,
     remotes: Vec<RemoteInfo>,
     stashes: Vec<StashEntry>,
@@ -543,6 +663,9 @@ impl Sidebar {
 
         Self {
             expanded_sections,
+            show_change_sections: true,
+            working_change_count: 0,
+            outer_scroll: ScrollHandle::new(),
             tags: Vec::new(),
             remotes: Vec::new(),
             stashes: Vec::new(),
@@ -753,34 +876,16 @@ impl Sidebar {
             }
         }
 
-        items.push(SidebarItem::SectionHeader(SidebarSection::StagedChanges));
-        if is_expanded(SidebarSection::StagedChanges, &self.expanded_sections) {
-            for item in &self.flattened_staged {
-                match item {
-                    FlatFileItem::File { file_idx, .. } => {
-                        items.push(SidebarItem::StagedFile(*file_idx));
-                    }
-                    FlatFileItem::Dir { dir_key, .. } => {
-                        items.push(SidebarItem::StagedDir(dir_key.clone()));
-                    }
-                }
-            }
-        }
+        add_change_nav_items(
+            &mut items,
+            self.show_change_sections,
+            &self.expanded_sections,
+            &self.flattened_staged,
+            &self.flattened_unstaged,
+        );
 
-        items.push(SidebarItem::SectionHeader(SidebarSection::UnstagedChanges));
-        if is_expanded(SidebarSection::UnstagedChanges, &self.expanded_sections) {
-            for item in &self.flattened_unstaged {
-                match item {
-                    FlatFileItem::File { file_idx, .. } => {
-                        items.push(SidebarItem::UnstagedFile(*file_idx));
-                    }
-                    FlatFileItem::Dir { dir_key, .. } => {
-                        items.push(SidebarItem::UnstagedDir(dir_key.clone()));
-                    }
-                }
-            }
-        }
-
+        self.keyboard_index =
+            remap_keyboard_index(&self.cached_nav_items, &items, self.keyboard_index);
         self.cached_nav_items = items;
     }
 
@@ -791,20 +896,16 @@ impl Sidebar {
         let Some(selected_index) = self.keyboard_index else {
             return;
         };
-        if selected_index >= self.cached_nav_items.len() {
-            return;
+        match self.cached_nav_items.get(selected_index) {
+            Some(SidebarItem::WorkingChanges) => {
+                // This standalone row sits directly below the repository heading.
+                self.outer_scroll.set_offset(Point::new(px(0.), px(0.)));
+                return;
+            }
+            Some(SidebarItem::SectionHeader(_)) | None => return,
+            _ => {}
         }
-        let Some((section, row_index)) = self.cached_nav_items[..=selected_index]
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, item)| match item {
-                SidebarItem::SectionHeader(section) if index < selected_index => {
-                    Some((*section, selected_index - index - 1))
-                }
-                SidebarItem::SectionHeader(_) => None,
-                _ => None,
-            })
+        let Some((section, row_index)) = section_list_row(&self.cached_nav_items, selected_index)
         else {
             return;
         };
@@ -832,6 +933,7 @@ impl Sidebar {
         };
 
         match item {
+            SidebarItem::WorkingChanges => cx.emit(SidebarEvent::WorkingChangesSelected),
             SidebarItem::SectionHeader(section) => {
                 self.toggle_section(section, cx);
             }
@@ -999,6 +1101,32 @@ impl Sidebar {
         self.cached_nav_items.get(self.keyboard_index?).cloned()
     }
 
+    /// Switch between classic file lists and a single working-changes entry.
+    /// Safe to call from the parent's render on every frame.
+    pub fn set_show_change_sections(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_change_sections == show {
+            return;
+        }
+        self.show_change_sections = show;
+        if !show {
+            if matches!(
+                self.open_popover,
+                Some(SidebarPopover::ChangeListOptions(_))
+            ) {
+                self.open_popover = None;
+            }
+            if matches!(
+                self.hovered_popover_trigger,
+                Some(SidebarPopover::ChangeListOptions(_))
+            ) {
+                self.hovered_popover_trigger = None;
+            }
+        }
+        self.rebuild_nav_items();
+        self.scroll_keyboard_row_into_view();
+        cx.notify();
+    }
+
     /// Focus the sidebar for keyboard navigation.
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
@@ -1128,6 +1256,14 @@ impl Sidebar {
         if self.worktrees == worktrees {
             return;
         }
+        // Reveal linked checkouts when they first become available, but do not
+        // undo a user's collapse choice on every subsequent status refresh.
+        if self.worktrees.len() <= 1
+            && worktrees.len() > 1
+            && !self.is_expanded(SidebarSection::Worktrees)
+        {
+            self.expanded_sections.push(SidebarSection::Worktrees);
+        }
         let previously_selected_path = self.selected_worktree.and_then(|index| {
             self.worktrees
                 .get(index)
@@ -1174,6 +1310,7 @@ impl Sidebar {
         if self.staged == staged && self.unstaged == unstaged {
             return;
         }
+        self.working_change_count = unique_changed_file_count(&staged, &unstaged);
         self.staged = staged;
         self.unstaged = unstaged;
         self.rebuild_change_trees();
@@ -1198,7 +1335,8 @@ impl Sidebar {
     }
 
     fn is_expanded(&self, section: SidebarSection) -> bool {
-        self.expanded_sections.contains(&section)
+        section_is_visible(section, self.show_change_sections)
+            && self.expanded_sections.contains(&section)
     }
 
     fn toggle_section(&mut self, section: SidebarSection, cx: &mut Context<Self>) {
@@ -1575,10 +1713,11 @@ impl Sidebar {
     }
 
     /// Height of everything in the sidebar that is not a virtualized list:
-    /// the repo header, the eight section headers, placeholder rows of
-    /// expanded-but-empty sections, and the separator.
+    /// the repo header, visible section headers (or the working-changes row),
+    /// placeholder rows of expanded-but-empty sections, and the separator.
     fn chrome_height(&self, item_h: f32, header_h: f32) -> f32 {
-        let mut chrome = header_h + 8.0 * item_h + SIDEBAR_SEPARATOR_HEIGHT;
+        let header_count = if self.show_change_sections { 8.0 } else { 7.0 };
+        let mut chrome = header_h + header_count * item_h + SIDEBAR_SEPARATOR_HEIGHT;
 
         let placeholders = [
             (
@@ -2087,6 +2226,52 @@ impl Render for Sidebar {
         // Track flat navigation index for keyboard highlighting
         let mut nav_idx: usize = 0;
         let kb_accent = colors.border_focused;
+
+        if !self.show_change_sections {
+            let working_nav_index = nav_idx;
+            nav_idx += 1;
+            content = content.child(
+                div()
+                    .id("sidebar-working-changes")
+                    .h_flex()
+                    .w_full()
+                    .h(px(item_h))
+                    .px(px(8.))
+                    .gap(px(4.))
+                    .bg(colors.surface_background)
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .when(keyboard_index == Some(working_nav_index), |el| {
+                        el.border_l_2().border_color(kb_accent)
+                    })
+                    .hover(|s| s.bg(colors.ghost_element_hover))
+                    .active(|s| s.bg(colors.ghost_element_active))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.focus_handle.focus(window, cx);
+                        this.select_row(working_nav_index, cx);
+                        cx.emit(SidebarEvent::WorkingChangesSelected);
+                    }))
+                    .child(
+                        rgitui_ui::Icon::new(IconName::Folder)
+                            .size(rgitui_ui::IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(t!("sidebar.working_changes"))
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(self.working_change_count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+            // Both layouts reserve one separator between working changes and refs.
+            content = content.child(div().w_full().h(px(1.)).my(px(4.)).bg(colors.border));
+        }
 
         // -- Local Branches --
         let local_branch_count = self.local_branches.len();
@@ -3567,11 +3752,23 @@ impl Render for Sidebar {
                                 let worktree_index = flattened[i];
                                 let worktree = &worktrees[worktree_index];
                                 let kb_active = keyboard_index == Some(nav_base + i);
-                                let is_selected = selected_worktree == Some(worktree_index);
+                                let is_selected = viewed_worktree(
+                                    selected_worktree,
+                                    worktree_index,
+                                    worktree.is_current,
+                                );
                                 let name: SharedString = worktree.name.clone().into();
-                                let path: SharedString =
-                                    worktree.path.display().to_string().into();
+                                let branch: SharedString = worktree.branch.clone().map(Into::into)
+                                    .unwrap_or_else(|| if worktree.head_detached {
+                                        t!("title_bar.detached")
+                                    } else {
+                                        "—".into()
+                                    });
+                                let tooltip = t!("sidebar.worktree.open.tooltip",
+                                    name = name, branch = branch,
+                                    path = worktree.path.display().to_string());
                                 let w_sel = w.clone();
+                                let w_open = w.clone();
                                 let w_rm = w.clone();
 
                                 div()
@@ -3579,6 +3776,8 @@ impl Render for Sidebar {
                                         "worktree-item".into(),
                                         i as u64,
                                     ))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(tooltip.clone()))
                                     .h_flex()
                                     .w_full()
                                     .h(px(item_h))
@@ -3606,26 +3805,28 @@ impl Render for Sidebar {
                                         });
                                     })
                                     .child(
-                                        rgitui_ui::Icon::new(IconName::GitBranch)
+                                        rgitui_ui::Icon::new(IconName::Folder)
                                             .size(rgitui_ui::IconSize::XSmall)
-                                            .color(if worktree.is_current {
-                                                Color::Info
-                                            } else {
-                                                Color::Muted
-                                            }),
+                                            .color(if is_selected { Color::Info } else { Color::Muted }),
                                     )
-                                    .child(Label::new(name.clone()).size(LabelSize::Small).color(
-                                        if worktree.is_current {
-                                            Color::Info
-                                        } else {
-                                            Color::Default
-                                        },
-                                    ))
-                                    .when(worktree.is_current, |el| {
+                                    .child(
+                                        div().flex_1().min_w_0().overflow_hidden().child(
+                                            Label::new(name).size(LabelSize::Small).truncate()
+                                        ),
+                                    )
+                                    .child(
+                                        div().max_w(px(88.)).min_w_0().overflow_hidden().child(
+                                            Label::new(branch).size(LabelSize::XSmall)
+                                                .color(Color::Muted).truncate()
+                                        ),
+                                    )
+                                    .when(is_selected, |el| {
                                         el.child(
-                                            Label::new(t!("sidebar.current_tag"))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
+                                            div().flex_shrink_0().child(
+                                                Label::new(t!("sidebar.current_tag"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Info),
+                                            )
                                         )
                                     })
                                     .when(worktree.is_locked, |el| {
@@ -3635,13 +3836,24 @@ impl Render for Sidebar {
                                                 .color(Color::Warning),
                                         )
                                     })
-                                    .child(div().flex_1())
-                                    .child(
-                                        Label::new(path)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    )
+                                    .when(!is_selected, |el| {
+                                        el.child(
+                                            IconButton::new(
+                                                ElementId::NamedInteger("open-worktree".into(), i as u64),
+                                                IconName::ChevronRight,
+                                            )
+                                            .size(ButtonSize::Compact)
+                                            .color(Color::Info)
+                                            .tooltip(tooltip)
+                                            .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                                cx.stop_propagation();
+                                                let _ = w_open.clone().update(cx, |this: &mut Sidebar, cx| {
+                                                    this.selected_worktree = Some(worktree_index);
+                                                    cx.emit(SidebarEvent::WorktreeSelected(worktree_index));
+                                                });
+                                            }),
+                                        )
+                                    })
                                     .when(!worktree.is_current, |el| {
                                         el.child(
                                             IconButton::new(
@@ -3655,6 +3867,7 @@ impl Render for Sidebar {
                                             .color(Color::Deleted)
                                             .tooltip(t!("sidebar.remove_worktree.tooltip"))
                                             .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                                cx.stop_propagation();
                                                 let _ = w_rm.clone().update(cx, |_: &mut Sidebar, cx| {
                                                     cx.emit(SidebarEvent::WorktreeRemove(
                                                         worktree_index,
@@ -3674,158 +3887,158 @@ impl Render for Sidebar {
             }
         }
 
-        // Separator between refs and file changes
-        content = content.child(div().w_full().h(px(1.)).my(px(4.)).bg(colors.border));
+        if self.show_change_sections {
+            // Classic layout keeps file sections below refs and worktrees.
+            content = content.child(div().w_full().h(px(1.)).my(px(4.)).bg(colors.border));
+            // -- Staged Changes --
+            let staged_expanded = self.is_expanded(SidebarSection::StagedChanges);
+            let staged_count = self.staged.len();
+            let has_staged = staged_count > 0;
+            let staged_kind_counts = Self::file_kind_counts(&self.staged);
 
-        // -- Staged Changes --
-        let staged_expanded = self.is_expanded(SidebarSection::StagedChanges);
-        let staged_count = self.staged.len();
-        let has_staged = staged_count > 0;
-        let staged_kind_counts = Self::file_kind_counts(&self.staged);
+            let kb_active = keyboard_index == Some(nav_idx);
+            nav_idx += 1;
 
-        let kb_active = keyboard_index == Some(nav_idx);
-        nav_idx += 1;
+            let staged_chevron = if staged_expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            let mut staged_header = div()
+                .id("section-staged")
+                .h_flex()
+                .w_full()
+                .h(px(item_h))
+                .px(px(8.))
+                .gap(px(4.))
+                .items_center()
+                .bg(colors.surface_background)
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
+                .hover(|s| s.bg(colors.ghost_element_hover))
+                .active(|s| s.bg(colors.ghost_element_active))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.toggle_section(SidebarSection::StagedChanges, cx);
+                }))
+                .child(
+                    rgitui_ui::Icon::new(staged_chevron)
+                        .size(rgitui_ui::IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(t!("sidebar.staged"))
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .truncate(),
+                );
 
-        let staged_chevron = if staged_expanded {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
-        let mut staged_header = div()
-            .id("section-staged")
-            .h_flex()
-            .w_full()
-            .h(px(item_h))
-            .px(px(8.))
-            .gap(px(4.))
-            .items_center()
-            .bg(colors.surface_background)
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
-            .hover(|s| s.bg(colors.ghost_element_hover))
-            .active(|s| s.bg(colors.ghost_element_active))
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.toggle_section(SidebarSection::StagedChanges, cx);
-            }))
-            .child(
-                rgitui_ui::Icon::new(staged_chevron)
-                    .size(rgitui_ui::IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(t!("sidebar.staged"))
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD)
-                    .truncate(),
-            );
-
-        if has_staged {
-            let kind_order = [
-                FileChangeKind::Added,
-                FileChangeKind::Modified,
-                FileChangeKind::Deleted,
-                FileChangeKind::Renamed,
-                FileChangeKind::Copied,
-                FileChangeKind::TypeChange,
-                FileChangeKind::Untracked,
-                FileChangeKind::Conflicted,
-            ];
-            let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
-            for kind in &kind_order {
-                if let Some(&count) = staged_kind_counts.get(kind) {
-                    if count > 0 {
-                        breakdown = breakdown.child(
-                            Label::new(SharedString::from(format!(
-                                "{}{}",
-                                Self::file_change_symbol(*kind),
-                                count
-                            )))
-                            .size(LabelSize::XSmall)
-                            .color(Self::file_change_color(*kind)),
-                        );
+            if has_staged {
+                let kind_order = [
+                    FileChangeKind::Added,
+                    FileChangeKind::Modified,
+                    FileChangeKind::Deleted,
+                    FileChangeKind::Renamed,
+                    FileChangeKind::Copied,
+                    FileChangeKind::TypeChange,
+                    FileChangeKind::Untracked,
+                    FileChangeKind::Conflicted,
+                ];
+                let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
+                for kind in &kind_order {
+                    if let Some(&count) = staged_kind_counts.get(kind) {
+                        if count > 0 {
+                            breakdown = breakdown.child(
+                                Label::new(SharedString::from(format!(
+                                    "{}{}",
+                                    Self::file_change_symbol(*kind),
+                                    count
+                                )))
+                                .size(LabelSize::XSmall)
+                                .color(Self::file_change_color(*kind)),
+                            );
+                        }
                     }
                 }
+                staged_header = staged_header.child(breakdown);
             }
-            staged_header = staged_header.child(breakdown);
-        }
 
-        staged_header = staged_header
-            .child(div().flex_1())
-            .when(has_staged, |el| {
-                el.child(
-                    div().id("unstage-all-btn").flex_shrink_0().child(
-                        Button::new("unstage-all", t!("sidebar.unstage_all"))
-                            .icon(IconName::Minus)
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Subtle)
-                            .color(Color::Muted)
-                            .on_click(cx.listener(|_this, _: &ClickEvent, _, cx| {
-                                cx.emit(SidebarEvent::UnstageAll);
-                            })),
-                    ),
-                )
-            })
-            .child(self.render_popover_trigger(
-                SidebarPopover::ChangeListOptions(ChangeList::Staged),
-                "staged-options",
-                t!("sidebar.staged_options.tooltip"),
-                show_line_stats,
-                cx,
-            ))
-            .child(
-                div()
-                    .h_flex()
-                    .h(px(16.))
-                    .min_w(px(20.))
-                    .px(px(6.))
-                    .rounded(px(5.))
-                    .flex_shrink_0()
-                    .bg(if staged_count > 0 {
-                        colors.ghost_element_selected
-                    } else {
-                        colors.ghost_element_hover
-                    })
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Label::new(SharedString::from(format!("{}", staged_count)))
-                            .size(LabelSize::XSmall)
-                            .color(if staged_count > 0 {
-                                Color::Added
-                            } else {
-                                Color::Muted
-                            }),
-                    ),
-            );
-        content = content.child(staged_header);
-
-        if staged_expanded {
-            if self.staged.is_empty() {
-                content = content.child(
+            staged_header = staged_header
+                .child(div().flex_1())
+                .when(has_staged, |el| {
+                    el.child(
+                        div().id("unstage-all-btn").flex_shrink_0().child(
+                            Button::new("unstage-all", t!("sidebar.unstage_all"))
+                                .icon(IconName::Minus)
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Muted)
+                                .on_click(cx.listener(|_this, _: &ClickEvent, _, cx| {
+                                    cx.emit(SidebarEvent::UnstageAll);
+                                })),
+                        ),
+                    )
+                })
+                .child(self.render_popover_trigger(
+                    SidebarPopover::ChangeListOptions(ChangeList::Staged),
+                    "staged-options",
+                    t!("sidebar.staged_options.tooltip"),
+                    show_line_stats,
+                    cx,
+                ))
+                .child(
                     div()
                         .h_flex()
-                        .w_full()
-                        .h(px(28.))
-                        .px(px(16.))
+                        .h(px(16.))
+                        .min_w(px(20.))
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .flex_shrink_0()
+                        .bg(if staged_count > 0 {
+                            colors.ghost_element_selected
+                        } else {
+                            colors.ghost_element_hover
+                        })
                         .items_center()
+                        .justify_center()
                         .child(
-                            Label::new(t!("sidebar.no_staged"))
+                            Label::new(SharedString::from(format!("{}", staged_count)))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
+                                .color(if staged_count > 0 {
+                                    Color::Added
+                                } else {
+                                    Color::Muted
+                                }),
                         ),
                 );
-            } else {
-                let nav_base = nav_idx;
-                nav_idx += self.flattened_staged.len();
-                let flattened = self.flattened_staged.clone();
-                let list_height = list_heights.staged;
-                let files = self.staged.clone();
-                let selected_file = self.selected_file.clone();
-                let w = Rc::new(sidebar_weak.clone());
-                let colors = colors.clone();
-                let list = uniform_list(
+            content = content.child(staged_header);
+
+            if staged_expanded {
+                if self.staged.is_empty() {
+                    content = content.child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .h(px(28.))
+                            .px(px(16.))
+                            .items_center()
+                            .child(
+                                Label::new(t!("sidebar.no_staged"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder),
+                            ),
+                    );
+                } else {
+                    let nav_base = nav_idx;
+                    nav_idx += self.flattened_staged.len();
+                    let flattened = self.flattened_staged.clone();
+                    let list_height = list_heights.staged;
+                    let files = self.staged.clone();
+                    let selected_file = self.selected_file.clone();
+                    let w = Rc::new(sidebar_weak.clone());
+                    let colors = colors.clone();
+                    let list = uniform_list(
                     "staged-file-list",
                     flattened.len(),
                     move |range: Range<usize>, _window: &mut Window, cx: &mut App| {
@@ -3997,174 +4210,174 @@ impl Render for Sidebar {
                 .h(px(list_height))
                 .with_sizing_behavior(ListSizingBehavior::Auto)
                 .track_scroll(&self.staged_scroll);
-                content = content.child(list);
+                    content = content.child(list);
+                }
             }
-        }
 
-        // -- Unstaged Changes --
-        let unstaged_expanded = self.is_expanded(SidebarSection::UnstagedChanges);
-        let unstaged_count = self.unstaged.len();
-        let has_unstaged = unstaged_count > 0;
-        let unstaged_kind_counts = Self::file_kind_counts(&self.unstaged);
+            // -- Unstaged Changes --
+            let unstaged_expanded = self.is_expanded(SidebarSection::UnstagedChanges);
+            let unstaged_count = self.unstaged.len();
+            let has_unstaged = unstaged_count > 0;
+            let unstaged_kind_counts = Self::file_kind_counts(&self.unstaged);
 
-        let kb_active = keyboard_index == Some(nav_idx);
-        nav_idx += 1;
-        // Unstaged is the final navigable section, so `nav_idx` is not advanced
-        // past its rows; this base anchors the list rows in the shared flat
-        // keyboard-navigation index space.
-        let unstaged_nav_base = nav_idx;
+            let kb_active = keyboard_index == Some(nav_idx);
+            nav_idx += 1;
+            // Unstaged is the final navigable section, so `nav_idx` is not advanced
+            // past its rows; this base anchors the list rows in the shared flat
+            // keyboard-navigation index space.
+            let unstaged_nav_base = nav_idx;
 
-        let unstaged_chevron = if unstaged_expanded {
-            IconName::ChevronDown
-        } else {
-            IconName::ChevronRight
-        };
-        let mut unstaged_header = div()
-            .id("section-unstaged")
-            .h_flex()
-            .w_full()
-            .h(px(item_h))
-            .px(px(8.))
-            .gap(px(4.))
-            .items_center()
-            .bg(colors.surface_background)
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
-            .hover(|s| s.bg(colors.ghost_element_hover))
-            .active(|s| s.bg(colors.ghost_element_active))
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.toggle_section(SidebarSection::UnstagedChanges, cx);
-            }))
-            .child(
-                rgitui_ui::Icon::new(unstaged_chevron)
-                    .size(rgitui_ui::IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(t!("sidebar.unstaged"))
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD)
-                    .truncate(),
-            );
+            let unstaged_chevron = if unstaged_expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            let mut unstaged_header = div()
+                .id("section-unstaged")
+                .h_flex()
+                .w_full()
+                .h(px(item_h))
+                .px(px(8.))
+                .gap(px(4.))
+                .items_center()
+                .bg(colors.surface_background)
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .when(kb_active, |el| el.border_l_2().border_color(kb_accent))
+                .hover(|s| s.bg(colors.ghost_element_hover))
+                .active(|s| s.bg(colors.ghost_element_active))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.toggle_section(SidebarSection::UnstagedChanges, cx);
+                }))
+                .child(
+                    rgitui_ui::Icon::new(unstaged_chevron)
+                        .size(rgitui_ui::IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(t!("sidebar.unstaged"))
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .truncate(),
+                );
 
-        if has_unstaged {
-            let kind_order = [
-                FileChangeKind::Added,
-                FileChangeKind::Modified,
-                FileChangeKind::Deleted,
-                FileChangeKind::Renamed,
-                FileChangeKind::Copied,
-                FileChangeKind::TypeChange,
-                FileChangeKind::Untracked,
-                FileChangeKind::Conflicted,
-            ];
-            let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
-            for kind in &kind_order {
-                if let Some(&count) = unstaged_kind_counts.get(kind) {
-                    if count > 0 {
-                        if *kind == FileChangeKind::Untracked {
-                            let hidden = self.unstaged_hidden_kinds.contains(kind);
-                            breakdown = breakdown.child(self.kind_chip(
-                                SidebarSection::UnstagedChanges,
-                                *kind,
-                                count,
-                                hidden,
-                                &colors,
-                                cx,
-                            ));
-                        } else {
-                            breakdown = breakdown.child(
-                                Label::new(SharedString::from(format!(
-                                    "{}{}",
-                                    Self::file_change_symbol(*kind),
-                                    count
-                                )))
-                                .size(LabelSize::XSmall)
-                                .color(Self::file_change_color(*kind)),
-                            );
+            if has_unstaged {
+                let kind_order = [
+                    FileChangeKind::Added,
+                    FileChangeKind::Modified,
+                    FileChangeKind::Deleted,
+                    FileChangeKind::Renamed,
+                    FileChangeKind::Copied,
+                    FileChangeKind::TypeChange,
+                    FileChangeKind::Untracked,
+                    FileChangeKind::Conflicted,
+                ];
+                let mut breakdown = div().h_flex().min_w_0().overflow_hidden().gap(px(4.));
+                for kind in &kind_order {
+                    if let Some(&count) = unstaged_kind_counts.get(kind) {
+                        if count > 0 {
+                            if *kind == FileChangeKind::Untracked {
+                                let hidden = self.unstaged_hidden_kinds.contains(kind);
+                                breakdown = breakdown.child(self.kind_chip(
+                                    SidebarSection::UnstagedChanges,
+                                    *kind,
+                                    count,
+                                    hidden,
+                                    &colors,
+                                    cx,
+                                ));
+                            } else {
+                                breakdown = breakdown.child(
+                                    Label::new(SharedString::from(format!(
+                                        "{}{}",
+                                        Self::file_change_symbol(*kind),
+                                        count
+                                    )))
+                                    .size(LabelSize::XSmall)
+                                    .color(Self::file_change_color(*kind)),
+                                );
+                            }
                         }
                     }
                 }
+                unstaged_header = unstaged_header.child(breakdown);
             }
-            unstaged_header = unstaged_header.child(breakdown);
-        }
 
-        unstaged_header = unstaged_header
-            .child(div().flex_1())
-            .when(has_unstaged, |el| {
-                el.child(
-                    div().id("stage-all-btn").flex_shrink_0().child(
-                        Button::new("stage-all", t!("sidebar.stage_all"))
-                            .icon(IconName::Plus)
-                            .size(ButtonSize::Compact)
-                            .style(ButtonStyle::Subtle)
-                            .color(Color::Muted)
-                            .on_click(cx.listener(|_this, _: &ClickEvent, _, cx| {
-                                cx.emit(SidebarEvent::StageAll);
-                            })),
-                    ),
-                )
-            })
-            .child(self.render_popover_trigger(
-                SidebarPopover::ChangeListOptions(ChangeList::Unstaged),
-                "unstaged-options",
-                t!("sidebar.unstaged_options.tooltip"),
-                show_line_stats,
-                cx,
-            ))
-            .child(
-                div()
-                    .h_flex()
-                    .h(px(16.))
-                    .min_w(px(20.))
-                    .px(px(6.))
-                    .rounded(px(5.))
-                    .flex_shrink_0()
-                    .bg(if unstaged_count > 0 {
-                        colors.ghost_element_selected
-                    } else {
-                        colors.ghost_element_hover
-                    })
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Label::new(SharedString::from(format!("{}", unstaged_count)))
-                            .size(LabelSize::XSmall)
-                            .color(if unstaged_count > 0 {
-                                Color::Modified
-                            } else {
-                                Color::Muted
-                            }),
-                    ),
-            );
-        content = content.child(unstaged_header);
-
-        if unstaged_expanded {
-            if self.unstaged.is_empty() {
-                content = content.child(
+            unstaged_header = unstaged_header
+                .child(div().flex_1())
+                .when(has_unstaged, |el| {
+                    el.child(
+                        div().id("stage-all-btn").flex_shrink_0().child(
+                            Button::new("stage-all", t!("sidebar.stage_all"))
+                                .icon(IconName::Plus)
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Muted)
+                                .on_click(cx.listener(|_this, _: &ClickEvent, _, cx| {
+                                    cx.emit(SidebarEvent::StageAll);
+                                })),
+                        ),
+                    )
+                })
+                .child(self.render_popover_trigger(
+                    SidebarPopover::ChangeListOptions(ChangeList::Unstaged),
+                    "unstaged-options",
+                    t!("sidebar.unstaged_options.tooltip"),
+                    show_line_stats,
+                    cx,
+                ))
+                .child(
                     div()
                         .h_flex()
-                        .w_full()
-                        .h(px(28.))
-                        .px(px(16.))
+                        .h(px(16.))
+                        .min_w(px(20.))
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .flex_shrink_0()
+                        .bg(if unstaged_count > 0 {
+                            colors.ghost_element_selected
+                        } else {
+                            colors.ghost_element_hover
+                        })
                         .items_center()
+                        .justify_center()
                         .child(
-                            Label::new(t!("sidebar.working_clean"))
+                            Label::new(SharedString::from(format!("{}", unstaged_count)))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
+                                .color(if unstaged_count > 0 {
+                                    Color::Modified
+                                } else {
+                                    Color::Muted
+                                }),
                         ),
                 );
-            } else {
-                let nav_base = unstaged_nav_base;
-                let flattened = self.flattened_unstaged.clone();
-                let list_height = list_heights.unstaged;
-                let files = self.unstaged.clone();
-                let selected_file = self.selected_file.clone();
-                let w = sidebar_weak.clone();
-                let colors = colors.clone();
-                let list = uniform_list(
+            content = content.child(unstaged_header);
+
+            if unstaged_expanded {
+                if self.unstaged.is_empty() {
+                    content = content.child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .h(px(28.))
+                            .px(px(16.))
+                            .items_center()
+                            .child(
+                                Label::new(t!("sidebar.working_clean"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder),
+                            ),
+                    );
+                } else {
+                    let nav_base = unstaged_nav_base;
+                    let flattened = self.flattened_unstaged.clone();
+                    let list_height = list_heights.unstaged;
+                    let files = self.unstaged.clone();
+                    let selected_file = self.selected_file.clone();
+                    let w = sidebar_weak.clone();
+                    let colors = colors.clone();
+                    let list = uniform_list(
                     "unstaged-file-list",
                     flattened.len(),
                     move |range: Range<usize>, _window: &mut Window, cx: &mut App| {
@@ -4400,7 +4613,8 @@ impl Render for Sidebar {
                 .h(px(list_height))
                 .with_sizing_behavior(ListSizingBehavior::Auto)
                 .track_scroll(&self.unstaged_scroll);
-                content = content.child(list);
+                    content = content.child(list);
+                }
             }
         }
 
@@ -4411,6 +4625,7 @@ impl Render for Sidebar {
             .w_full()
             .flex_1()
             .overflow_y_scroll()
+            .track_scroll(&self.outer_scroll)
             .child(content);
 
         let mut panel = panel.child(scroll_div);
@@ -4811,6 +5026,185 @@ mod tests {
     use super::*;
     use rgitui_git::{BranchInfo, FileChangeKind, FileStatus};
     use std::path::PathBuf;
+
+    #[test]
+    fn viewing_worktree_marker_follows_inspection_not_repository_origin() {
+        assert!(viewed_worktree(None, 0, true));
+        assert!(!viewed_worktree(None, 1, false));
+        assert!(!viewed_worktree(Some(1), 0, true));
+        assert!(viewed_worktree(Some(1), 1, false));
+        assert!(viewed_worktree(Some(0), 0, true));
+        assert!(!viewed_worktree(Some(0), 1, false));
+    }
+
+    #[test]
+    fn focused_navigation_replaces_all_change_rows_even_when_expanded() {
+        let mut items = vec![
+            SidebarItem::SectionHeader(SidebarSection::Worktrees),
+            SidebarItem::Worktree(0),
+        ];
+        let files = vec![FlatFileItem::File {
+            file_idx: 3,
+            indent: px(0.),
+        }];
+        add_change_nav_items(
+            &mut items,
+            false,
+            &[
+                SidebarSection::StagedChanges,
+                SidebarSection::UnstagedChanges,
+            ],
+            &files,
+            &files,
+        );
+        assert_eq!(
+            items,
+            vec![
+                SidebarItem::WorkingChanges,
+                SidebarItem::SectionHeader(SidebarSection::Worktrees),
+                SidebarItem::Worktree(0),
+            ]
+        );
+        assert_eq!(
+            section_list_row(&items, 2),
+            Some((SidebarSection::Worktrees, 0))
+        );
+        assert_eq!(section_list_row(&items, 0), None);
+        assert_eq!(section_list_row(&items, 1), None);
+        assert_eq!(section_list_row(&items, 3), None);
+    }
+
+    #[test]
+    fn focused_working_entry_precedes_branches_and_many_worktrees() {
+        let mut items = vec![
+            SidebarItem::SectionHeader(SidebarSection::LocalBranches),
+            SidebarItem::LocalBranch(0),
+            SidebarItem::SectionHeader(SidebarSection::Worktrees),
+        ];
+        items.extend((0..15).map(SidebarItem::Worktree));
+        let refs = items.clone();
+        add_change_nav_items(&mut items, false, &[], &[], &[]);
+        assert_eq!(items[0], SidebarItem::WorkingChanges);
+        assert_eq!(&items[1..], refs.as_slice());
+        assert_eq!(section_list_row(&items, 0), None);
+        assert_eq!(
+            section_list_row(&items, 2),
+            Some((SidebarSection::LocalBranches, 0))
+        );
+        assert_eq!(
+            section_list_row(&items, 18),
+            Some((SidebarSection::Worktrees, 14))
+        );
+    }
+
+    #[test]
+    fn focused_navigation_keeps_working_entry_when_clean_or_filtered_empty() {
+        let mut items = Vec::new();
+        add_change_nav_items(&mut items, false, &[], &[], &[]);
+        assert_eq!(items, vec![SidebarItem::WorkingChanges]);
+    }
+
+    #[test]
+    fn classic_navigation_uses_only_expanded_filtered_tree_rows() {
+        let staged = vec![
+            FlatFileItem::Dir {
+                dir_key: "staged:src".into(),
+                label: "src/".into(),
+                file_count: 1,
+                collapsed: false,
+                indent: px(0.),
+            },
+            FlatFileItem::File {
+                file_idx: 5,
+                indent: px(12.),
+            },
+        ];
+        let unstaged = vec![FlatFileItem::File {
+            file_idx: 2,
+            indent: px(0.),
+        }];
+        let mut items = Vec::new();
+        add_change_nav_items(
+            &mut items,
+            true,
+            &[SidebarSection::StagedChanges],
+            &staged,
+            &unstaged,
+        );
+        assert_eq!(
+            items,
+            vec![
+                SidebarItem::SectionHeader(SidebarSection::StagedChanges),
+                SidebarItem::StagedDir("staged:src".into()),
+                SidebarItem::StagedFile(5),
+                SidebarItem::SectionHeader(SidebarSection::UnstagedChanges),
+            ]
+        );
+        assert_eq!(
+            section_list_row(&items, 2),
+            Some((SidebarSection::StagedChanges, 1))
+        );
+        assert_eq!(section_list_row(&items, 3), None);
+    }
+
+    #[test]
+    fn layout_switch_remaps_change_selection_without_targeting_another_file() {
+        let classic = vec![
+            SidebarItem::LocalBranch(2),
+            SidebarItem::SectionHeader(SidebarSection::StagedChanges),
+            SidebarItem::StagedFile(4),
+            SidebarItem::SectionHeader(SidebarSection::UnstagedChanges),
+            SidebarItem::UnstagedDir("unstaged:src".into()),
+        ];
+        let focused = vec![SidebarItem::WorkingChanges, SidebarItem::LocalBranch(2)];
+        assert_eq!(remap_keyboard_index(&classic, &focused, Some(0)), Some(1));
+        for index in 1..classic.len() {
+            assert_eq!(
+                remap_keyboard_index(&classic, &focused, Some(index)),
+                Some(0)
+            );
+        }
+        assert_eq!(remap_keyboard_index(&focused, &classic, Some(0)), Some(1));
+        assert_eq!(remap_keyboard_index(&classic, &focused, None), None);
+        // Filtering refs leaves the working target at the top.
+        assert_eq!(
+            remap_keyboard_index(&focused, &focused[..1], Some(0)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn focused_visibility_preserves_every_ref_section() {
+        for section in [
+            SidebarSection::LocalBranches,
+            SidebarSection::Remotes,
+            SidebarSection::RemoteBranches,
+            SidebarSection::Tags,
+            SidebarSection::Stashes,
+            SidebarSection::Worktrees,
+        ] {
+            assert!(section_is_visible(section, false));
+            assert!(section_is_visible(section, true));
+        }
+        for section in [
+            SidebarSection::StagedChanges,
+            SidebarSection::UnstagedChanges,
+        ] {
+            assert!(!section_is_visible(section, false));
+            assert!(section_is_visible(section, true));
+        }
+    }
+
+    #[test]
+    fn working_count_deduplicates_partially_staged_files() {
+        let staged = vec![make_file("src/a.rs", FileChangeKind::Modified)];
+        let unstaged = vec![
+            make_file("src/a.rs", FileChangeKind::Modified),
+            make_file("src/b.rs", FileChangeKind::Untracked),
+        ];
+        assert_eq!(unique_changed_file_count(&staged, &unstaged), 2);
+        assert_eq!(unique_changed_file_count(&[], &[]), 0);
+    }
 
     #[test]
     fn list_heights_stay_content_sized_when_everything_fits() {

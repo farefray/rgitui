@@ -84,11 +84,15 @@ impl<T> OverlayFocus<T> {
 /// window.
 pub(crate) struct DrawnPanels<T> {
     last: Option<(T, BottomPanelMode)>,
+    visibility: Option<(bool, bool, bool)>,
 }
 
 impl<T> Default for DrawnPanels<T> {
     fn default() -> Self {
-        Self { last: None }
+        Self {
+            last: None,
+            visibility: None,
+        }
     }
 }
 
@@ -123,7 +127,21 @@ impl Workspace {
             .tabs
             .get(self.active_tab)
             .map(|tab| (tab.project.entity_id(), tab.bottom_panel_mode));
-        let replacement = self.focus.drawn_panels.observe(drawn);
+        let visibility = (
+            self.graph_is_visible(),
+            self.content_is_visible(),
+            self.tabs
+                .get(self.active_tab)
+                .is_some_and(|tab| tab.inspecting_working_changes()),
+        );
+        let changed = self.focus.drawn_panels.visibility.replace(visibility) != Some(visibility);
+        let replacement = self.focus.drawn_panels.observe(drawn).or_else(|| {
+            changed.then_some(if visibility.0 {
+                FocusedPanel::Graph
+            } else {
+                FocusedPanel::DiffViewer
+            })
+        });
         let hand_back = match transition {
             OverlayTransition::Closed(return_to) => Some((return_to, FocusedPanel::Graph)),
             // An open overlay holds focus itself; a panel swapped out underneath

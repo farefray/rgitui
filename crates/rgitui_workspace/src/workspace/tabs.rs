@@ -306,7 +306,6 @@ impl Workspace {
                     graph: &graph,
                     sidebar: &sidebar,
                     diff_viewer: &diff_viewer,
-                    detail_panel: &detail_panel,
                     toolbar: &toolbar,
                     diff_cache: caches.diff.clone(),
                     diff_prefetch: diff_prefetch.clone(),
@@ -399,6 +398,13 @@ impl Workspace {
                 s.set_selected_worktree_by_path(Some(&selected_worktree_path), cx);
             });
 
+            detail_panel.update(cx, |panel, cx| {
+                panel.set_working_changes(
+                    (*init_status).clone(),
+                    selected_worktree_path.clone(),
+                    cx,
+                )
+            });
             commit_panel.update(cx, |cp, cx| cp.set_staged_count(staged_count, cx));
         }
 
@@ -451,6 +457,12 @@ impl Workspace {
             global_search_view,
             right_panel_mode: RightPanelMode::Details,
             bottom_panel_mode: BottomPanelMode::Diff,
+            center_view: super::CenterView::Graph,
+            content_open: false,
+            inspection: super::InspectionContext::WorkingChanges,
+            inspection_generation: 0,
+            navigation_generation: 0,
+            pending_auxiliary: None,
             caches,
             inspecting_worktree: None,
             _subscriptions: subscriptions,
@@ -865,6 +877,7 @@ impl Workspace {
             diff_viewer_height: self.layout.diff_viewer_height,
             commit_input_height: self.layout.commit_input_height,
             graph_hidden: self.layout.graph_hidden,
+            graph_focused: self.layout.graph_focused,
         }
     }
 
@@ -874,6 +887,7 @@ impl Workspace {
         self.layout.diff_viewer_height = layout.diff_viewer_height;
         self.layout.commit_input_height = layout.commit_input_height.max(300.0);
         self.layout.graph_hidden = layout.graph_hidden;
+        self.layout.graph_focused = layout.graph_focused;
     }
 
     pub(super) fn persist_workspace_snapshot(&mut self, cx: &mut Context<Self>) {

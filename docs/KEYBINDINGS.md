@@ -69,7 +69,7 @@ The file is reloaded when you save it. Bindings you add win over the defaults. T
 | _unbound_ | — | `rgitui::AbortOperation` | Abort the merge, rebase, cherry-pick or revert in progress. |
 | _unbound_ | — | `rgitui::ContinueMerge` | Continue the merge, rebase, cherry-pick or revert in progress. |
 | `shift-d` | `Workspace && !modal && !TextInput` | `rgitui::ToggleDiffMode` | Switch the diff viewer between unified and side-by-side. |
-| `secondary-shift-g` | `Workspace && !modal` | `rgitui::ToggleGraph` | Hide or show the commit graph, giving its space to the diff viewer. |
+| `secondary-shift-g` | `Workspace && !modal` | `rgitui::ToggleGraph` | Switch Graph and file views; in classic layout, hide or show the graph. |
 | `secondary-f` or `/` | `Workspace && !modal` or `Workspace && !modal && !TextInput` | `rgitui::Search` | Search the commit graph. |
 | `secondary-g` | `Workspace && !modal` | `rgitui::AiMessage` | Generate a commit message with the configured AI provider. |
 | `f5` | `Workspace && !modal` | `rgitui::Refresh` | Reload the repository state from disk. |
@@ -112,8 +112,8 @@ The file is reloaded when you save it. Bindings you add win over the defaults. T
 | `shift-tab` | `Workspace && !modal && !TextInput` | `rgitui::FocusPrevPanel` | Move keyboard focus to the previous panel. |
 | `secondary-[` | `Workspace && !modal` | `rgitui::ShrinkDetailPanel` | Narrow the detail panel. |
 | `secondary-]` | `Workspace && !modal` | `rgitui::GrowDetailPanel` | Widen the detail panel. |
-| `secondary-up` | `Workspace && !modal` | `rgitui::ShrinkDiffViewer` | Shorten the diff viewer. |
-| `secondary-down` | `Workspace && !modal` | `rgitui::GrowDiffViewer` | Heighten the diff viewer. |
+| `secondary-up` | `Workspace && !modal` | `rgitui::ShrinkDiffViewer` | Shorten the diff viewer in classic split layout. |
+| `secondary-down` | `Workspace && !modal` | `rgitui::GrowDiffViewer` | Heighten the diff viewer in classic split layout. |
 | _unbound_ | — | `rgitui::OpenKeymap` | Open keymap.json in your editor to rebind shortcuts. |
 
 ## Menu

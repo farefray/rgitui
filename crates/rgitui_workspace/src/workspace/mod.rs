@@ -5,6 +5,7 @@ mod events;
 mod focus;
 mod key_handler;
 mod layout;
+mod navigation;
 mod operations;
 mod state;
 mod tabs;
@@ -12,6 +13,7 @@ mod undo;
 mod update_checker;
 
 pub(crate) use layout::open_editor;
+pub(super) use navigation::{CenterView, InspectionContext};
 pub(crate) use state::*;
 pub(crate) use undo::{UndoAction, UndoStack};
 
@@ -190,6 +192,12 @@ pub(super) struct ProjectTab {
     pub global_search_view: Entity<crate::GlobalSearchView>,
     pub right_panel_mode: RightPanelMode,
     pub bottom_panel_mode: BottomPanelMode,
+    pub center_view: CenterView,
+    pub content_open: bool,
+    pub inspection: InspectionContext,
+    pub inspection_generation: u64,
+    pub navigation_generation: u64,
+    pub pending_auxiliary: Option<(ViewCacheKey, BottomPanelMode, u64)>,
     pub caches: ViewCaches,
     pub inspecting_worktree: Option<InspectingWorktree>,
     pub _subscriptions: Vec<gpui::Subscription>,
@@ -222,6 +230,12 @@ impl Clone for ProjectTab {
             global_search_view: self.global_search_view.clone(),
             right_panel_mode: self.right_panel_mode,
             bottom_panel_mode: self.bottom_panel_mode,
+            center_view: self.center_view,
+            content_open: self.content_open,
+            inspection: self.inspection.clone(),
+            inspection_generation: self.inspection_generation,
+            navigation_generation: self.navigation_generation,
+            pending_auxiliary: self.pending_auxiliary.clone(),
             caches: self.caches.clone(),
             inspecting_worktree: self.inspecting_worktree.clone(),
             _subscriptions: Vec::new(),
@@ -318,6 +332,25 @@ impl FocusedPanel {
         } else {
             self
         }
+    }
+
+    fn visible_target(self, graph: bool, content: bool) -> Self {
+        match self {
+            Self::DiffViewer if !content => Self::Graph,
+            panel => panel.available(!graph),
+        }
+    }
+
+    fn cycle_visible(current: Option<Self>, forward: bool, graph: bool, content: bool) -> Self {
+        let mut target = Self::cycle(current, forward, !graph);
+        if target == Self::DiffViewer && !content {
+            target = if forward {
+                target.next()
+            } else {
+                target.prev()
+            };
+        }
+        target.visible_target(graph, content)
     }
 
     /// Where Tab (`forward`) or Shift+Tab moves focus from `current`, stepping
@@ -506,6 +539,7 @@ impl Workspace {
                 diff_viewer_height,
                 commit_input_height,
                 graph_hidden: layout_settings.graph_hidden,
+                graph_focused: layout_settings.graph_focused,
                 content_bounds: Bounds::default(),
                 right_panel_bounds: Bounds::default(),
             },
@@ -975,14 +1009,24 @@ impl Workspace {
     /// Cycle focus to the next panel in order.
     pub(super) fn focus_next_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_focused_panel(window, cx);
-        let next = FocusedPanel::cycle(current, true, self.layout.graph_hidden);
+        let next = FocusedPanel::cycle_visible(
+            current,
+            true,
+            self.graph_is_visible(),
+            self.content_is_visible(),
+        );
         self.focus_panel(next, window, cx);
     }
 
     /// Cycle focus to the previous panel in order.
     pub(super) fn focus_prev_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_focused_panel(window, cx);
-        let prev = FocusedPanel::cycle(current, false, self.layout.graph_hidden);
+        let prev = FocusedPanel::cycle_visible(
+            current,
+            false,
+            self.graph_is_visible(),
+            self.content_is_visible(),
+        );
         self.focus_panel(prev, window, cx);
     }
 
@@ -994,7 +1038,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            match panel.available(self.layout.graph_hidden) {
+            match panel.visible_target(self.graph_is_visible(), self.content_is_visible()) {
                 FocusedPanel::Sidebar => {
                     tab.sidebar.update(cx, |s, cx| s.focus(window, cx));
                 }

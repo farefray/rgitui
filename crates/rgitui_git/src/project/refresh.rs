@@ -205,6 +205,11 @@ fn head_summary(repo: &Repository) -> (Option<String>, bool, Option<git2::Oid>) 
     (branch, detached, head_oid)
 }
 
+fn head_is_unborn(repo: &Repository) -> bool {
+    repo.head()
+        .is_err_and(|error| error.code() == git2::ErrorCode::UnbornBranch)
+}
+
 /// The branch a HEAD reflog message says HEAD was switched away from.
 ///
 /// Every checkout records `checkout: moving from <from> to <to>` — git's own
@@ -259,6 +264,7 @@ fn worktree_info_at(
         branch,
         head_detached,
         head_oid,
+        head_unborn: opened.as_ref().is_ok_and(head_is_unborn),
         status: None,
         state,
     }
@@ -294,6 +300,7 @@ fn gather_worktrees(repo: &Repository) -> Vec<WorktreeInfo> {
         branch,
         head_detached,
         head_oid,
+        head_unborn: head_is_unborn(repo),
         status: None,
         state: RepoState::from_git2(repo.state()),
     });
@@ -1940,6 +1947,22 @@ mod worktree_tests {
             .iter()
             .find(|worktree| worktree.name == name)
             .unwrap_or_else(|| panic!("no worktree named {name}"))
+    }
+
+    #[test]
+    fn discovery_distinguishes_unborn_and_unavailable_checkouts() {
+        let fixture = TempRepo::init();
+        let unborn = gather_worktrees(fixture.repo());
+        assert!(unborn[0].head_oid.is_none());
+        assert!(unborn[0].head_unborn);
+        let missing = worktree_info_at(
+            "missing".into(),
+            fixture.path().join("unavailable"),
+            false,
+            false,
+        );
+        assert!(missing.head_oid.is_none());
+        assert!(!missing.head_unborn);
     }
 
     #[test]

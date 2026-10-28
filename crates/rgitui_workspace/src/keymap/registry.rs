@@ -128,7 +128,7 @@ commands! {
         ContinueMerge unbound if in_progress_operation;
         /// Switch the diff viewer between unified and side-by-side.
         ToggleDiffMode "shift-d" in "Workspace && !modal && !TextInput";
-        /// Hide or show the commit graph, giving its space to the diff viewer.
+        /// Switch Graph and file views; in classic layout, hide or show the graph.
         ToggleGraph "secondary-shift-g";
         /// Search the commit graph.
         Search ["secondary-f", "/" in "Workspace && !modal && !TextInput"];
@@ -219,9 +219,9 @@ commands! {
         ShrinkDetailPanel "secondary-[" [hidden];
         /// Widen the detail panel.
         GrowDetailPanel "secondary-]" [hidden];
-        /// Shorten the diff viewer.
+        /// Shorten the diff viewer in classic split layout.
         ShrinkDiffViewer "secondary-up" [hidden];
-        /// Heighten the diff viewer.
+        /// Heighten the diff viewer in classic split layout.
         GrowDiffViewer "secondary-down" [hidden];
         /// Open keymap.json in your editor to rebind shortcuts.
         OpenKeymap unbound;

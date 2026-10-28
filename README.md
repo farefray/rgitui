@@ -57,13 +57,13 @@
 
 ### Views
 
-- **Commit graph** — animated lane-based visualization with Bezier-curve edges and commit search
+- **Commit graph** — branch-first references, connected ancestry lanes, optional hashes, and commit search
 - **Diff viewer** — unified and side-by-side diffs plus an interactive Current / Result / Incoming conflict resolver with syntax highlighting (syntect)
 - **Blame view** — per-line author info with avatars
 - **File history** — commit history filtered to a single file
 - **Reflog** — reference log browser
 - **Global search** — full-repo search via `git grep`
-- **Detail panel** — commit metadata, file list with diff stats, cherry-pick controls
+- **Contextual inspector** — selected commit details or staged/unstaged working changes, with checkout-bound staging controls
 
 ### GitHub integration
 
@@ -73,7 +73,9 @@
 
 ### UI
 
-- Drag-resizable sidebar, detail panel, diff viewer, and commit panel
+- **Graph-focused layout** — full-height Graph and reusable file views; return to Graph without losing your place
+- **Classic split layout** remains available through the visible Split view / Graph focus control
+- Drag-resizable sidebar, detail panel, split-layout diff viewer, and commit panel
 - Command palette (`Ctrl+P`) with context-aware commands
 - Toolbar with one-click fetch, pull, push, branch, stash, create PR, and more
 - Status bar showing branch, ahead/behind, staged/unstaged counts, and operation status
@@ -93,7 +95,9 @@ Built-in themes:
 Existing theme choices are preserved. Select **Forest** in Settings → Appearance
 to try it. Interface text defaults to embedded **IBM Plex Sans**; code and hashes
 remain monospace, and an explicit `ui_font` setting still takes precedence.
-See [UX and theming](docs/UX_THEMING.md) for the visual hierarchy and review checklist.
+See [UX and theming](docs/UX_THEMING.md) for the visual hierarchy and review checklist,
+and [Graph-first workspace](docs/GRAPH_WORKSPACE.md) for graph/file navigation and the
+contextual working-changes inspector.
 
 ### Performance
 
@@ -167,7 +171,7 @@ rgitui /path/to/repo
 | `` Ctrl+` `` | Switch to the previously used repository |
 | `Ctrl+F` | Search commit graph |
 | `Ctrl+Shift+F` | Global search (`git grep`) |
-| `Ctrl+Shift+G` | Hide / show the commit graph |
+| `Ctrl+Shift+G` | Switch Graph / file view (classic layout: hide / show graph) |
 | `Ctrl+Shift+R` | Fetch |
 | `Ctrl+G` | Generate AI commit message |
 | `Ctrl+Enter` | Commit staged changes |
@@ -210,7 +214,7 @@ silently operating on the main checkout; use Git in that worktree's terminal.
 | `Tab` / `Shift+Tab` | Cycle panel focus |
 | `Alt+1`..`Alt+4` | Focus sidebar / graph / detail / diff |
 | `Ctrl+[` / `Ctrl+]` | Resize detail panel |
-| `Ctrl+Up` / `Ctrl+Down` | Resize diff viewer (up to the full column, minus a sliver of graph) |
+| `Ctrl+Up` / `Ctrl+Down` | Resize diff viewer in classic split layout |
 | `/` | Search in focused panel |
 
 ### Diff viewer

@@ -77,6 +77,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.graph_is_visible() {
+            cx.propagate();
+            return;
+        }
         let Some(graph) = self.tabs.get(self.active_tab).map(|tab| tab.graph.clone()) else {
             cx.propagate();
             return;
@@ -164,6 +168,15 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.content_is_visible()
+            || !self
+                .tabs
+                .get(self.active_tab)
+                .is_some_and(|tab| tab.bottom_panel_mode == BottomPanelMode::Diff)
+        {
+            cx.propagate();
+            return;
+        }
         let Some(diff) = self
             .tabs
             .get(self.active_tab)
@@ -212,7 +225,7 @@ impl Workspace {
             return;
         };
         let graph = tab.graph.clone();
-        let revealing = self.layout.graph_hidden;
+        let revealing = !self.graph_is_visible();
         self.set_graph_hidden(false, cx);
         graph.update(cx, |graph, cx| {
             if revealing {
@@ -249,6 +262,17 @@ impl Workspace {
     /// `Render for Workspace`): that is the one place every caller, the command
     /// palette included, reaches with a `Window`.
     pub(super) fn set_graph_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        if self.layout.graph_focused {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if hidden {
+                    tab.reveal_content(tab.bottom_panel_mode);
+                } else {
+                    tab.reveal_graph();
+                }
+            }
+            cx.notify();
+            return;
+        }
         if self.layout.graph_hidden == hidden {
             return;
         }
@@ -317,12 +341,14 @@ impl Workspace {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        if tab.bottom_panel_mode == BottomPanelMode::GlobalSearch {
+        if tab.center_view == super::CenterView::Content
+            && tab.bottom_panel_mode == BottomPanelMode::GlobalSearch
+        {
             tab.global_search_view
                 .update(cx, |search, cx| search.hide(cx));
-            tab.bottom_panel_mode = BottomPanelMode::Diff;
+            tab.reveal_content(BottomPanelMode::Diff);
         } else {
-            tab.bottom_panel_mode = BottomPanelMode::GlobalSearch;
+            tab.reveal_content(BottomPanelMode::GlobalSearch);
             tab.global_search_view.update(cx, |search, cx| {
                 search.show(window, cx);
             });
@@ -432,7 +458,7 @@ impl Workspace {
             CommandId::GrowDetailPanel => self.resize_detail_panel(DETAIL_PANEL_STEP, cx),
             CommandId::ShrinkDiffViewer => self.resize_diff_viewer(-DIFF_VIEWER_STEP, cx),
             CommandId::GrowDiffViewer => self.resize_diff_viewer(DIFF_VIEWER_STEP, cx),
-            CommandId::ToggleGraph => self.set_graph_hidden(!self.layout.graph_hidden, cx),
+            CommandId::ToggleGraph => self.set_graph_hidden(self.graph_is_visible(), cx),
             // Toggling the palette needs a `Window`, so it is handled in
             // `dispatch_command`. It is `[hidden]`, so the palette never
             // dispatches it to itself. The panel-focus commands likewise need a
@@ -554,7 +580,7 @@ impl Workspace {
             CommandId::Search => {
                 // As in `toggle_graph_search`: a hidden graph comes back with
                 // its search open, never closed.
-                let revealing = self.layout.graph_hidden;
+                let revealing = !self.graph_is_visible();
                 self.set_graph_hidden(false, cx);
                 if !(revealing && tab.graph.read(cx).is_search_visible()) {
                     tab.graph.update(cx, |g, cx| {
@@ -727,12 +753,14 @@ impl Workspace {
             }
             CommandId::GlobalSearch => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    if tab.bottom_panel_mode == BottomPanelMode::GlobalSearch {
+                    if tab.center_view == super::CenterView::Content
+                        && tab.bottom_panel_mode == BottomPanelMode::GlobalSearch
+                    {
                         tab.global_search_view
                             .update(cx, |search, cx| search.hide(cx));
-                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        tab.reveal_content(BottomPanelMode::Diff);
                     } else {
-                        tab.bottom_panel_mode = BottomPanelMode::GlobalSearch;
+                        tab.reveal_content(BottomPanelMode::GlobalSearch);
                         tab.global_search_view
                             .update(cx, |search, cx| search.show_without_focus(cx));
                     }
@@ -968,8 +996,10 @@ impl Workspace {
 
     fn toggle_blame_view(&mut self, tab: &ProjectTab, cx: &mut Context<Self>) {
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-            if active_tab.bottom_panel_mode == BottomPanelMode::Blame {
-                active_tab.bottom_panel_mode = BottomPanelMode::Diff;
+            if active_tab.center_view == super::CenterView::Content
+                && active_tab.bottom_panel_mode == BottomPanelMode::Blame
+            {
+                active_tab.reveal_content(BottomPanelMode::Diff);
                 cx.notify();
                 return;
             }
@@ -992,7 +1022,7 @@ impl Workspace {
                     bv.set_blame(lines, display_path, cx);
                 });
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-                    active_tab.bottom_panel_mode = BottomPanelMode::Blame;
+                    active_tab.reveal_content(BottomPanelMode::Blame);
                 }
                 cx.notify();
                 return;
@@ -1006,11 +1036,9 @@ impl Workspace {
             .ok()
             .and_then(|mut cache| cache.get(&cache_key));
         match entry {
-            Some(ViewCacheEntry::Loading) => self.show_toast(
-                "Blame is still being prepared for this file.",
-                ToastKind::Info,
-                cx,
-            ),
+            Some(ViewCacheEntry::Loading) => {
+                self.reveal_pending_auxiliary(BottomPanelMode::Blame, cache_key.clone(), cx);
+            }
             Some(ViewCacheEntry::Unavailable(reason)) => {
                 log::debug!("Blame unavailable for {}: {}", cache_key.file_path, reason);
                 self.show_toast(
@@ -1021,16 +1049,18 @@ impl Workspace {
             }
             Some(ViewCacheEntry::Ready(_)) => {}
             None => {
+                self.reveal_pending_auxiliary(BottomPanelMode::Blame, cache_key.clone(), cx);
                 Self::prefetch_blame_and_history(cache_key, tab.caches.clone(), cx);
-                self.show_toast("Preparing blame for this file...", ToastKind::Info, cx);
             }
         }
     }
 
     fn toggle_file_history_view(&mut self, tab: &ProjectTab, cx: &mut Context<Self>) {
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-            if active_tab.bottom_panel_mode == BottomPanelMode::FileHistory {
-                active_tab.bottom_panel_mode = BottomPanelMode::Diff;
+            if active_tab.center_view == super::CenterView::Content
+                && active_tab.bottom_panel_mode == BottomPanelMode::FileHistory
+            {
+                active_tab.reveal_content(BottomPanelMode::Diff);
                 cx.notify();
                 return;
             }
@@ -1053,7 +1083,7 @@ impl Workspace {
                     fv.set_history(commits, display_path, cx);
                 });
                 if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-                    active_tab.bottom_panel_mode = BottomPanelMode::FileHistory;
+                    active_tab.reveal_content(BottomPanelMode::FileHistory);
                 }
                 cx.notify();
                 return;
@@ -1068,7 +1098,7 @@ impl Workspace {
             .and_then(|mut cache| cache.get(&cache_key));
         match entry {
             Some(ViewCacheEntry::Loading) => {
-                self.show_toast("File history is still being prepared.", ToastKind::Info, cx)
+                self.reveal_pending_auxiliary(BottomPanelMode::FileHistory, cache_key.clone(), cx);
             }
             Some(ViewCacheEntry::Unavailable(reason)) => {
                 log::debug!(
@@ -1084,16 +1114,18 @@ impl Workspace {
             }
             Some(ViewCacheEntry::Ready(_)) => {}
             None => {
+                self.reveal_pending_auxiliary(BottomPanelMode::FileHistory, cache_key.clone(), cx);
                 Self::prefetch_blame_and_history(cache_key, tab.caches.clone(), cx);
-                self.show_toast("Preparing file history...", ToastKind::Info, cx);
             }
         }
     }
 
     fn toggle_reflog_view(&mut self, tab: &ProjectTab, cx: &mut Context<Self>) {
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-            if active_tab.bottom_panel_mode == BottomPanelMode::Reflog {
-                active_tab.bottom_panel_mode = BottomPanelMode::Diff;
+            if active_tab.center_view == super::CenterView::Content
+                && active_tab.bottom_panel_mode == BottomPanelMode::Reflog
+            {
+                active_tab.reveal_content(BottomPanelMode::Diff);
                 cx.notify();
                 return;
             }
@@ -1103,7 +1135,16 @@ impl Workspace {
         let project_id = project.entity_id();
         let worktree_path = tab.effective_repo_path(cx);
 
-        let task = project.update(cx, |proj, cx| proj.reflog_async("HEAD".to_string(), cx));
+        let active = &mut self.tabs[self.active_tab];
+        let request_generation = active.begin_content_request(BottomPanelMode::Reflog);
+        active
+            .reflog_view
+            .update(cx, |view, cx| view.set_entries(Vec::new(), cx));
+        cx.notify();
+        let request_path = worktree_path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { rgitui_git::compute_reflog(&request_path, "HEAD") });
 
         cx.spawn(
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
@@ -1114,12 +1155,14 @@ impl Workspace {
                                 return;
                             };
                             let tab = &mut workspace.tabs[index];
-                            if tab.effective_repo_path(cx) != worktree_path {
+                            if tab.effective_repo_path(cx) != worktree_path
+                                || tab.navigation_generation != request_generation
+                            {
                                 return;
                             }
                             tab.reflog_view
                                 .update(cx, |rv, cx| rv.set_entries(entries, cx));
-                            tab.bottom_panel_mode = BottomPanelMode::Reflog;
+                            // Navigation happened at dispatch, never on completion.
                             cx.notify();
                         });
                     });
@@ -1142,8 +1185,10 @@ impl Workspace {
 
     fn toggle_submodule_view(&mut self, tab: &ProjectTab, cx: &mut Context<Self>) {
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-            if active_tab.bottom_panel_mode == BottomPanelMode::Submodules {
-                active_tab.bottom_panel_mode = BottomPanelMode::Diff;
+            if active_tab.center_view == super::CenterView::Content
+                && active_tab.bottom_panel_mode == BottomPanelMode::Submodules
+            {
+                active_tab.reveal_content(BottomPanelMode::Diff);
                 cx.notify();
                 return;
             }
@@ -1153,7 +1198,17 @@ impl Workspace {
         let project_id = project.entity_id();
         let worktree_path = tab.effective_repo_path(cx);
 
-        let task = project.update(cx, |proj, cx| proj.submodules_async(cx));
+        let active = &mut self.tabs[self.active_tab];
+        let request_generation = active.begin_content_request(BottomPanelMode::Submodules);
+        active
+            .submodule_view
+            .update(cx, |view, cx| view.set_submodules(Vec::new(), cx));
+        cx.notify();
+        let request_path = worktree_path.clone();
+        let task = cx.background_executor().spawn(async move {
+            let repo = git2::Repository::open(&request_path)?;
+            rgitui_git::compute_submodules(&repo)
+        });
 
         cx.spawn(
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
@@ -1164,12 +1219,14 @@ impl Workspace {
                                 return;
                             };
                             let tab = &mut workspace.tabs[index];
-                            if tab.effective_repo_path(cx) != worktree_path {
+                            if tab.effective_repo_path(cx) != worktree_path
+                                || tab.navigation_generation != request_generation
+                            {
                                 return;
                             }
                             tab.submodule_view
                                 .update(cx, |sv, cx| sv.set_submodules(submodules, cx));
-                            tab.bottom_panel_mode = BottomPanelMode::Submodules;
+                            // Navigation happened at dispatch, never on completion.
                             cx.notify();
                         });
                     });
@@ -1192,8 +1249,10 @@ impl Workspace {
 
     fn toggle_bisect_view(&mut self, tab: &ProjectTab, cx: &mut Context<Self>) {
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab) {
-            if active_tab.bottom_panel_mode == BottomPanelMode::Bisect {
-                active_tab.bottom_panel_mode = BottomPanelMode::Diff;
+            if active_tab.center_view == super::CenterView::Content
+                && active_tab.bottom_panel_mode == BottomPanelMode::Bisect
+            {
+                active_tab.reveal_content(BottomPanelMode::Diff);
                 cx.notify();
                 return;
             }
@@ -1203,7 +1262,16 @@ impl Workspace {
         let project_id = project.entity_id();
         let worktree_path = tab.effective_repo_path(cx);
 
-        let task = project.update(cx, |proj, cx| proj.bisect_log_async(cx));
+        let active = &mut self.tabs[self.active_tab];
+        let request_generation = active.begin_content_request(BottomPanelMode::Bisect);
+        active
+            .bisect_view
+            .update(cx, |view, cx| view.set_entries(Vec::new(), cx));
+        cx.notify();
+        let request_path = worktree_path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { rgitui_git::compute_bisect_log(&request_path) });
 
         cx.spawn(
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
@@ -1214,12 +1282,14 @@ impl Workspace {
                                 return;
                             };
                             let tab = &mut workspace.tabs[index];
-                            if tab.effective_repo_path(cx) != worktree_path {
+                            if tab.effective_repo_path(cx) != worktree_path
+                                || tab.navigation_generation != request_generation
+                            {
                                 return;
                             }
                             tab.bisect_view
                                 .update(cx, |bv, cx| bv.set_entries(entries, cx));
-                            tab.bottom_panel_mode = BottomPanelMode::Bisect;
+                            // Navigation happened at dispatch, never on completion.
                             cx.notify();
                         });
                     });
@@ -1238,6 +1308,83 @@ impl Workspace {
             },
         )
         .detach();
+    }
+
+    fn reveal_pending_auxiliary(
+        &mut self,
+        mode: BottomPanelMode,
+        key: ViewCacheKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.reveal_content(mode);
+        match mode {
+            BottomPanelMode::Blame => tab.blame_view.update(cx, |view, cx| {
+                view.set_blame(Vec::new(), key.file_path.clone(), cx)
+            }),
+            BottomPanelMode::FileHistory => tab.file_history_view.update(cx, |view, cx| {
+                view.set_history(Vec::new(), key.file_path.clone(), cx)
+            }),
+            _ => return,
+        }
+        tab.pending_auxiliary = Some((key, mode, tab.navigation_generation));
+        cx.notify();
+    }
+
+    /// Cache completion may populate a requested view, but never navigate.
+    pub(super) fn refresh_pending_auxiliary(&mut self, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            let Some((key, mode, generation)) = tab.pending_auxiliary.clone() else {
+                continue;
+            };
+            if tab.navigation_generation != generation
+                || tab.current_view_cache_key(cx).as_ref() != Some(&key)
+            {
+                tab.pending_auxiliary = None;
+                continue;
+            }
+            match mode {
+                BottomPanelMode::Blame => {
+                    let entry = tab
+                        .caches
+                        .blame
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.peek(&key).cloned());
+                    match entry {
+                        Some(ViewCacheEntry::Ready(lines)) => {
+                            tab.blame_view
+                                .update(cx, |view, cx| view.set_blame(lines, key.file_path, cx));
+                            tab.pending_auxiliary = None;
+                        }
+                        Some(ViewCacheEntry::Unavailable(_)) => tab.pending_auxiliary = None,
+                        _ => {}
+                    }
+                }
+                BottomPanelMode::FileHistory => {
+                    let entry = tab
+                        .caches
+                        .history
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.peek(&key).cloned());
+                    match entry {
+                        Some(ViewCacheEntry::Ready(commits)) => {
+                            tab.file_history_view.update(cx, |view, cx| {
+                                view.set_history(commits, key.file_path, cx)
+                            });
+                            tab.pending_auxiliary = None;
+                        }
+                        Some(ViewCacheEntry::Unavailable(_)) => tab.pending_auxiliary = None,
+                        _ => {}
+                    }
+                }
+                _ => tab.pending_auxiliary = None,
+            }
+        }
+        cx.notify();
     }
 
     /// Prefetch blame and file history for a file in the background.
@@ -1349,7 +1496,8 @@ impl Workspace {
 
                 blame_fut.await;
                 history_fut.await;
-                this.update(cx, |_workspace, cx| cx.notify()).ok();
+                this.update(cx, |workspace, cx| workspace.refresh_pending_auxiliary(cx))
+                    .ok();
             },
         )
         .detach();

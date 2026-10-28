@@ -12,7 +12,7 @@ use gpui::{
     canvas, div, img, point, px, uniform_list, Animation, AnimationExt, App, Bounds, ClickEvent,
     Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle, ListSizingBehavior,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, Render,
-    ScrollStrategy, SharedString, Size, UniformListScrollHandle, WeakEntity, Window,
+    ScrollHandle, ScrollStrategy, SharedString, Size, UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{
     compact_ref_labels, compute_graph, CommitInfo, FileChangeKind, GraphEdge, GraphRow, RefLabel,
@@ -38,6 +38,72 @@ impl Render for DateColumnResize {
     fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
     }
+}
+
+/// Column geometry shared by the header, commits and virtual worktree rows.
+/// Metadata yields first; ref labels never change the uniform row height.
+#[derive(Debug)]
+struct GraphColumns {
+    refs: f32,
+    author: f32,
+    date: f32,
+}
+
+fn graph_columns(
+    width: f32,
+    graph: f32,
+    refs: bool,
+    hash: bool,
+    author: f32,
+    date: f32,
+) -> GraphColumns {
+    let width = if width > 0.0 { width } else { 1000.0 };
+    let refs = if refs {
+        (width * 0.18).clamp(112.0, 180.0)
+    } else {
+        0.0
+    };
+    // Row padding, rebase grip and header controls also consume horizontal space.
+    let remaining = width - graph - refs - if hash { 80.0 } else { 0.0 } - 76.0;
+    let author = if remaining >= 380.0 {
+        author.min((remaining * 0.22).clamp(80.0, 180.0))
+    } else {
+        0.0
+    };
+    let date = if remaining - author >= 440.0 {
+        date.min(90.0)
+    } else {
+        0.0
+    };
+    GraphColumns { refs, author, date }
+}
+
+fn lane_center(lane: usize, lane_width: f32, padding: f32) -> f32 {
+    padding + (lane as f32 + 0.5) * lane_width
+}
+
+/// One primary label plus a bounded +N affordance; all full names remain available.
+fn ref_presentation(refs: &[RefLabel]) -> (Option<RefLabel>, usize, Vec<String>) {
+    let compact = compact_ref_labels(refs);
+    let primary = compact
+        .iter()
+        .min_by_key(|entry| match entry.label {
+            RefLabel::LocalBranch(_) => 0,
+            RefLabel::Tag(_) => 1,
+            RefLabel::RemoteBranch(_) => 2,
+            RefLabel::Head => 3,
+        })
+        .map(|entry| entry.label.clone());
+    let names = refs
+        .iter()
+        .map(|label| match label {
+            RefLabel::Head => "HEAD".to_owned(),
+            RefLabel::LocalBranch(name) => format!("refs/heads/{name}"),
+            RefLabel::RemoteBranch(name) => format!("refs/remotes/{name}"),
+            RefLabel::Tag(name) => format!("refs/tags/{name}"),
+        })
+        .collect();
+    (primary, refs.len().saturating_sub(1), names)
 }
 
 /// Width of the commit graph context menu.
@@ -323,9 +389,6 @@ pub enum GraphViewEvent {
     CreateBranchAtCommit(git2::Oid),
     /// Check out the commit itself, detaching HEAD ("Checkout commit").
     CheckoutCommit(git2::Oid),
-    /// The commit was double-clicked: check out the local branch that points at
-    /// it, or the commit itself when none does.
-    CommitActivated(git2::Oid),
     CopyCommitSha(String),
     CopyCommitMessage(String),
     CopyAuthorName(String),
@@ -338,7 +401,7 @@ pub enum GraphViewEvent {
     LoadMoreCommits,
     /// Toggle "My Commits" filter — show only commits authored by the current user.
     ToggleMyCommits,
-    /// A worktree node row was selected.
+    /// Enter an existing checkout for inspection; never check out a Git ref.
     WorktreeNodeSelected {
         worktree_path: PathBuf,
         name: String,
@@ -364,6 +427,8 @@ pub struct WorktreeGraphInfo {
     pub name: String,
     pub is_current: bool,
     pub head_oid: Option<git2::Oid>,
+    /// An unborn HEAD confirmed by Git, not inferred from a missing OID.
+    pub head_unborn: bool,
     pub staged_count: usize,
     pub unstaged_count: usize,
     pub combined_breakdown: HashMap<FileChangeKind, usize>,
@@ -386,12 +451,50 @@ struct WorktreeRowPosition {
     color_index: usize,
 }
 
+fn worktree_list_index_for_path(
+    worktrees: &[WorktreeGraphInfo],
+    positions: &[WorktreeRowPosition],
+    path: &std::path::Path,
+) -> Option<usize> {
+    let index = worktrees
+        .iter()
+        .position(|info| info.worktree_path == path)?;
+    positions
+        .iter()
+        .find(|position| position.worktree_idx == index)
+        .map(|position| position.list_index)
+}
+
 /// State for the right-click context menu.
 struct ContextMenuState {
     /// The index of the commit that was right-clicked.
     commit_index: usize,
     /// Screen position where the menu should appear.
     position: Point<Pixels>,
+}
+
+/// Pointer gestures only change selection. Checkout is an explicit menu action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitClickSelection {
+    Inspect,
+    Extend,
+    Toggle,
+}
+
+fn commit_click_selection(
+    click_count: usize,
+    shift: bool,
+    secondary: bool,
+) -> CommitClickSelection {
+    if click_count >= 2 {
+        CommitClickSelection::Inspect
+    } else if shift {
+        CommitClickSelection::Extend
+    } else if secondary {
+        CommitClickSelection::Toggle
+    } else {
+        CommitClickSelection::Inspect
+    }
 }
 
 const DRAG_THRESHOLD: Pixels = px(6.);
@@ -414,7 +517,7 @@ fn contains_case_insensitive(haystack: &str, lowercase_needle: &str) -> bool {
     haystack.to_lowercase().contains(lowercase_needle)
 }
 
-/// Lay out dirty worktree pseudo-nodes relative to the already-computed commit
+/// Lay out worktree pseudo-nodes (including clean checkouts) relative to the already-computed commit
 /// graph.
 ///
 /// A worktree is a child of its HEAD commit, not an inline row in an existing
@@ -428,7 +531,18 @@ fn compute_worktree_row_positions(
     worktree_infos: &[WorktreeGraphInfo],
     graph_lane_count: usize,
 ) -> Vec<WorktreeRowPosition> {
+    if worktree_infos.is_empty() {
+        return Vec::new();
+    }
     let visible_commit_count = commits.len().min(graph_rows.len());
+    // A converging child may route into HEAD's lane on the preceding row.
+    // Ghost-lane cleanup can then clear has_incoming on HEAD itself, so use
+    // actual visible ancestry as well: WIP must be a sibling, never its parent.
+    let parents_with_visible_children: HashSet<_> = commits
+        .iter()
+        .take(visible_commit_count)
+        .flat_map(|commit| commit.parent_oids.iter().copied())
+        .collect();
     let mut anchored = Vec::new();
     let mut orphan_indices = Vec::new();
 
@@ -471,7 +585,8 @@ fn compute_worktree_row_positions(
     let mut claimed_head_lanes = HashSet::new();
     for (commit_index, position) in &mut anchored {
         let graph_row = &graph_rows[*commit_index];
-        let has_real_incoming = graph_row.has_incoming
+        let has_real_incoming = parents_with_visible_children.contains(&commits[*commit_index].oid)
+            || graph_row.has_incoming
             || graph_row.edges.iter().any(|edge| {
                 edge.from_lane != graph_row.node_lane && edge.to_lane == graph_row.node_lane
             });
@@ -773,6 +888,8 @@ pub struct GraphView {
     worktree_rows: Vec<usize>,
     virtual_rows_prefix: Arc<Vec<usize>>,
     show_settings_popover: bool,
+    ref_details: Option<Arc<Vec<String>>>,
+    ref_details_scroll: ScrollHandle,
     /// SHA display length: 0 = default short (7), or specific length (7/8/10/12/40).
     sha_display_length: u8,
     show_author_column: bool,
@@ -851,6 +968,8 @@ impl GraphView {
             worktree_rows: Vec::new(),
             virtual_rows_prefix: Arc::new(Vec::new()),
             show_settings_popover: false,
+            ref_details: None,
+            ref_details_scroll: ScrollHandle::new(),
             sha_display_length: 0,
             show_author_column: true,
             show_date_column: true,
@@ -933,9 +1052,7 @@ impl GraphView {
                 // rows must be swapped together: pairing new commits with old rows can index
                 // the wrong commit while a background graph computation is in flight.
                 let prev_selected_oid = this.selected_oid;
-                let prev_selected_index = this.selected_index;
-                let prev_selected_worktree =
-                    prev_selected_index.is_some_and(|index| this.is_worktree_row(index));
+                let prev_selected_worktree = this.selected_worktree_path().map(PathBuf::from);
                 // The multi-selection is remembered by OID too: commit indices
                 // shift whenever commits are loaded, filtered or reordered.
                 let prev_selected_oids: Vec<git2::Oid> = this
@@ -973,12 +1090,12 @@ impl GraphView {
                         this.selected_index = None;
                         this.selected_oid = None;
                     }
-                } else if prev_selected_worktree {
-                    if prev_selected_index.is_some_and(|index| index >= this.total_list_items()) {
-                        this.selected_index = None;
-                    } else {
-                        this.selected_index = prev_selected_index;
-                    }
+                } else if let Some(path) = prev_selected_worktree {
+                    this.selected_index = worktree_list_index_for_path(
+                        &this.worktree_infos,
+                        &this.worktree_row_positions,
+                        &path,
+                    );
                 } else {
                     this.selected_index = None;
                 }
@@ -1094,12 +1211,25 @@ impl GraphView {
 
     /// Update the worktree node data shown in the graph.
     pub fn set_worktree_statuses(&mut self, infos: Vec<WorktreeGraphInfo>, cx: &mut Context<Self>) {
-        let filtered: Vec<WorktreeGraphInfo> = infos
-            .into_iter()
-            .filter(|info| info.staged_count > 0 || info.unstaged_count > 0)
-            .collect();
-        self.worktree_infos = filtered;
+        let selected_worktree = self.selected_worktree_path().map(PathBuf::from);
+        // A checkout is a navigation target even when clean or not yet scanned.
+        self.worktree_infos = infos;
         self.recompute_worktree_positions();
+        // Worktree discovery/removal can shift rows. Keep selection attached to
+        // the checkout path, never to its previous visual index.
+        if let Some(path) = selected_worktree {
+            self.selected_index = worktree_list_index_for_path(
+                &self.worktree_infos,
+                &self.worktree_row_positions,
+                &path,
+            );
+        } else if let Some(oid) = self.selected_oid {
+            self.selected_index = self
+                .commits
+                .iter()
+                .position(|commit| commit.oid == oid)
+                .and_then(|index| self.list_index_for_commit_index(index));
+        }
         cx.notify();
     }
 
@@ -1347,6 +1477,37 @@ impl GraphView {
     /// This is the public API used by external callers (workspace vim-key navigation).
     pub fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
         self.select_list_index(index, cx);
+    }
+
+    /// Select the working row for a checkout, not an assumed first graph row.
+    /// Other branches can have newer commits, and linked worktrees can share HEAD.
+    pub fn select_worktree(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        self.pending_scroll = None;
+        let Some(index) =
+            worktree_list_index_for_path(&self.worktree_infos, &self.worktree_row_positions, path)
+        else {
+            // A checkout may not have been discovered yet. Its inspector can
+            // still open, but must not leave a historical commit highlighted.
+            self.selected_index = None;
+            self.selected_oid = None;
+            self.selection.clear();
+            self.sync_selected_rows();
+            cx.emit(GraphViewEvent::SelectionChanged);
+            cx.notify();
+            return false;
+        };
+        self.select_list_index(index, cx);
+        self.scroll_handle
+            .scroll_to_item(index, ScrollStrategy::Top);
+        true
+    }
+
+    /// The checkout identity under the cursor, independent of virtual row shifts.
+    pub fn selected_worktree_path(&self) -> Option<&std::path::Path> {
+        let position = self.worktree_row_at_list_index(self.selected_index?)?;
+        self.worktree_infos
+            .get(position.worktree_idx)
+            .map(|info| info.worktree_path.as_path())
     }
 
     /// Drop the cursor when it sits on a worktree pseudo-row.
@@ -1934,11 +2095,10 @@ impl Render for GraphView {
         let graph_lane_count = self.global_max_lane.max(worktree_max_lane + 1);
 
         let graph_col_width =
-            ((graph_lane_count as f32 + 1.0) * lane_width + graph_padding_left).max(80.0);
+            ((graph_lane_count as f32 + 1.0) * lane_width + graph_padding_left).max(64.0);
 
         // Column visibility settings
-        let show_author_column = self.show_author_column;
-        let show_date_column = self.show_date_column;
+        let show_hash_column = cx.global::<SettingsState>().settings().show_hash_column;
         let show_absolute_dates = self.show_absolute_dates;
         let sha_display_length = self.sha_display_length;
         let show_avatars = self.show_avatars;
@@ -1948,6 +2108,31 @@ impl Render for GraphView {
         let author_col_width = cx.global::<SettingsState>().settings().author_column_width;
         let date_col_width = cx.global::<SettingsState>().settings().date_column_width;
         let show_author_email = self.show_author_email;
+        let columns = graph_columns(
+            f32::from(self.container_bounds.size.width),
+            if show_graph_lanes {
+                graph_col_width
+            } else {
+                0.0
+            },
+            show_ref_badges,
+            show_hash_column,
+            if self.show_author_column {
+                author_col_width
+            } else {
+                0.0
+            },
+            if self.show_date_column {
+                date_col_width
+            } else {
+                0.0
+            },
+        );
+        let ref_col_width = columns.refs;
+        let author_col_width = columns.author;
+        let date_col_width = columns.date;
+        let show_author_column = author_col_width > 0.0;
+        let show_date_column = date_col_width > 0.0;
         let my_commits_active = self.my_commits_active;
 
         // Header row (not virtualized — always visible)
@@ -1967,9 +2152,12 @@ impl Render for GraphView {
                 move |this, e: &gpui::DragMoveEvent<AuthorColumnResize>, _, cx| {
                     let settings = cx.global_mut::<SettingsState>();
                     let right_edge = this.container_bounds.right()
-                        - px(22.0 + 22.0 + 8.0 + 12.0)
-                        - px(date_col_width)
-                        - px(12.0);
+                        - px(52.0)
+                        - px(if show_date_column {
+                            date_col_width + 20.0
+                        } else {
+                            0.0
+                        });
                     let new_w = f32::from(e.event.position.x - (right_edge - px(author_col_width)))
                         .clamp(50., 600.);
                     settings.settings_mut().author_column_width = new_w;
@@ -1979,13 +2167,22 @@ impl Render for GraphView {
             .on_drag_move::<DateColumnResize>(cx.listener(
                 move |this, e: &gpui::DragMoveEvent<DateColumnResize>, _, cx| {
                     let settings = cx.global_mut::<SettingsState>();
-                    let right_edge = this.container_bounds.right() - px(22.0 + 22.0 + 8.0);
+                    let right_edge = this.container_bounds.right() - px(60.0);
                     let new_w = f32::from(e.event.position.x - (right_edge - px(date_col_width)))
                         .clamp(50., 300.);
                     settings.settings_mut().date_column_width = new_w;
                     cx.notify();
                 },
             ))
+            .when(show_ref_badges, |el| {
+                el.child(
+                    div().w(px(ref_col_width)).flex_shrink_0().child(
+                        Label::new(t!("graph.column.refs"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
             .when(show_graph_lanes, |el| {
                 el.child(
                     div()
@@ -2011,14 +2208,16 @@ impl Render for GraphView {
             // Matches the 16px drag-to-rebase grip in each row so the
             // Hash header lines up with the hash column below it.
             .child(div().w(px(16.)).flex_shrink_0())
-            .child(
-                div().w(px(80.)).flex_shrink_0().child(
-                    Label::new(t!("graph.column.hash"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .weight(gpui::FontWeight::SEMIBOLD),
-                ),
-            )
+            .when(show_hash_column, |el| {
+                el.child(
+                    div().w(px(80.)).flex_shrink_0().child(
+                        Label::new(t!("graph.column.hash"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    ),
+                )
+            })
             .when(show_subject_column, |el| {
                 el.child(
                     div().flex_1().child(
@@ -2031,11 +2230,7 @@ impl Render for GraphView {
             });
 
         if show_author_column {
-            let author_width = if self.show_author_email {
-                author_col_width.max(180.0)
-            } else {
-                author_col_width
-            };
+            let author_width = author_col_width;
             header = header.child(
                 div()
                     .relative()
@@ -2260,22 +2455,26 @@ impl Render for GraphView {
                                 unstaged_count: info.unstaged_count,
                                 combined_breakdown: info.combined_breakdown.clone(),
                                 worktree_name: info.name.clone(),
+                                worktree_path: info.worktree_path.clone(),
                                 branch_name: info.branch.clone(),
                                 head_detached: info.head_detached,
                                 is_current_worktree: info.is_current,
                                 is_orphan_worktree: is_orphan,
+                                head_unborn: info.head_unborn,
                                 pass_through_edges,
                                 row_height,
                                 lane_width,
                                 graph_padding_left,
                                 graph_col_width,
+                                ref_col_width,
+                                show_hash_column,
+                                show_subject_column,
                                 working_tree_bg: row_bg,
                                 working_tree_border_color: row_border_color,
                                 node_color: row_node_color,
                                 selected_bg,
                                 hover_bg,
                                 active_bg,
-                                panel_bg,
                                 selected_border,
                                 view: view.clone(),
                                 show_author_column,
@@ -2327,7 +2526,7 @@ impl Render for GraphView {
 
                         let graph_width = graph_col_width;
                         let node_lane = graph_row.node_lane;
-                        let node_x = node_lane as f32 * lane_width + lane_width / 2.0 + graph_padding_left;
+                        let node_x = lane_center(node_lane, lane_width, graph_padding_left);
 
                         let node_color = rgitui_theme::lane_color(graph_row.node_color);
                         let has_virtual_parent_above = worktree_targets_commit_immediately_above(
@@ -2337,57 +2536,12 @@ impl Render for GraphView {
                         );
                         let has_incoming = graph_row.has_incoming || has_virtual_parent_above;
 
-                        // Author initials for avatar (extract small strings, not the whole CommitInfo)
-                        let initials: SharedString = commit
-                            .author
-                            .name
-                            .split_whitespace()
-                            .take(2)
-                            .filter_map(|w| w.chars().next())
-                            .collect::<String>()
-                            .to_uppercase()
-                            .into();
-
-                        // Ref badges — distinct styling per ref type
-                        let mut ref_badges: Vec<gpui::AnyElement> = Vec::new();
-                        for (ref_index, compact_ref) in
-                            compact_ref_labels(&commit.refs).into_iter().enumerate()
-                        {
-                            let badge = match &compact_ref.label {
-                                RefLabel::Head => Badge::new(head_badge_text.clone())
-                                    .prefix("→")
-                                    .color(Color::Warning)
-                                    .bold(),
-                                RefLabel::LocalBranch(name) => {
-                                    Badge::new(name.clone()).color(Color::Success)
-                                }
-                                RefLabel::RemoteBranch(name) => {
-                                    Badge::new(name.clone()).color(Color::Info).italic()
-                                }
-                                RefLabel::Tag(name) => {
-                                    Badge::new(name.clone()).color(Color::Accent).prefix("tag")
-                                }
-                            }
-                            .compact()
-                            .when(!compact_ref.remotes.is_empty(), |badge| badge.prefix("↑"));
-                            let remote_tooltip = (!compact_ref.remotes.is_empty()).then(|| {
-                                Tooltip::text(format!(
-                                    "Also on {}",
-                                    compact_ref.remotes.join(", ")
-                                ))
-                            });
-                            ref_badges.push(
-                                div()
-                                    .id(ElementId::NamedInteger(
-                                        "graph-ref-badge".into(),
-                                        ref_index as u64,
-                                    ))
-                                    .flex_shrink_0()
-                                    .when_some(remote_tooltip, |el, tooltip| el.tooltip(tooltip))
-                                    .child(badge)
-                                    .into_any_element(),
-                            );
-                        }
+                        let (primary_ref, ref_overflow, ref_names) = if show_ref_badges {
+                            ref_presentation(&commit.refs)
+                        } else {
+                            (None, 0, Vec::new())
+                        };
+                        let has_ref_connector = primary_ref.is_some();
 
                         let hash_display: SharedString = match sha_display_length {
                             0 => commit.short_id.clone().into(),
@@ -2413,9 +2567,8 @@ impl Render for GraphView {
                         let view_clone = view.clone();
                         let view_ctx_menu = view.clone();
 
-                        // HEAD keeps its marker when selected: double-clicking a
-                        // commit both checks it out and selects it, and the
-                        // selection must not paint over where HEAD now is.
+                        // Inspection must not paint over the independent HEAD
+                        // marker. Clicking a commit never moves HEAD.
                         let left_tab_color = if is_head_row {
                             head_color
                         } else if selected {
@@ -2453,14 +2606,14 @@ impl Render for GraphView {
                                             }
                                             this.dismiss_context_menu(cx);
                                             let modifiers = event.modifiers();
-                                            if event.click_count() >= 2 {
-                                                cx.emit(GraphViewEvent::CommitActivated(oid));
-                                            } else if modifiers.shift {
-                                                this.extend_selection_to_list_index(i, cx);
-                                            } else if modifiers.secondary() {
-                                                this.toggle_selection_at_list_index(i, cx);
-                                            } else {
-                                                this.select_list_index(i, cx);
+                                            match commit_click_selection(
+                                                event.click_count(),
+                                                modifiers.shift,
+                                                modifiers.secondary(),
+                                            ) {
+                                                CommitClickSelection::Inspect => this.select_list_index(i, cx),
+                                                CommitClickSelection::Extend => this.extend_selection_to_list_index(i, cx),
+                                                CommitClickSelection::Toggle => this.toggle_selection_at_list_index(i, cx),
                                             }
                                         })
                                         .ok();
@@ -2487,7 +2640,64 @@ impl Render for GraphView {
                             )
                             .child(div().w(px(5.)).flex_shrink_0());
 
-                        // Graph column with canvas + avatar overlay
+                        if show_ref_badges {
+                            let mut ref_column = div().w(px(ref_col_width)).flex_shrink_0().h_flex().justify_end();
+                            if let Some(label) = primary_ref {
+                                let text: SharedString = if matches!(label, RefLabel::Head) {
+                                    head_badge_text.clone()
+                                } else {
+                                    label.display_name().to_owned().into()
+                                };
+                                let icon = match label {
+                                    RefLabel::Tag(_) => IconName::Tag,
+                                    RefLabel::Head => IconName::Check,
+                                    _ => IconName::GitBranch,
+                                };
+                                let details = Arc::new(ref_names);
+                                let key_details = details.clone();
+                                let ref_view = view.clone();
+                                let key_view = view.clone();
+                                ref_column = ref_column.child(
+                                    div().id(ElementId::NamedInteger("graph-refs".into(), i as u64))
+                                        .tab_index(0)
+                                        .h_flex().min_w_0().max_w_full().h(px(20.0 * compact_mul))
+                                        .px(px(5.)).gap(px(4.)).rounded(px(3.))
+                                        .bg(gpui::Hsla { a: 0.12, ..node_color })
+                                        .border_1().border_color(gpui::Hsla { a: 0.65, ..node_color })
+                                        .focus_visible(move |s| s.border_color(selected_border))
+                                        .tooltip(Tooltip::text(details.join("\n")))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            ref_view.update(cx, |this, cx| {
+                                                this.ref_details_scroll.set_offset(point(px(0.), px(0.)));
+                                                this.ref_details = Some(details.clone());
+                                                cx.notify();
+                                            }).ok();
+                                        })
+                                        .on_key_down(move |event, _, cx| {
+                                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                                cx.stop_propagation();
+                                                key_view.update(cx, |this, cx| {
+                                                    this.ref_details_scroll.set_offset(point(px(0.), px(0.)));
+                                                    this.ref_details = Some(key_details.clone());
+                                                    cx.notify();
+                                                }).ok();
+                                            }
+                                        })
+                                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(node_color)))
+                                        .child(div().min_w_0().overflow_hidden().child(
+                                            Label::new(text).size(LabelSize::XSmall).color(Color::Custom(node_color)).truncate(),
+                                        ))
+                                        .when(ref_overflow > 0, |el| el.child(
+                                            div().flex_shrink_0().child(Label::new(format!("+{ref_overflow}")).size(LabelSize::XSmall).color(Color::Custom(node_color))),
+                                        )),
+                                );
+                            }
+                            row = row.child(ref_column);
+                        }
+
+                        // Graph column with canvas + real-photo overlay.
                         if show_graph_lanes {
                         row = row.child(
                             div()
@@ -2508,6 +2718,20 @@ impl Render for GraphView {
                                             let h = bounds.size.height;
                                             let mid_y = px(row_height / 2.0);
                                             let node_x_px = px(node_x);
+
+                                            // Ref connector is dashed so crossings cannot be read as ancestry.
+                                            if has_ref_connector {
+                                                let mut connector = PathBuilder::stroke(px(1.25));
+                                                let mut x = 0.0;
+                                                while x < node_x {
+                                                    connector.move_to(point(origin.x + px(x), origin.y + mid_y));
+                                                    connector.line_to(point(origin.x + px((x + 3.0).min(node_x)), origin.y + mid_y));
+                                                    x += 5.0;
+                                                }
+                                                if let Ok(path) = connector.build() {
+                                                    window.paint_path(path, node_color);
+                                                }
+                                            }
 
                                             // 1. Approach segment: incoming line from row above → dot center.
                                             if has_incoming {
@@ -2663,7 +2887,7 @@ impl Render for GraphView {
                                             let cx_x = origin.x + node_x_px;
                                             let cy_y = origin.y + mid_y;
                                             // Background ring to occlude lines passing behind the dot
-                                            let ring_r = 14.0_f32 * compact_mul;
+                                            let ring_r = dot_radius + 2.0 * compact_mul;
                                             if let Some(built_ring) = build_filled_circle(cx_x, cy_y, ring_r) {
                                                 window.paint_path(built_ring, row_bg_for_canvas);
                                             }
@@ -2710,73 +2934,23 @@ impl Render for GraphView {
                                     )
                                     .size_full(),
                                 )
-                                // Avatar overlay: resolved image or initials fallback
-                                .when(show_avatars, |el| el.child({
-                                    let avatar_url = cx
-                                        .try_global::<AvatarCache>()
+                                // Missing/failed photos leave the actual graph dot visible.
+                                // Photos do not set lane colors; those belong to graph topology.
+                                .when(show_avatars, |el| {
+                                    let avatar_url = cx.try_global::<AvatarCache>()
                                         .and_then(|cache| cache.avatar_url(&author_email))
-                                        .map(|s| s.to_string());
-                                    let initials_fallback = initials.clone();
-                                    let fallback_color = node_color;
-
-                                    let avatar_size = 24.0_f32 * compact_mul;
-                                    let mut avatar_container = div()
-                                        .absolute()
-                                        .left(px(node_x - avatar_size / 2.0))
-                                        .top(px((row_height - avatar_size) / 2.0))
-                                        .w(px(avatar_size))
-                                        .h(px(avatar_size))
-                                        .rounded_full()
-                                        .overflow_hidden()
-                                        .bg(panel_bg)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center();
-
-                                    if let Some(url) = avatar_url {
-                                        let fb_initials = initials_fallback.clone();
-                                        let fb_color = fallback_color;
-                                        avatar_container = avatar_container.child(
-                                            img(url)
-                                                .rounded_full()
-                                                .size_full()
+                                        .map(|url| url.to_string());
+                                    el.when_some(avatar_url, |el, url| {
+                                        let avatar_size = 16.0 * compact_mul;
+                                        el.child(div().absolute()
+                                            .left(px(node_x - avatar_size / 2.0))
+                                            .top(px((row_height - avatar_size) / 2.0))
+                                            .size(px(avatar_size))
+                                            .child(img(url).rounded_full().size_full()
                                                 .object_fit(ObjectFit::Cover)
-                                                .with_fallback(move || {
-                                                    div()
-                                                        .size_full()
-                                                        .rounded_full()
-                                                        .border_1()
-                                                        .border_color(fb_color)
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(
-                                                            div()
-                                                                .text_color(fb_color)
-                                                                .text_size(px(8.0))
-                                                                .font_weight(
-                                                                    gpui::FontWeight::BOLD,
-                                                                )
-                                                                .child(fb_initials.clone()),
-                                                        )
-                                                        .into_any_element()
-                                                }),
-                                        );
-                                    } else {
-                                        avatar_container = avatar_container
-                                            .border_1()
-                                            .border_color(fallback_color)
-                                            .child(
-                                                div()
-                                                    .text_color(fallback_color)
-                                                    .text_size(px(8.0))
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .child(initials_fallback),
-                                            );
-                                    }
-
-                                    avatar_container
-                                })),
+                                                .with_fallback(|| div().into_any_element())))
+                                    })
+                                }),
                         );
                         }
 
@@ -2811,15 +2985,17 @@ impl Render for GraphView {
                                 ),
                         );
 
-                        row = row.child(
-                            div().w(px(80.)).flex_shrink_0().font_family("Lilex").child(
+                        row = row.when(show_hash_column, |el| el.child(
+                            div().id(ElementId::NamedInteger("graph-hash".into(), i as u64))
+                                .w(px(80.)).flex_shrink_0().font_family("Lilex")
+                                .tooltip(Tooltip::text(oid.to_string())).child(
                                 Label::new(hash_display)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
                                     .weight(gpui::FontWeight::MEDIUM)
                                     .truncate(),
                             ),
-                        );
+                        ));
 
                         if show_subject_column {
                             let mut message_col = div()
@@ -2829,21 +3005,6 @@ impl Render for GraphView {
                                 .items_center()
                                 .gap(px(4.))
                                 .overflow_x_hidden();
-
-                            if show_ref_badges {
-                                for badge in ref_badges {
-                                    message_col = message_col.child(badge);
-                                }
-                            }
-
-                            // GPG signed commit badge
-                            if commit.is_signed {
-                                message_col = message_col.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .child(Badge::new(t!("graph.signed")).color(Color::Success).bold()),
-                                );
-                            }
 
                             let summary_label = if is_head_row || selected {
                                 Label::new(summary)
@@ -2855,7 +3016,13 @@ impl Render for GraphView {
                                     .size(LabelSize::Small)
                                     .truncate()
                             };
-                            message_col = message_col.child(summary_label);
+                            message_col = message_col.child(div().min_w_0().overflow_hidden().child(summary_label));
+                            // Keep every subject at the same x, even for signed commits.
+                            if commit.is_signed {
+                                message_col = message_col.child(
+                                    div().flex_shrink_0().child(Badge::new(t!("graph.signed")).color(Color::Success).compact()),
+                                );
+                            }
 
                             row = row.child(message_col);
                         }
@@ -2871,7 +3038,7 @@ impl Render for GraphView {
                             row = row.child(
                                 div()
                                     .id(ElementId::NamedInteger("graph-author".into(), i as u64))
-                                    .w(px(if show_author_email { author_col_width.max(180.) } else { author_col_width }))
+                                    .w(px(author_col_width))
                                     .flex_shrink_0()
                                     .ml(px(12.))
                                     .px(px(4.))
@@ -2932,7 +3099,10 @@ impl Render for GraphView {
                 let view_bounds = view_bounds.clone();
                 move |bounds: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
                     view_bounds
-                        .update(cx, |this: &mut GraphView, _| {
+                        .update(cx, |this: &mut GraphView, cx| {
+                            if this.container_bounds.size.width != bounds.size.width {
+                                cx.notify();
+                            }
                             this.container_bounds = bounds;
                         })
                         .ok();
@@ -2980,6 +3150,9 @@ impl Render for GraphView {
                             if !click_inside_menu {
                                 this.dismiss_context_menu(cx);
                             }
+                            if this.ref_details.take().is_some() {
+                                cx.notify();
+                            }
                             if this.show_settings_popover {
                                 this.show_settings_popover = false;
                                 cx.notify();
@@ -2988,6 +3161,30 @@ impl Render for GraphView {
                         .ok();
                 }
             })
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.ref_details.is_some() {
+                    let delta = match event.keystroke.key.as_str() {
+                        "escape" => {
+                            this.ref_details = None;
+                            Some((0.0, 0.0))
+                        }
+                        "up" => Some((0.0, 28.0)),
+                        "down" => Some((0.0, -28.0)),
+                        "pageup" => Some((0.0, 200.0)),
+                        "pagedown" => Some((0.0, -200.0)),
+                        "left" => Some((80.0, 0.0)),
+                        "right" => Some((-80.0, 0.0)),
+                        _ => None,
+                    };
+                    if let Some((dx, dy)) = delta {
+                        let offset = this.ref_details_scroll.offset();
+                        this.ref_details_scroll
+                            .set_offset(point(offset.x + px(dx), offset.y + px(dy)));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }
+            }))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 // Focus the graph when clicked (for keyboard navigation)
                 this.graph_focus.focus(window, cx);
@@ -3280,6 +3477,36 @@ impl Render for GraphView {
             }
         }
 
+        if let Some(details) = &self.ref_details {
+            container = container.child(
+                div()
+                    .id("graph-ref-details")
+                    .absolute()
+                    .left(px(8.))
+                    .top(px(28.))
+                    .w(px(320.))
+                    .max_w_full()
+                    .max_h(px(240.))
+                    .v_flex()
+                    .overflow_scroll()
+                    .track_scroll(&self.ref_details_scroll)
+                    .occlude()
+                    .p(px(8.))
+                    .rounded(px(4.))
+                    .bg(colors.elevated_surface_background)
+                    .border_1()
+                    .border_color(border_color)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(details.iter().map(|name| {
+                        div()
+                            .py(px(3.))
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .child(Label::new(name.clone()).size(LabelSize::Small))
+                    })),
+            );
+        }
+
         // Settings popover overlay
         if self.show_settings_popover {
             let popover_bg = colors.elevated_surface_background;
@@ -3288,6 +3515,12 @@ impl Render for GraphView {
 
             let view_sha_length = cx.weak_entity();
             let view_subject = cx.weak_entity();
+            let view_hash = cx.weak_entity();
+            let hash_state = if show_hash_column {
+                CheckState::Checked
+            } else {
+                CheckState::Unchecked
+            };
             let view_author = cx.weak_entity();
             let view_author_email = cx.weak_entity();
             let view_date = cx.weak_entity();
@@ -3379,6 +3612,36 @@ impl Render for GraphView {
                         .h(px(1.))
                         .my(px(2.))
                         .bg(colors.border_variant),
+                )
+                .child(
+                    div()
+                        .id("toggle-hash-col")
+                        .h_flex()
+                        .w_full()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .gap(px(8.))
+                        .items_center()
+                        .cursor_pointer()
+                        .rounded(px(3.))
+                        .hover(move |s| s.bg(popover_hover))
+                        .on_click(move |_: &ClickEvent, _, cx| {
+                            view_hash
+                                .update(cx, |_, cx| {
+                                    let state = cx.global_mut::<SettingsState>();
+                                    state.settings_mut().show_hash_column =
+                                        !state.settings().show_hash_column;
+                                    if let Err(error) = state.save() {
+                                        log::error!(
+                                            "Failed to save graph display settings: {error}"
+                                        );
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                        })
+                        .child(Checkbox::new("cb-hash-col", hash_state))
+                        .child(Label::new(t!("graph.display.hash_column")).size(LabelSize::XSmall)),
                 )
                 .child(
                     div()
@@ -3640,22 +3903,26 @@ struct WorkingTreeRowParams {
     unstaged_count: usize,
     combined_breakdown: HashMap<FileChangeKind, usize>,
     worktree_name: String,
+    worktree_path: PathBuf,
     branch_name: Option<String>,
     head_detached: bool,
     is_current_worktree: bool,
     is_orphan_worktree: bool,
+    head_unborn: bool,
     pass_through_edges: Vec<GraphEdge>,
     row_height: f32,
     lane_width: f32,
     graph_padding_left: f32,
     graph_col_width: f32,
+    ref_col_width: f32,
+    show_hash_column: bool,
+    show_subject_column: bool,
     working_tree_bg: gpui::Hsla,
     working_tree_border_color: gpui::Hsla,
     node_color: gpui::Hsla,
     selected_bg: gpui::Hsla,
     hover_bg: gpui::Hsla,
     active_bg: gpui::Hsla,
-    panel_bg: gpui::Hsla,
     selected_border: gpui::Hsla,
     view: WeakEntity<GraphView>,
     show_author_column: bool,
@@ -3674,6 +3941,10 @@ struct WorkingTreeRowParams {
     parent_lane: Option<usize>,
 }
 
+fn confirmed_unborn_worktree(missing_head: bool, head_unborn: bool) -> bool {
+    missing_head && head_unborn
+}
+
 /// Render the virtual "Working Tree" row that appears at the top of the graph.
 fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
     let WorkingTreeRowParams {
@@ -3683,22 +3954,26 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         unstaged_count,
         combined_breakdown,
         worktree_name,
+        worktree_path,
         branch_name,
         head_detached,
         is_current_worktree,
         is_orphan_worktree,
+        head_unborn,
         pass_through_edges,
         row_height,
         lane_width,
         graph_padding_left,
         graph_col_width,
+        ref_col_width,
+        show_hash_column,
+        show_subject_column,
         working_tree_bg,
         working_tree_border_color,
         node_color,
         selected_bg,
         hover_bg,
         active_bg,
-        panel_bg,
         selected_border,
         view,
         show_author_column,
@@ -3762,25 +4037,50 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         .unwrap_or(0);
 
     let graph_width = graph_col_width;
-    let node_x = node_lane as f32 * lane_width + lane_width / 2.0 + graph_padding_left;
+    let node_x = lane_center(node_lane, lane_width, graph_padding_left);
     // A detached HEAD has no branch to name, but saying so beats saying nothing:
     // the row would otherwise read identically to a worktree whose branch simply
     // failed to load.
     let branch_name = branch_name.filter(|branch| !branch.is_empty());
-    let row_title = match (is_orphan_worktree, branch_name, head_detached) {
-        (true, Some(branch), _) => t!("graph.no_commits_on", branch = branch),
-        (true, None, true) => t!("graph.no_commits_detached"),
-        (true, None, false) => t!("graph.no_commits_yet"),
-        (false, Some(branch), _) => t!("graph.pending_on", branch = branch),
-        (false, None, true) => t!("graph.pending_on_detached"),
-        (false, None, false) => t!("graph.pending_changes"),
-    };
-    let row_badge_color = if is_current_worktree || is_orphan_worktree {
-        Color::Warning
+    let worktree_label = if is_current_worktree {
+        t!("graph.worktree.working_directory", name = worktree_name)
     } else {
-        Color::Accent
+        t!("graph.worktree.label", name = worktree_name)
     };
-    let hash_label = if is_orphan_worktree {
+    let branch_label = branch_name
+        .clone()
+        .map(SharedString::from)
+        .unwrap_or_else(|| {
+            if head_detached {
+                t!("graph.head_detached")
+            } else {
+                t!("graph.worktree.branch_unknown")
+            }
+        });
+    let enter_tooltip = t!(
+        "graph.worktree.enter_tooltip",
+        label = worktree_label.clone(),
+        branch = branch_label.clone(),
+        path = worktree_path.display().to_string(),
+    );
+    // Zero counts can also mean status has not loaded. A branch-only title is
+    // accurate for both cases; never claim pending changes or confirmed clean.
+    let is_unborn_worktree = confirmed_unborn_worktree(is_orphan_worktree, head_unborn);
+    let row_title = if is_orphan_worktree && !is_unborn_worktree {
+        t!("graph.worktree.details_unavailable")
+    } else if !has_changes && !is_orphan_worktree {
+        branch_label
+    } else {
+        match (is_orphan_worktree, branch_name, head_detached) {
+            (true, Some(branch), _) => t!("graph.no_commits_on", branch = branch),
+            (true, None, true) => t!("graph.no_commits_detached"),
+            (true, None, false) => t!("graph.no_commits_yet"),
+            (false, Some(branch), _) => t!("graph.pending_on", branch = branch),
+            (false, None, true) => t!("graph.pending_on_detached"),
+            (false, None, false) => t!("graph.pending_changes"),
+        }
+    };
+    let hash_label = if is_unborn_worktree {
         t!("graph.working_tree.new")
     } else {
         t!("graph.working_tree.working")
@@ -3798,28 +4098,65 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         .h(px(row_height))
         .w_full()
         .bg(bg)
-        .border_b_1()
-        .border_color(gpui::Hsla {
-            a: 0.15,
-            ..working_tree_border_color
-        })
         .cursor(CursorStyle::PointingHand)
         .when(!has_context_menu, |el| {
             el.hover(move |s| s.bg(row_hover_bg))
         })
         .active(move |s| s.bg(row_active_bg))
+        .tooltip(Tooltip::text(enter_tooltip))
         .on_click(
             move |_event: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 view_click
                     .update(cx, |this, cx| {
                         this.dismiss_context_menu(cx);
-                        this.select_list_index(list_index, cx);
+                        // Resolve by path again: refresh may have reordered the
+                        // rows between the first and second click.
+                        if let Some(index) = worktree_list_index_for_path(
+                            &this.worktree_infos,
+                            &this.worktree_row_positions,
+                            &worktree_path,
+                        ) {
+                            this.select_list_index(index, cx);
+                        }
                     })
                     .ok();
             },
         )
         .child(div().w(px(3.)).h_full().flex_shrink_0().bg(left_tab_color))
         .child(div().w(px(5.)).flex_shrink_0())
+        .when(ref_col_width > 0.0, |el| {
+            el.child(
+                div()
+                    .w(px(ref_col_width))
+                    .flex_shrink_0()
+                    .h_flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .id(ElementId::NamedInteger(
+                                "worktree-ref".into(),
+                                list_index as u64,
+                            ))
+                            .min_w_0()
+                            .max_w_full()
+                            .overflow_hidden()
+                            .h_flex()
+                            .gap(px(4.))
+                            .child(
+                                Icon::new(IconName::Folder)
+                                    .size(IconSize::Small)
+                                    .color(Color::Custom(node_color)),
+                            )
+                            .child(
+                                Label::new(worktree_label.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Custom(node_color))
+                                    .weight(gpui::FontWeight::SEMIBOLD)
+                                    .truncate(),
+                            ),
+                    ),
+            )
+        })
         // Graph column with canvas (hollow circle node + connecting line down)
         .when(show_graph_lanes, |el| {
             el.child(
@@ -3841,6 +4178,22 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                 let node_x_px = px(node_x);
                                 let cx_x = origin.x + node_x_px;
                                 let cy_y = origin.y + mid_y;
+
+                                if ref_col_width > 0.0 {
+                                    let mut connector = PathBuilder::stroke(px(1.25));
+                                    let mut x = 0.0;
+                                    while x < node_x {
+                                        connector.move_to(point(origin.x + px(x), cy_y));
+                                        connector.line_to(point(
+                                            origin.x + px((x + 3.0).min(node_x)),
+                                            cy_y,
+                                        ));
+                                        x += 5.0;
+                                    }
+                                    if let Ok(path) = connector.build() {
+                                        window.paint_path(path, node_color);
+                                    }
+                                }
 
                                 for edge in &pass_through_edges {
                                     let lane_x = px(edge.from_lane as f32 * lane_width
@@ -3915,7 +4268,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                 }
 
                                 // Background ring to occlude lines behind the dot
-                                let ring_r = 13.0_f32 * compact_mul;
+                                let ring_r = 7.0_f32 * compact_mul;
                                 let steps = 32_usize;
                                 let mut ring = PathBuilder::fill();
                                 for s in 0..steps {
@@ -3930,7 +4283,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                 }
                                 ring.close();
                                 if let Ok(built_ring) = ring.build() {
-                                    window.paint_path(built_ring, panel_bg);
+                                    window.paint_path(built_ring, bg);
                                 }
 
                                 // Hollow circle (stroke only, no fill) to distinguish from commits
@@ -3980,133 +4333,146 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                     ),
             )
         })
-        .child(
-            div()
-                .w(px(80.))
-                .flex_shrink_0()
-                .h_flex()
-                .items_center()
-                .gap(px(4.))
-                .child(
-                    Icon::new(IconName::Edit)
-                        .size(IconSize::XSmall)
-                        .color(Color::Warning),
-                )
-                .child(
-                    Label::new(hash_label)
-                        .size(LabelSize::XSmall)
-                        .color(if is_current_worktree || is_orphan_worktree {
-                            Color::Warning
-                        } else {
-                            Color::Accent
-                        })
-                        .weight(gpui::FontWeight::MEDIUM),
-                ),
-        )
-        .child({
-            let mut message_col = div()
-                .flex_1()
-                .min_w_0()
-                .h_flex()
-                .items_center()
-                .gap(px(4.))
-                .overflow_x_hidden();
-
-            let badge_color = if has_changes {
-                row_badge_color
-            } else {
-                Color::Muted
-            };
-            message_col = message_col.child(
+        .child(div().w(px(16.)).flex_shrink_0())
+        .when(show_hash_column, |el| {
+            el.child(
                 div()
+                    .w(px(80.))
                     .flex_shrink_0()
-                    .child(Badge::new(worktree_name).color(badge_color).bold()),
-            );
-            if is_orphan_worktree {
-                message_col = message_col.child(
-                    div()
-                        .flex_shrink_0()
-                        .child(Badge::new(t!("graph.new_branch")).color(Color::Warning)),
-                );
-            }
+                    .h_flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(hash_label)
+                            .size(LabelSize::XSmall)
+                            .color(if is_current_worktree || is_orphan_worktree {
+                                Color::Warning
+                            } else {
+                                Color::Accent
+                            })
+                            .weight(gpui::FontWeight::MEDIUM),
+                    ),
+            )
+        })
+        .when(show_subject_column, |el| {
+            el.child({
+                let mut message_col = div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .overflow_x_hidden();
 
-            if has_changes {
-                message_col = message_col.child(
-                    Label::new(row_title)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                );
-                if staged_count > 0 {
-                    message_col = message_col.child(
-                        div().flex_shrink_0().child(
-                            Badge::new(t!("graph.working_tree.staged", count = staged_count))
-                                .color(Color::Success),
-                        ),
-                    );
+                if ref_col_width <= 0.0 {
+                    message_col = message_col
+                        .child(
+                            Icon::new(IconName::Folder)
+                                .size(IconSize::Small)
+                                .color(Color::Custom(node_color)),
+                        )
+                        .child(Label::new(worktree_label).size(LabelSize::Small).truncate());
                 }
-                if unstaged_count > 0 {
+                if has_changes {
                     message_col = message_col.child(
-                        div().flex_shrink_0().child(
-                            Badge::new(t!("graph.working_tree.unstaged", count = unstaged_count))
+                        Label::new(row_title)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    );
+                    if staged_count > 0 {
+                        message_col = message_col.child(
+                            div().flex_shrink_0().child(
+                                Badge::new(t!("graph.working_tree.staged", count = staged_count))
+                                    .color(Color::Success),
+                            ),
+                        );
+                    }
+                    if unstaged_count > 0 {
+                        message_col = message_col.child(
+                            div().flex_shrink_0().child(
+                                Badge::new(t!(
+                                    "graph.working_tree.unstaged",
+                                    count = unstaged_count
+                                ))
                                 .color(Color::Warning),
-                        ),
+                            ),
+                        );
+                    }
+
+                    let mut indicators = div().h_flex().gap(px(4.)).flex_shrink_0();
+
+                    if added_count > 0 {
+                        indicators = indicators.child(
+                            Label::new(SharedString::from(format!("+{added_count}")))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Success)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        );
+                    }
+                    if modified_count > 0 {
+                        indicators = indicators.child(
+                            Label::new(SharedString::from(format!("~{modified_count}")))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        );
+                    }
+                    if deleted_count > 0 {
+                        indicators = indicators.child(
+                            Label::new(SharedString::from(format!("-{deleted_count}")))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        );
+                    }
+                    if conflicted_count > 0 {
+                        indicators = indicators.child(
+                            Label::new(SharedString::from(format!("!{conflicted_count}")))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .weight(gpui::FontWeight::SEMIBOLD),
+                        );
+                    }
+
+                    message_col = message_col.child(indicators);
+                } else {
+                    message_col = message_col.child(
+                        Label::new(row_title)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
                     );
                 }
 
-                let mut indicators = div().h_flex().gap(px(4.)).flex_shrink_0();
-
-                if added_count > 0 {
-                    indicators = indicators.child(
-                        Label::new(SharedString::from(format!("+{added_count}")))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Success)
-                            .weight(gpui::FontWeight::SEMIBOLD),
+                if is_unborn_worktree {
+                    message_col = message_col.child(
+                        Badge::new(t!("graph.new_branch"))
+                            .color(Color::Warning)
+                            .compact(),
                     );
                 }
-                if modified_count > 0 {
-                    indicators = indicators.child(
-                        Label::new(SharedString::from(format!("~{modified_count}")))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent)
-                            .weight(gpui::FontWeight::SEMIBOLD),
-                    );
-                }
-                if deleted_count > 0 {
-                    indicators = indicators.child(
-                        Label::new(SharedString::from(format!("-{deleted_count}")))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                            .weight(gpui::FontWeight::SEMIBOLD),
-                    );
-                }
-                if conflicted_count > 0 {
-                    indicators = indicators.child(
-                        Label::new(SharedString::from(format!("!{conflicted_count}")))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                            .weight(gpui::FontWeight::SEMIBOLD),
-                    );
-                }
-
-                message_col = message_col.child(indicators);
-            } else {
-                message_col = message_col.child(
-                    Label::new(row_title)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
-                );
-            }
-
-            message_col
+                message_col
+            })
         })
         .when(show_author_column, |el| {
-            el.child(div().w(px(author_col_width)).flex_shrink_0())
+            el.child(div().w(px(author_col_width)).ml(px(12.)).flex_shrink_0())
         })
         .when(show_date_column, |el| {
-            el.child(div().w(px(date_col_width)).flex_shrink_0())
+            el.child(
+                div()
+                    .w(px(date_col_width))
+                    .ml(px(12.))
+                    .mr(px(8.))
+                    .flex_shrink_0(),
+            )
         })
+        .child(div().w(px(52.)).flex_shrink_0())
         .into_any_element()
 }
 
@@ -4148,6 +4514,82 @@ mod tests {
     use chrono::{Duration, Utc};
     use rgitui_git::{CommitInfo, FileChangeKind, FileStatus, RefLabel, Signature};
     use std::path::PathBuf;
+
+    #[test]
+    fn lane_centers_match_commit_and_virtual_row_geometry() {
+        assert_eq!(lane_center(0, 20.0, 10.0), 20.0);
+        assert_eq!(lane_center(3, 20.0, 10.0), 80.0);
+        for lane in 0..64 {
+            assert_eq!(
+                lane_center(lane + 1, 20.0, 10.0) - lane_center(lane, 20.0, 10.0),
+                20.0
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_yields_to_subjects_in_narrow_panes() {
+        let narrow = graph_columns(500.0, 80.0, true, false, 140.0, 100.0);
+        assert_eq!(narrow.author, 0.0);
+        assert_eq!(narrow.date, 0.0);
+        assert_eq!(narrow.refs, 112.0);
+        let normal = graph_columns(1000.0, 100.0, true, false, 140.0, 100.0);
+        let message = 1000.0 - 100.0 - normal.refs - normal.author - normal.date - 108.0;
+        assert!(message >= 350.0);
+        assert!(normal.author > 0.0 && normal.date > 0.0);
+        let medium = graph_columns(800.0, 80.0, true, false, 140.0, 100.0);
+        assert_eq!(medium.date, 0.0);
+        assert!(800.0 - 80.0 - medium.refs - medium.author - 88.0 >= 350.0);
+    }
+
+    #[test]
+    fn optional_columns_do_not_reserve_hidden_space() {
+        let columns = graph_columns(1000.0, 80.0, false, false, 0.0, 0.0);
+        assert_eq!(columns.refs, 0.0);
+        assert_eq!(columns.author, 0.0);
+        assert_eq!(columns.date, 0.0);
+        let hash = graph_columns(800.0, 80.0, true, true, 140.0, 100.0);
+        let no_hash = graph_columns(800.0, 80.0, true, false, 140.0, 100.0);
+        assert!(hash.author <= no_hash.author);
+        assert!(hash.date <= no_hash.date);
+    }
+
+    #[test]
+    fn ref_layout_prefers_branch_and_preserves_every_full_name() {
+        let refs = vec![
+            RefLabel::Head,
+            RefLabel::Tag("v1".into()),
+            RefLabel::RemoteBranch("origin/main".into()),
+            RefLabel::LocalBranch("main".into()),
+        ];
+        let (primary, overflow, names) = ref_presentation(&refs);
+        assert_eq!(primary, Some(RefLabel::LocalBranch("main".into())));
+        assert_eq!(overflow, 3);
+        assert_eq!(
+            names,
+            [
+                "HEAD",
+                "refs/tags/v1",
+                "refs/remotes/origin/main",
+                "refs/heads/main"
+            ]
+        );
+    }
+
+    #[test]
+    fn ref_layout_is_bounded_for_empty_single_and_many_refs() {
+        assert_eq!(ref_presentation(&[]), (None, 0, Vec::new()));
+        let single = ref_presentation(&[RefLabel::Head]);
+        assert_eq!(single.0, Some(RefLabel::Head));
+        assert_eq!(single.1, 0);
+        let refs: Vec<_> = (0..1000)
+            .map(|i| RefLabel::Tag(format!("release/{i}")))
+            .collect();
+        let (primary, overflow, names) = ref_presentation(&refs);
+        assert!(primary.is_some());
+        assert_eq!(overflow, 999);
+        assert_eq!(names.len(), 1000);
+    }
 
     fn make_oid(byte: u8) -> git2::Oid {
         let mut bytes = [0_u8; 20];
@@ -4302,6 +4744,7 @@ mod tests {
             name: name.to_string(),
             is_current,
             head_oid,
+            head_unborn: head_oid.is_none(),
             staged_count: 0,
             unstaged_count: 1,
             combined_breakdown: HashMap::new(),
@@ -4323,6 +4766,125 @@ mod tests {
             additions: 0,
             deletions: 0,
         }
+    }
+
+    #[test]
+    fn unavailable_checkout_is_not_presented_as_an_unborn_branch() {
+        assert!(!confirmed_unborn_worktree(true, false));
+        assert!(confirmed_unborn_worktree(true, true));
+        assert!(!confirmed_unborn_worktree(false, true));
+        assert!(!confirmed_unborn_worktree(false, false));
+    }
+
+    #[test]
+    fn commit_double_click_only_inspects_regardless_of_modifiers() {
+        for clicks in [2, 3] {
+            for shift in [false, true] {
+                for secondary in [false, true] {
+                    assert_eq!(
+                        commit_click_selection(clicks, shift, secondary),
+                        CommitClickSelection::Inspect,
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            commit_click_selection(1, false, false),
+            CommitClickSelection::Inspect
+        );
+        assert_eq!(
+            commit_click_selection(1, true, false),
+            CommitClickSelection::Extend
+        );
+        assert_eq!(
+            commit_click_selection(1, false, true),
+            CommitClickSelection::Toggle
+        );
+    }
+
+    #[test]
+    fn clean_linked_worktree_keeps_its_row_parent_and_path_identity() {
+        let commits = vec![make_commit(2, &[1], vec![]), make_commit(1, &[], vec![])];
+        let rows = compute_graph(&commits);
+        let mut worktrees = vec![
+            dirty_worktree("opened", Some(make_oid(2)), true),
+            dirty_worktree("linked", Some(make_oid(1)), false),
+        ];
+        let dirty_positions =
+            compute_worktree_row_positions(&commits, &rows, &worktrees, graph_lane_count(&rows));
+        let path = std::path::Path::new("linked");
+        let selected = worktree_list_index_for_path(&worktrees, &dirty_positions, path).unwrap();
+        worktrees[1].unstaged_count = 0;
+        let clean_positions =
+            compute_worktree_row_positions(&commits, &rows, &worktrees, graph_lane_count(&rows));
+        assert_eq!(clean_positions.len(), 2);
+        assert_eq!(
+            worktree_list_index_for_path(&worktrees, &clean_positions, path),
+            Some(selected)
+        );
+        let linked = clean_positions
+            .iter()
+            .find(|p| p.worktree_idx == 1)
+            .unwrap();
+        assert_eq!(linked.commit_index, Some(1));
+        assert_eq!(linked.parent_lane, Some(rows[1].node_lane));
+        // Discovery order is not identity, even when both checkouts are clean.
+        worktrees[0].unstaged_count = 0;
+        worktrees.swap(0, 1);
+        let reordered =
+            compute_worktree_row_positions(&commits, &rows, &worktrees, graph_lane_count(&rows));
+        assert_eq!(
+            worktree_list_index_for_path(&worktrees, &reordered, path),
+            Some(selected)
+        );
+        let virtual_rows: Vec<_> = reordered.iter().map(|p| p.list_index).collect();
+        for index in 0..commits.len() {
+            let row = row_for_commit_index(&virtual_rows, commits.len(), index).unwrap();
+            assert_eq!(commit_index_for_row(&virtual_rows, row), Some(index));
+        }
+        // A background graph refresh can move the row even when status is
+        // unchanged. Restoration must resolve the saved path, not the old row.
+        let mut refreshed_commits = vec![make_commit(3, &[2], vec![])];
+        refreshed_commits.extend(commits);
+        let refreshed_rows = compute_graph(&refreshed_commits);
+        let refreshed = compute_worktree_row_positions(
+            &refreshed_commits,
+            &refreshed_rows,
+            &worktrees,
+            graph_lane_count(&refreshed_rows),
+        );
+        assert_eq!(
+            worktree_list_index_for_path(&worktrees, &refreshed, path),
+            Some(selected + 1),
+        );
+    }
+
+    #[test]
+    fn working_entry_selects_checkout_identity_not_first_virtual_row() {
+        let commits = vec![make_commit(2, &[1], vec![]), make_commit(1, &[], vec![])];
+        let rows = compute_graph(&commits);
+        let worktrees = vec![
+            dirty_worktree("linked", Some(make_oid(2)), false),
+            dirty_worktree("main", Some(make_oid(1)), true),
+        ];
+        let positions =
+            compute_worktree_row_positions(&commits, &rows, &worktrees, graph_lane_count(&rows));
+        let main =
+            worktree_list_index_for_path(&worktrees, &positions, std::path::Path::new("main"))
+                .unwrap();
+        let linked =
+            worktree_list_index_for_path(&worktrees, &positions, std::path::Path::new("linked"))
+                .unwrap();
+        assert_ne!(main, linked);
+        assert!(main > linked);
+        assert_eq!(
+            worktree_list_index_for_path(&worktrees, &positions, std::path::Path::new("missing")),
+            None
+        );
+        assert_eq!(
+            worktree_list_index_for_path(&worktrees, &[], std::path::Path::new("main")),
+            None
+        );
     }
 
     #[test]
@@ -4355,6 +4917,38 @@ mod tests {
             edge.from_lane == graph_rows[2].node_lane && edge.to_lane == graph_rows[2].node_lane
         }));
         assert!(worktree_targets_commit_immediately_above(&positions, 3, 2));
+    }
+
+    #[test]
+    fn dirty_main_at_merge_is_sibling_of_converging_feature_child() {
+        let commits = vec![
+            make_commit(6, &[5], vec![RefLabel::LocalBranch("feature/ahead".into())]),
+            make_commit(5, &[4], vec![]),
+            make_commit(
+                4,
+                &[2, 3],
+                vec![RefLabel::LocalBranch("main".into()), RefLabel::Head],
+            ),
+            make_commit(
+                3,
+                &[1],
+                vec![RefLabel::LocalBranch("feature/merged".into())],
+            ),
+            make_commit(2, &[1], vec![]),
+            make_commit(1, &[], vec![]),
+        ];
+        let rows = compute_graph(&commits);
+        let worktrees = vec![dirty_worktree("main", Some(make_oid(4)), true)];
+        let positions =
+            compute_worktree_row_positions(&commits, &rows, &worktrees, graph_lane_count(&rows));
+        let pending = &positions[0];
+        let head = &rows[2];
+        assert_eq!(pending.commit_index, Some(2));
+        assert_eq!(pending.parent_lane, Some(head.node_lane));
+        assert_ne!(pending.node_lane, head.node_lane);
+        assert!(worktree_pass_through_edges(pending, &rows)
+            .iter()
+            .any(|edge| { edge.from_lane == head.node_lane && edge.to_lane == head.node_lane }));
     }
 
     #[test]

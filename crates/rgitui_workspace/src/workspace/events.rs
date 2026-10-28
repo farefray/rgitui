@@ -9,7 +9,7 @@ use gpui::{AppContext, Context, Entity};
 use rgitui_ai::{AiEvent, AiGenerator, GenerationId};
 use rgitui_diff::{ConflictResolution, DiffOperation, DiffSource, DiffViewer, DiffViewerEvent};
 use rgitui_git::{
-    CommitCheckout, CommitInfo, GitOperationKind, GitOperationState, GitProject, GitProjectEvent,
+    CommitInfo, GitOperationKind, GitOperationState, GitProject, GitProjectEvent,
     RebaseEntryAction, RebasePlanEntry, Signature,
 };
 use rgitui_graph::{GraphView, GraphViewEvent, WorktreeGraphInfo};
@@ -56,28 +56,103 @@ fn diff_target_is_live(
     })
 }
 
+fn classic_diff_updates_allowed(
+    workspace: &gpui::WeakEntity<Workspace>,
+    requested_in_graph_layout: bool,
+    cx: &gpui::App,
+) -> bool {
+    !requested_in_graph_layout
+        && workspace
+            .upgrade()
+            .is_some_and(|workspace| !workspace.read(cx).layout.graph_focused)
+}
+
+/// An inspector selection is independent of the retained Diff in graph mode.
+/// The viewer generation matters only when this result will also replace it.
+fn inspection_payload_is_current(
+    inspection_current: bool,
+    updates_diff: bool,
+    requested_diff_generation: u64,
+    current_diff_generation: u64,
+) -> bool {
+    inspection_current && (!updates_diff || requested_diff_generation == current_diff_generation)
+}
+
+fn sidebar_event_matches_checkout(event: &SidebarEvent, current: &std::path::Path) -> bool {
+    match event {
+        SidebarEvent::FileSelectedAt { checkout, .. }
+        | SidebarEvent::ConflictFileSelectedAt { checkout, .. } => checkout == current,
+        _ => true,
+    }
+}
+
+fn working_file_selection_event(
+    path: &str,
+    staged: bool,
+    conflicted: bool,
+    checkout: &std::path::Path,
+) -> SidebarEvent {
+    if conflicted {
+        SidebarEvent::ConflictFileSelectedAt {
+            path: path.to_owned(),
+            checkout: checkout.to_path_buf(),
+        }
+    } else {
+        SidebarEvent::FileSelectedAt {
+            path: path.to_owned(),
+            staged,
+            checkout: checkout.to_path_buf(),
+        }
+    }
+}
+
+fn inspection_target_is_live(
+    workspace: &gpui::WeakEntity<Workspace>,
+    target: &RepositoryTarget,
+    generation: u64,
+    cx: &gpui::App,
+) -> bool {
+    workspace.upgrade().is_some_and(|workspace| {
+        workspace.read(cx).tabs.iter().any(|tab| {
+            super::navigation::request_is_current(
+                target,
+                generation,
+                &tab.project.entity_id(),
+                &tab.effective_repo_path(cx),
+                tab.inspection_generation,
+            )
+        })
+    })
+}
+
 pub(super) fn build_worktree_graph_infos(
     worktrees: &[rgitui_git::WorktreeInfo],
 ) -> Vec<WorktreeGraphInfo> {
     worktrees
         .iter()
-        .filter_map(|worktree| {
-            let status = worktree.status.as_ref()?;
-            let mut combined_breakdown = rgitui_graph::compute_breakdown(&status.staged);
-            for (kind, count) in rgitui_graph::compute_breakdown(&status.unstaged) {
-                *combined_breakdown.entry(kind).or_insert(0) += count;
+        .map(|worktree| {
+            // Discovery is enough to enter a checkout. An unavailable status
+            // must not hide it (nor be described as confirmed clean).
+            let status = worktree.status.as_ref();
+            let mut combined_breakdown = std::collections::HashMap::new();
+            if let Some(status) = status {
+                combined_breakdown = rgitui_graph::compute_breakdown(&status.staged);
+                for (kind, count) in rgitui_graph::compute_breakdown(&status.unstaged) {
+                    *combined_breakdown.entry(kind).or_insert(0) += count;
+                }
             }
-            Some(WorktreeGraphInfo {
+            WorktreeGraphInfo {
                 name: worktree.name.clone(),
                 is_current: worktree.is_current,
                 head_oid: worktree.head_oid,
-                staged_count: status.staged.len(),
-                unstaged_count: status.unstaged.len(),
+                head_unborn: worktree.head_unborn,
+                staged_count: status.map_or(0, |status| status.staged.len()),
+                unstaged_count: status.map_or(0, |status| status.unstaged.len()),
                 combined_breakdown,
                 worktree_path: worktree.path.clone(),
                 branch: worktree.branch.clone(),
                 head_detached: worktree.head_detached,
-            })
+            }
         })
         .collect()
 }
@@ -265,15 +340,22 @@ pub(super) fn set_inspecting_worktree_for_tab(
     let watch_path = inspecting.as_ref().map(|worktree| worktree.path.clone());
     tab.inspecting_worktree = inspecting;
     let next_path = tab.effective_repo_path(cx);
+    tab.inspect(super::InspectionContext::WorkingChanges);
+    if workspace.layout.graph_focused {
+        tab.reveal_graph();
+    }
     if next_path == previous_path {
+        update_sidebar_for_tab(workspace, tab_index, cx);
+        cx.notify();
         return;
     }
+    tab.reset_checkout_navigation();
     // Search hits, drafts and pending AI requests belong to a checkout.
     tab.global_search_view
         .update(cx, |search, cx| search.clear(cx));
     let commit_panel = tab.commit_panel.clone();
     commit_panel.update(cx, |panel, cx| {
-        panel.switch_checkout(next_path, cx);
+        panel.switch_checkout(next_path.clone(), cx);
     });
 
     let project = tab.project.clone();
@@ -301,10 +383,16 @@ pub(super) fn set_inspecting_worktree_for_tab(
     }
     project.update(cx, |proj, _| proj.set_inspected_worktree(watch_path));
     update_sidebar_for_tab(workspace, tab_index, cx);
-    detail_panel.update(cx, |dp, cx| dp.clear(cx));
+    let _ = detail_panel; // refreshed with the new checkout's status above
     diff_viewer.update(cx, |dv, cx| dv.clear(cx));
     if leaving {
-        graph.update(cx, |g, cx| g.clear_worktree_selection(cx));
+        graph.update(cx, |g, cx| {
+            // Returning via the opened checkout's graph row should retain that
+            // row, while a cursor on the checkout we just left must be cleared.
+            if g.selected_worktree_path() != Some(next_path.as_path()) {
+                g.clear_worktree_selection(cx);
+            }
+        });
     }
     workspace.update_command_context(cx);
     workspace.persist_workspace_snapshot(cx);
@@ -330,6 +418,11 @@ fn update_sidebar_for_tab(
         let proj = tab.project.read(cx);
         active_worktree_status(tab, proj)
     };
+    if tab.inspecting_working_changes() {
+        tab.detail_panel.update(cx, |panel, cx| {
+            panel.set_working_changes(status.clone(), selected_path.clone(), cx)
+        });
+    }
     tab.sidebar.update(cx, |sidebar, cx| {
         sidebar.update_status(status.staged.clone(), status.unstaged.clone(), cx);
         sidebar.set_selected_worktree_by_path(Some(&selected_path), cx);
@@ -1080,11 +1173,15 @@ pub(super) fn subscribe_global_search(
                     return;
                 };
                 let repo_path = tab.effective_repo_path(cx);
-                tab.bottom_panel_mode = BottomPanelMode::Diff;
+                tab.inspect(super::InspectionContext::WorkingChanges);
+                tab.reveal_content(BottomPanelMode::Diff);
+                let (status, _) = active_worktree_status(tab, tab.project.read(cx));
+                tab.detail_panel.update(cx, |panel, cx| {
+                    panel.set_working_changes(status, repo_path.clone(), cx)
+                });
                 cx.notify();
 
                 let dv = tab.diff_viewer.clone();
-                let dp = tab.detail_panel.clone();
                 let path_buf = std::path::PathBuf::from(&path);
                 let path_for_toast = path.clone();
                 let line_for_toast = *line_number;
@@ -1115,7 +1212,6 @@ pub(super) fn subscribe_global_search(
                                     dv.set_diff(diff, path_str_owned, DiffSource::Worktree, cx);
                                     dv.scroll_to_line(line_owned, cx);
                                 });
-                                dp.update(cx, |dp, cx| dp.clear(cx));
                             }
                             Err(e) => {
                                 log::error!("Failed to get diff for search result: {}", e);
@@ -1164,7 +1260,6 @@ pub(super) struct ProjectSubscriptions<'a> {
     pub graph: &'a Entity<GraphView>,
     pub sidebar: &'a Entity<Sidebar>,
     pub diff_viewer: &'a Entity<DiffViewer>,
-    pub detail_panel: &'a Entity<DetailPanel>,
     pub toolbar: &'a Entity<Toolbar>,
     pub diff_cache: Arc<Mutex<CommitDiffCache>>,
     pub diff_prefetch: DiffPrefetchScheduler,
@@ -1179,7 +1274,6 @@ pub(super) fn subscribe_project(
     let sidebar = subs.sidebar.clone();
     let toolbar = subs.toolbar.clone();
     let diff_viewer = subs.diff_viewer.clone();
-    let detail_panel_ref = subs.detail_panel.clone();
     let diff_cache = subs.diff_cache;
     let diff_prefetch = subs.diff_prefetch;
     let has_prewarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1373,7 +1467,6 @@ pub(super) fn subscribe_project(
                     // applying — a stale recompute must not clobber the newer
                     // selection (nor its detail panel).
                     let viewer_generation = diff_viewer.read(cx).generation();
-                    let dp = detail_panel_ref.clone();
                     // Recompute against the checkout the diff was read from. Using
                     // the main repository here found no changes for a file that is
                     // only modified inside an inspected worktree, and the empty
@@ -1411,7 +1504,6 @@ pub(super) fn subscribe_project(
                                     // staged). Clear rather than render an empty
                                     // pane for a file that's left the change set.
                                     dv.update(cx, |dv, cx| dv.clear(cx));
-                                    dp.update(cx, |dp, cx| dp.clear(cx));
                                 } else {
                                     dv.update(cx, |dv, cx| {
                                         let source = DiffSource::working_tree(is_staged);
@@ -1424,10 +1516,8 @@ pub(super) fn subscribe_project(
                                         }
                                         dv.set_diff(diff, path_str_for_update, source, cx);
                                     });
-                                    // The detail panel only ever shows commit/stash
-                                    // details, never the working tree. Keep it
-                                    // cleared while a working-tree diff is shown.
-                                    dp.update(cx, |dp, cx| dp.clear(cx));
+                                    // The inspector has independent committed/working
+                                    // selection; refreshing a retained diff must not reset it.
                                 }
                             });
                         }
@@ -1609,23 +1699,41 @@ pub(super) fn subscribe_sidebar(
 
     cx.subscribe(&sidebar, {
         move |this, _sidebar, event: &SidebarEvent, cx| {
-            if !is_active_project(this, &project) {
+            if !is_active_project(this, &project)
+                || !sidebar_event_matches_checkout(event, &this.effective_worktree_path(cx))
+            {
                 return;
             }
             match event {
-                SidebarEvent::FileSelected { path, staged } => {
+                SidebarEvent::WorkingChangesSelected => {
+                    let tab = &mut this.tabs[this.active_tab];
+                    tab.inspect(super::InspectionContext::WorkingChanges);
+                    if this.layout.graph_focused {
+                        tab.reveal_graph();
+                    }
+                    let checkout = tab.effective_repo_path(cx);
+                    tab.graph.update(cx, |graph, cx| {
+                        graph.select_worktree(&checkout, cx);
+                    });
+                    update_sidebar_for_active_worktree(this, cx);
+                    cx.notify();
+                }
+                SidebarEvent::FileSelected { path, staged }
+                | SidebarEvent::FileSelectedAt { path, staged, .. } => {
                     log::info!("FileSelected: path={} staged={}", path, staged);
+                    this.tabs[this.active_tab].inspect(super::InspectionContext::WorkingChanges);
+                    this.tabs[this.active_tab].reveal_content(BottomPanelMode::Diff);
+                    update_sidebar_for_active_worktree(this, cx);
+                    cx.notify();
                     let path_buf = std::path::PathBuf::from(path);
                     let p = path.clone();
                     let is_staged = *staged;
                     let repo_path = this.effective_worktree_path(cx);
                     let dv = diff_viewer.clone();
-                    let dp = detail_panel_ref.clone();
                     let source = DiffSource::working_tree(is_staged);
                     let request_generation = dv.update(cx, |dv, cx| {
                         dv.set_diff_loading(p.clone(), source.clone(), cx)
                     });
-                    dp.update(cx, |panel, cx| panel.clear(cx));
 
                     cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                         let result = cx
@@ -1665,7 +1773,12 @@ pub(super) fn subscribe_sidebar(
                     })
                     .detach();
                 }
-                SidebarEvent::ConflictFileSelected(path) => {
+                SidebarEvent::ConflictFileSelected(path)
+                | SidebarEvent::ConflictFileSelectedAt { path, .. } => {
+                    this.tabs[this.active_tab].inspect(super::InspectionContext::WorkingChanges);
+                    this.tabs[this.active_tab].reveal_content(BottomPanelMode::Diff);
+                    update_sidebar_for_active_worktree(this, cx);
+                    cx.notify();
                     let path_buf = std::path::PathBuf::from(path);
                     let path_string = path.clone();
                     let repo_path = this
@@ -1675,11 +1788,9 @@ pub(super) fn subscribe_sidebar(
                         .map(|tab| tab.effective_repo_path(cx))
                         .unwrap_or_else(|| this.effective_worktree_path(cx));
                     let dv = diff_viewer.clone();
-                    let dp = detail_panel_ref.clone();
                     let request_generation = dv.update(cx, |dv, cx| {
                         dv.set_conflict_loading(path_string.clone(), cx)
                     });
-                    dp.update(cx, |panel, cx| panel.clear(cx));
                     cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                         let result = cx
                             .background_executor()
@@ -1784,7 +1895,24 @@ pub(super) fn subscribe_sidebar(
                         .stashes()
                         .get(idx)
                         .map(|s| (s.message.clone(), s.oid));
-                    let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
+                    let Some((_, stash_oid)) = stash_info.as_ref() else {
+                        return;
+                    };
+                    let graph_focused = this.layout.graph_focused;
+                    let tab = &mut this.tabs[this.active_tab];
+                    let inspection_generation =
+                        tab.inspect(super::InspectionContext::Stash(*stash_oid));
+                    let target = RepositoryTarget {
+                        project_id: project.entity_id(),
+                        worktree_path: tab.effective_repo_path(cx),
+                    };
+                    dp.update(cx, |panel, cx| panel.clear(cx));
+                    let request_generation = if graph_focused {
+                        dv.read(cx).generation()
+                    } else {
+                        dv.update(cx, |dv, cx| dv.begin_diff_request(cx))
+                    };
+                    cx.notify();
                     cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                         let result = cx
                             .background_executor()
@@ -1792,7 +1920,17 @@ pub(super) fn subscribe_sidebar(
                             .await;
                         cx.update(|cx| {
                             if !diff_target_is_live(&workspace, &dv, cx)
-                                || dv.read(cx).generation() != request_generation
+                                || !inspection_payload_is_current(
+                                    inspection_target_is_live(
+                                        &workspace,
+                                        &target,
+                                        inspection_generation,
+                                        cx,
+                                    ),
+                                    classic_diff_updates_allowed(&workspace, graph_focused, cx),
+                                    request_generation,
+                                    dv.read(cx).generation(),
+                                )
                             {
                                 return;
                             }
@@ -1806,24 +1944,31 @@ pub(super) fn subscribe_sidebar(
                                     // identity there is no honest provenance to attach, so
                                     // show nothing rather than something mislabelled; the
                                     // detail panel is cleared below for the same reason.
-                                    match (commit_diff.files.first(), stash_info.as_ref()) {
-                                        (Some(first_file), Some((_, oid))) => {
-                                            let path = first_file.path.display().to_string();
-                                            let source = DiffSource::Stash(oid.to_string());
-                                            dv.update(cx, |dv, cx| {
-                                                dv.set_diff(first_file.clone(), path, source, cx)
-                                            });
-                                        }
-                                        (Some(_), None) => {
-                                            log::warn!(
+                                    if classic_diff_updates_allowed(&workspace, graph_focused, cx) {
+                                        match (commit_diff.files.first(), stash_info.as_ref()) {
+                                            (Some(first_file), Some((_, oid))) => {
+                                                let path = first_file.path.display().to_string();
+                                                let source = DiffSource::Stash(oid.to_string());
+                                                dv.update(cx, |dv, cx| {
+                                                    dv.set_diff(
+                                                        first_file.clone(),
+                                                        path,
+                                                        source,
+                                                        cx,
+                                                    )
+                                                });
+                                            }
+                                            (Some(_), None) => {
+                                                log::warn!(
                                                 "stash {} is missing from the cached stash list; \
                                          skipping its diff",
                                                 idx
                                             );
-                                            dv.update(cx, |dv, cx| dv.clear(cx));
-                                        }
-                                        (None, _) => {
-                                            dv.update(cx, |dv, cx| dv.clear(cx));
+                                                dv.update(cx, |dv, cx| dv.clear(cx));
+                                            }
+                                            (None, _) => {
+                                                dv.update(cx, |dv, cx| dv.clear(cx));
+                                            }
                                         }
                                     }
                                     // Populate detail panel with the full stash file list so users
@@ -1859,9 +2004,11 @@ pub(super) fn subscribe_sidebar(
                                 }
                                 Err(e) => {
                                     log::error!("Failed to get stash diff: {}", e);
-                                    dv.update(cx, |dv, cx| {
-                                        dv.set_error(format!("Failed to load stash: {}", e), cx)
-                                    });
+                                    if classic_diff_updates_allowed(&workspace, graph_focused, cx) {
+                                        dv.update(cx, |dv, cx| {
+                                            dv.set_error(format!("Failed to load stash: {}", e), cx)
+                                        });
+                                    }
                                 }
                             }
                         });
@@ -2186,6 +2333,16 @@ pub(super) fn subscribe_graph(
                 GraphViewEvent::CommitSelected(oid) => {
                     let commit_oid = *oid;
                     log::info!("CommitSelected: oid={:.7}", commit_oid);
+                    let graph_focused = this.layout.graph_focused;
+                    let tab = &mut this.tabs[this.active_tab];
+                    let inspection_generation =
+                        tab.inspect(super::InspectionContext::Commit(commit_oid));
+                    let target = RepositoryTarget {
+                        project_id: project.entity_id(),
+                        worktree_path: tab.effective_repo_path(cx),
+                    };
+                    detail_panel_ref.update(cx, |panel, cx| panel.clear(cx));
+                    cx.notify();
 
                     // Extract everything we need from the project before
                     // releasing the immutable borrow on cx.
@@ -2193,7 +2350,7 @@ pub(super) fn subscribe_graph(
                         let proj = project.read(cx);
                         let commits = proj.recent_commits();
                         let info = commits.iter().find(|c| c.oid == commit_oid).cloned();
-                        let path = proj.repo_path().to_path_buf();
+                        let path = target.worktree_path.clone();
 
                         const PREFETCH_WINDOW: usize = 25;
                         let mut oids = Vec::new();
@@ -2224,7 +2381,9 @@ pub(super) fn subscribe_graph(
                         let dv = diff_viewer.clone();
                         let dp = detail_panel_ref.clone();
                         let cached = cached.clone();
-                        let display_generation = if let Some(first_file) = cached.files.first() {
+                        let display_generation = if graph_focused {
+                            dv.read(cx).generation()
+                        } else if let Some(first_file) = cached.files.first() {
                             let path = first_file.path.display().to_string();
                             let oid_str = commit_oid.to_string();
                             dv.update(cx, |dv, cx| {
@@ -2255,8 +2414,13 @@ pub(super) fn subscribe_graph(
                                     info.co_authors = co_authors;
                                 }
                                 cx.update(|cx| {
-                                    if !diff_target_is_live(&workspace, &dv, cx)
-                                        || dv.read(cx).generation() != display_generation
+                                    if !inspection_target_is_live(
+                                        &workspace,
+                                        &target,
+                                        inspection_generation,
+                                        cx,
+                                    ) || (!graph_focused
+                                        && dv.read(cx).generation() != display_generation)
                                     {
                                         return;
                                     }
@@ -2273,7 +2437,11 @@ pub(super) fn subscribe_graph(
                         let cache = diff_cache.clone();
                         let oid_str = commit_oid.to_string();
                         let enrich_path = repo_path.clone();
-                        let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
+                        let request_generation = if graph_focused {
+                            dv.read(cx).generation()
+                        } else {
+                            dv.update(cx, |dv, cx| dv.begin_diff_request(cx))
+                        };
 
                         cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                             // Compute diff and enrich commit info in parallel
@@ -2295,7 +2463,14 @@ pub(super) fn subscribe_graph(
                                     let diff_arc = Arc::new(commit_diff);
                                     cache.lock().unwrap().insert(commit_oid, diff_arc.clone());
 
-                                    if dv.read(cx).generation() != request_generation {
+                                    if !inspection_target_is_live(
+                                        &workspace,
+                                        &target,
+                                        inspection_generation,
+                                        cx,
+                                    ) || (!graph_focused
+                                        && dv.read(cx).generation() != request_generation)
+                                    {
                                         return;
                                     }
 
@@ -2307,6 +2482,10 @@ pub(super) fn subscribe_graph(
                                         dp.update(cx, |dp, cx| {
                                             dp.set_commit_arc(info, diff_arc.clone(), cx)
                                         });
+                                    }
+                                    if !classic_diff_updates_allowed(&workspace, graph_focused, cx)
+                                    {
+                                        return;
                                     }
                                     if let Some(first_file) = diff_arc.files.first() {
                                         let path = first_file.path.display().to_string();
@@ -2324,7 +2503,15 @@ pub(super) fn subscribe_graph(
                                 }
                                 Err(e) => {
                                     log::error!("Failed to get commit diff: {}", e);
-                                    if dv.read(cx).generation() == request_generation {
+                                    if classic_diff_updates_allowed(&workspace, graph_focused, cx)
+                                        && inspection_target_is_live(
+                                            &workspace,
+                                            &target,
+                                            inspection_generation,
+                                            cx,
+                                        )
+                                        && dv.read(cx).generation() == request_generation
+                                    {
                                         dv.update(cx, |dv, cx| {
                                             dv.set_error(
                                                 format!("Failed to load commit: {}", e),
@@ -2411,43 +2598,6 @@ pub(super) fn subscribe_graph(
                     project.update(cx, |proj, cx| {
                         proj.checkout_commit_at(oid, &worktree_path, cx).detach();
                     });
-                }
-                GraphViewEvent::CommitActivated(oid) => {
-                    let oid = *oid;
-                    let worktree_path = this.effective_worktree_path(cx);
-                    let checkout = {
-                        let proj = project.read(cx);
-                        let refs = proj
-                            .recent_commits()
-                            .iter()
-                            .find(|commit| commit.oid == oid)
-                            .map(|commit| commit.refs.as_slice())
-                            .unwrap_or_default();
-                        rgitui_git::commit_checkout(
-                            refs,
-                            proj.head_branch_at(&worktree_path).as_deref(),
-                        )
-                    };
-                    match checkout {
-                        CommitCheckout::AlreadyCheckedOut(branch) => {
-                            this.show_toast(
-                                format!("'{branch}' is already checked out"),
-                                ToastKind::Info,
-                                cx,
-                            );
-                        }
-                        CommitCheckout::Branch(branch) => {
-                            project.update(cx, |proj, cx| {
-                                proj.checkout_branch_at(&branch, &worktree_path, cx)
-                                    .detach();
-                            });
-                        }
-                        CommitCheckout::Detached => {
-                            project.update(cx, |proj, cx| {
-                                proj.checkout_commit_at(oid, &worktree_path, cx).detach();
-                            });
-                        }
-                    }
                 }
                 GraphViewEvent::CopyCommitSha(sha) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone()));
@@ -2599,6 +2749,9 @@ pub(super) fn subscribe_graph(
                         name,
                         path: worktree_path,
                     });
+                    // This path always selects WorkingChanges, including a
+                    // same-checkout click and a clean/not-yet-scanned worktree.
+                    // It changes UI context and watcher targets, never Git HEAD.
                     set_inspecting_worktree(this, inspecting, cx);
                 }
                 GraphViewEvent::InteractiveRebase(target_oid) => {
@@ -2684,7 +2837,57 @@ pub(super) fn subscribe_detail_panel(
                 return;
             }
             match event {
+                DetailPanelEvent::WorkingAction { checkout, action } => {
+                    if this.tabs[this.active_tab].effective_repo_path(cx) != *checkout {
+                        return;
+                    }
+                    use crate::detail_panel::WorkingChangesAction;
+                    match action {
+                        WorkingChangesAction::StageFile(path) => {
+                            project.update(cx, |project, cx| {
+                                project
+                                    .stage_files_at(&[path.into()], checkout, cx)
+                                    .detach();
+                            })
+                        }
+                        WorkingChangesAction::UnstageFile(path) => {
+                            project.update(cx, |project, cx| {
+                                project
+                                    .unstage_files_at(&[path.into()], checkout, cx)
+                                    .detach();
+                            })
+                        }
+                        WorkingChangesAction::StageAll => project.update(cx, |project, cx| {
+                            project.stage_all_at(checkout, cx).detach();
+                        }),
+                        WorkingChangesAction::UnstageAll => project.update(cx, |project, cx| {
+                            project.unstage_all_at(checkout, cx).detach();
+                        }),
+                        WorkingChangesAction::DiscardFile(path) => {
+                            // The origin and checkout were checked above; capture
+                            // that same target synchronously for the confirmation.
+                            this.show_confirmation(ConfirmAction::DiscardFile(path.clone()), cx);
+                        }
+                    }
+                }
+                DetailPanelEvent::WorkingFileSelected {
+                    path,
+                    staged,
+                    conflicted,
+                    checkout,
+                } => {
+                    if this.tabs[this.active_tab].effective_repo_path(cx) != *checkout {
+                        return;
+                    }
+                    let sidebar = this.tabs[this.active_tab].sidebar.clone();
+                    // Emission is queued: the checkout can change again before
+                    // subscribe_sidebar consumes this forwarded selection.
+                    let event = working_file_selection_event(path, *staged, *conflicted, checkout);
+                    sidebar.update(cx, |_, cx| cx.emit(event));
+                }
                 DetailPanelEvent::FileSelected(file_diff, path, source) => {
+                    this.tabs[this.active_tab].reveal_content(BottomPanelMode::Diff);
+                    cx.notify();
                     let p = path.clone();
                     let fd = file_diff.clone();
                     let source = source.clone();
@@ -2746,67 +2949,11 @@ pub(super) fn subscribe_detail_panel(
                     let target_oid = commits[target_pos].oid;
                     let _ = proj;
 
-                    // Re-fetch commit info and diff for the target
-                    let repo_path = project.read(cx).repo_path().to_path_buf();
-                    let dv = diff_viewer.clone();
-                    let dp = detail_panel_cloned.clone();
-                    let project_for_async = project.clone();
-                    let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
-                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
-                        let result = cx
-                            .background_executor()
-                            .spawn(async move {
-                                rgitui_git::compute_commit_diff(&repo_path, target_oid)
-                            })
-                            .await;
-                        cx.update(|cx| {
-                            if !diff_target_is_live(&workspace, &dv, cx)
-                                || dv.read(cx).generation() != request_generation
-                            {
-                                return;
-                            }
-                            let commit_info = project_for_async
-                                .read(cx)
-                                .recent_commits()
-                                .iter()
-                                .find(|c| c.oid == target_oid)
-                                .cloned();
-                            match (commit_info, result) {
-                                (Some(info), Ok(commit_diff)) => {
-                                    dp.update(cx, |dp, cx| {
-                                        dp.set_commit(info.clone(), commit_diff.clone(), cx)
-                                    });
-                                    if let Some(first_file) = commit_diff.files.first() {
-                                        let path = first_file.path.display().to_string();
-                                        let oid_str = target_oid.to_string();
-                                        dv.update(cx, |dv, cx| {
-                                            dv.set_diff(
-                                                first_file.clone(),
-                                                path,
-                                                DiffSource::Commit(oid_str),
-                                                cx,
-                                            )
-                                        });
-                                    } else {
-                                        dv.update(cx, |dv, cx| dv.clear(cx));
-                                    }
-                                }
-                                (_, Err(error)) => {
-                                    log::error!("Failed to get commit diff: {}", error);
-                                    dv.update(cx, |dv, cx| {
-                                        dv.set_error(
-                                            format!("Failed to load commit: {}", error),
-                                            cx,
-                                        )
-                                    });
-                                }
-                                (None, Ok(_)) => {
-                                    dv.update(cx, |dv, cx| dv.clear(cx));
-                                }
-                            }
-                        });
-                    })
-                    .detach();
+                    // Share graph inspection's origin/selection guards and its
+                    // graph-first rule: changing commits never opens a file.
+                    this.tabs[this.active_tab].graph.update(cx, |graph, cx| {
+                        graph.scroll_to_commit(target_oid, cx);
+                    });
                 }
             }
         }
@@ -2838,10 +2985,12 @@ pub(super) fn subscribe_diff_viewer(
                     .iter_mut()
                     .find(|tab| tab.diff_viewer == diff_viewer_ref);
                 let repo_path = if let Some(tab) = owning_tab {
-                    if matches!(
-                        tab.bottom_panel_mode,
-                        BottomPanelMode::Blame | BottomPanelMode::FileHistory
-                    ) {
+                    if !this.layout.graph_focused
+                        && matches!(
+                            tab.bottom_panel_mode,
+                            BottomPanelMode::Blame | BottomPanelMode::FileHistory
+                        )
+                    {
                         tab.bottom_panel_mode = BottomPanelMode::Diff;
                     }
                     tab.effective_repo_path(cx)
@@ -2863,7 +3012,10 @@ pub(super) fn subscribe_diff_viewer(
                 return;
             }
 
-            if !is_active_project(this, &project) {
+            if !is_active_project(this, &project)
+                || !this.content_is_visible()
+                || this.tabs[this.active_tab].bottom_panel_mode != BottomPanelMode::Diff
+            {
                 return;
             }
             let file_path = diff_viewer_ref
@@ -3537,6 +3689,9 @@ pub(super) fn subscribe_submodule_view(
             if !is_active_project(this, &project) {
                 return;
             }
+            if !matches!(event, SubmoduleViewEvent::Dismissed) && !this.require_main_checkout(cx) {
+                return;
+            }
             match event {
                 SubmoduleViewEvent::InitSubmodule(name) => {
                     let name = name.clone();
@@ -3710,10 +3865,104 @@ pub(super) fn subscribe_repo_clone_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_stash_summary, DiffPrefetchScheduler};
+    use super::{
+        build_worktree_graph_infos, extract_stash_summary, inspection_payload_is_current,
+        sidebar_event_matches_checkout, working_file_selection_event, DiffPrefetchScheduler,
+        SidebarEvent,
+    };
     use crate::cache::LruCache;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn graph_navigation_includes_clean_and_unscanned_linked_worktrees() {
+        let mut linked = rgitui_git::WorktreeInfo {
+            name: "linked".into(),
+            path: PathBuf::from("repo-linked"),
+            is_locked: false,
+            is_current: false,
+            branch: Some("feature".into()),
+            head_detached: false,
+            head_oid: Some(git2::Oid::from_bytes(&[1; 20]).unwrap()),
+            head_unborn: false,
+            status: None,
+            state: rgitui_git::RepoState::Clean,
+        };
+        for status in [None, Some(rgitui_git::WorkingTreeStatus::default())] {
+            linked.status = status;
+            let infos = build_worktree_graph_infos(std::slice::from_ref(&linked));
+            assert_eq!(
+                infos.len(),
+                1,
+                "status availability must not hide a checkout"
+            );
+            let info = &infos[0];
+            assert_eq!(info.worktree_path, linked.path);
+            assert_eq!(info.branch, linked.branch);
+            assert_eq!(info.head_oid, linked.head_oid);
+            assert!(!info.is_current);
+            assert_eq!(info.staged_count, 0);
+            assert_eq!(info.unstaged_count, 0);
+        }
+        linked.head_oid = None;
+        linked.branch = None;
+        for unborn in [false, true] {
+            linked.head_unborn = unborn;
+            let infos = build_worktree_graph_infos(std::slice::from_ref(&linked));
+            assert_eq!(infos[0].head_unborn, unborn);
+        }
+    }
+
+    #[test]
+    fn stash_inspection_survives_independent_diff_close_or_refresh() {
+        // Graph requests never update the retained Diff, even after switching
+        // to classic. Classic -> graph also disables Diff writes at completion.
+        for (requested_in_graph, currently_in_graph) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let updates_diff = !requested_in_graph && !currently_in_graph;
+            assert_eq!(
+                inspection_payload_is_current(true, updates_diff, 1, 2),
+                !updates_diff,
+            );
+            assert!(inspection_payload_is_current(true, updates_diff, 1, 1));
+            // Working changes / another stash / another checkout still wins.
+            assert!(!inspection_payload_is_current(false, updates_diff, 1, 1));
+            assert!(!inspection_payload_is_current(false, updates_diff, 1, 2));
+        }
+    }
+
+    #[test]
+    fn queued_working_file_and_conflict_selections_keep_their_checkout() {
+        let checkout_a = PathBuf::from("checkout-a");
+        let checkout_b = PathBuf::from("checkout-b");
+        for staged in [false, true] {
+            for conflicted in [false, true] {
+                let forwarded =
+                    working_file_selection_event("same.txt", staged, conflicted, &checkout_a);
+                // First hop while A is current succeeds; consuming after a
+                // queued worktree switch to B must reject, for both branches.
+                assert!(sidebar_event_matches_checkout(&forwarded, &checkout_a));
+                assert!(!sidebar_event_matches_checkout(&forwarded, &checkout_b));
+                match forwarded {
+                    SidebarEvent::FileSelectedAt {
+                        path,
+                        staged: source,
+                        ..
+                    } => {
+                        assert!(!conflicted);
+                        assert_eq!(path, "same.txt");
+                        assert_eq!(source, staged);
+                    }
+                    SidebarEvent::ConflictFileSelectedAt { path, .. } => {
+                        assert!(conflicted);
+                        assert_eq!(path, "same.txt");
+                    }
+                    _ => panic!("forwarded selection lost its checkout"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn diff_prefetch_reservation_is_singleflight() {

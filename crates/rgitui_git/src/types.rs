@@ -238,6 +238,9 @@ pub struct WorktreeInfo {
     pub head_detached: bool,
     /// OID of the HEAD commit in this worktree.
     pub head_oid: Option<git2::Oid>,
+    /// Git confirmed an unborn HEAD. A missing/unavailable checkout also has
+    /// no HEAD OID, but must not be presented as a new branch.
+    pub head_unborn: bool,
     /// Cached pending-change status for this worktree, if available.
     pub status: Option<WorkingTreeStatus>,
     /// Whether this checkout is mid-merge, mid-rebase, mid-cherry-pick and so

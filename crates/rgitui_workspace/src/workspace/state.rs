@@ -28,6 +28,8 @@ pub(crate) struct LayoutState {
     /// column. `diff_viewer_height` is kept while hidden, so showing the graph
     /// again restores the split the user had.
     pub graph_hidden: bool,
+    /// Graph and content take turns filling the center; classic split is retained.
+    pub graph_focused: bool,
     pub content_bounds: Bounds<Pixels>,
     pub right_panel_bounds: Bounds<Pixels>,
 }

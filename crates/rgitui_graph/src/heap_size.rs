@@ -121,6 +121,7 @@ mod tests {
             name: name.to_string(),
             is_current: true,
             head_oid: Some(git2::Oid::zero()),
+            head_unborn: false,
             staged_count: 1,
             unstaged_count: 2,
             combined_breakdown,

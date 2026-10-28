@@ -178,7 +178,7 @@
         },
         {
           "const": "rgitui::ToggleGraph",
-          "description": "Hide or show the commit graph, giving its space to the diff viewer. Command id: `toggle_graph`."
+          "description": "Switch Graph and file views; in classic layout, hide or show the graph. Command id: `toggle_graph`."
         },
         {
           "const": "rgitui::Search",
@@ -350,11 +350,11 @@
         },
         {
           "const": "rgitui::ShrinkDiffViewer",
-          "description": "Shorten the diff viewer. Command id: `shrink_diff_viewer`."
+          "description": "Shorten the diff viewer in classic split layout. Command id: `shrink_diff_viewer`."
         },
         {
           "const": "rgitui::GrowDiffViewer",
-          "description": "Heighten the diff viewer. Command id: `grow_diff_viewer`."
+          "description": "Heighten the diff viewer in classic split layout. Command id: `grow_diff_viewer`."
         },
         {
           "const": "rgitui::OpenKeymap",

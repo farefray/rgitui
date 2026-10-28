@@ -17,8 +17,8 @@ use rgitui_i18n::{key, t};
 use rgitui_settings::SettingsState;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
-    AvatarCache, Badge, ButtonSize, ButtonStyle, DiffStat, Icon, IconButton, IconName, IconSize,
-    Label, LabelSize, Scrollbar, TextInput, TextInputEvent, Tooltip,
+    AvatarCache, Badge, Button, ButtonSize, ButtonStyle, DiffStat, Icon, IconButton, IconName,
+    IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent, Tooltip,
 };
 
 use crate::keymap;
@@ -139,11 +139,162 @@ fn format_absolute_date(timestamp: i64) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub enum WorkingChangesAction {
+    StageFile(String),
+    UnstageFile(String),
+    DiscardFile(String),
+    StageAll,
+    UnstageAll,
+}
+
+#[derive(Clone)]
+enum WorkingRow {
+    Section {
+        staged: bool,
+        count: usize,
+    },
+    File {
+        index: usize,
+        file: rgitui_git::FileStatus,
+        staged: bool,
+    },
+}
+
+/// Staged and unstaged versions of the same path are distinct selections.
+fn working_selection(
+    status: &rgitui_git::WorkingTreeStatus,
+    index: usize,
+) -> Option<(std::path::PathBuf, bool)> {
+    if index < status.staged.len() {
+        status
+            .staged
+            .get(index)
+            .map(|file| (file.path.clone(), true))
+    } else {
+        status
+            .unstaged
+            .get(index - status.staged.len())
+            .map(|file| (file.path.clone(), false))
+    }
+}
+
+fn reconcile_working_selection(
+    old: &rgitui_git::WorkingTreeStatus,
+    new: &rgitui_git::WorkingTreeStatus,
+    selected: Option<usize>,
+) -> Option<usize> {
+    let (path, staged) = working_selection(old, selected?)?;
+    if staged {
+        new.staged.iter().position(|file| file.path == path)
+    } else {
+        new.unstaged
+            .iter()
+            .position(|file| file.path == path)
+            .map(|index| new.staged.len() + index)
+    }
+}
+
+fn working_rows(status: &rgitui_git::WorkingTreeStatus) -> Vec<WorkingRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    for (staged, files) in [(true, &status.staged), (false, &status.unstaged)] {
+        rows.push(WorkingRow::Section {
+            staged,
+            count: files.len(),
+        });
+        for file in files {
+            rows.push(WorkingRow::File {
+                index,
+                file: file.clone(),
+                staged,
+            });
+            index += 1;
+        }
+    }
+    rows
+}
+
+/// `None` is the unfiltered identity order: ordinary renders need no allocation
+/// or path conversion. Filtered renders and keyboard navigation share this map.
+fn working_display_order(rows: &[WorkingRow], query: Option<&str>) -> Option<Vec<usize>> {
+    query.map(|query| {
+        let query = query.to_lowercase();
+        rows.iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let visible = match row {
+                    WorkingRow::Section { .. } => true,
+                    WorkingRow::File { file, .. } => {
+                        file.path.to_string_lossy().to_lowercase().contains(&query)
+                    }
+                };
+                visible.then_some(index)
+            })
+            .collect()
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkingNavigation {
+    file_index: usize,
+    displayed_row: usize,
+    activate: bool,
+}
+
+/// Resolve a gesture against displayed file rows, never section headers or a
+/// hidden search result. The scroll target includes headers and filtering; the
+/// file index retains the staged/unstaged identity in the full status snapshot.
+fn working_navigation(
+    rows: &[WorkingRow],
+    display_order: Option<&[usize]>,
+    selected: Option<usize>,
+    command: CommandId,
+) -> Option<WorkingNavigation> {
+    let row_count = display_order.map_or(rows.len(), <[usize]>::len);
+    let files: Vec<_> = (0..row_count)
+        .filter_map(|displayed_row| {
+            let actual_row = display_order.map_or(displayed_row, |order| order[displayed_row]);
+            match &rows[actual_row] {
+                WorkingRow::File { index, .. } => Some((*index, displayed_row)),
+                WorkingRow::Section { .. } => None,
+            }
+        })
+        .collect();
+    let current = files.iter().position(|(index, _)| Some(*index) == selected);
+    let target = match command {
+        CommandId::SelectNext => {
+            current.map_or(0, |index| (index + 1).min(files.len().saturating_sub(1)))
+        }
+        CommandId::SelectPrev => current.map_or(0, |index| index.saturating_sub(1)),
+        CommandId::SelectFirst => 0,
+        CommandId::SelectLast => files.len().checked_sub(1)?,
+        CommandId::Confirm => current?,
+        _ => return None,
+    };
+    let &(file_index, displayed_row) = files.get(target)?;
+    Some(WorkingNavigation {
+        file_index,
+        displayed_row,
+        activate: command == CommandId::Confirm || selected != Some(file_index),
+    })
+}
+
+#[derive(Debug, Clone)]
 pub enum DetailPanelEvent {
     /// A file in the changed-files list was picked. Carries the provenance of
-    /// the content so the diff viewer never has to infer it — the panel only
-    /// ever lists files from a commit or a stash, never from the working tree.
+    /// the content so the diff viewer never has to infer it. Working changes
+    /// use `WorkingFileSelected` and load their current contents asynchronously.
     FileSelected(FileDiff, String, DiffSource),
+    WorkingFileSelected {
+        path: String,
+        staged: bool,
+        conflicted: bool,
+        checkout: std::path::PathBuf,
+    },
+    WorkingAction {
+        checkout: std::path::PathBuf,
+        action: WorkingChangesAction,
+    },
     CopySha(String),
     CherryPick(String),
     NavigatePrevCommit,
@@ -451,6 +602,9 @@ impl FilteredFiles {
 
 pub struct DetailPanel {
     commit: Option<CommitInfo>,
+    working_changes: Option<rgitui_git::WorkingTreeStatus>,
+    cached_working_rows: Arc<Vec<WorkingRow>>,
+    working_checkout: std::path::PathBuf,
     commit_diff: Option<Arc<CommitDiff>>,
     /// Provenance of `commit_diff`'s files — a commit or a stash. Set alongside
     /// the diff so file selections can report it without guessing.
@@ -501,6 +655,9 @@ impl DetailPanel {
 
         Self {
             commit: None,
+            working_changes: None,
+            cached_working_rows: Arc::default(),
+            working_checkout: std::path::PathBuf::new(),
             commit_diff: None,
             diff_source: None,
             cached_file_tree: None,
@@ -561,6 +718,9 @@ impl DetailPanel {
     }
 
     fn file_count(&self) -> usize {
+        if let Some(status) = &self.working_changes {
+            return status.staged.len() + status.unstaged.len();
+        }
         self.commit_diff
             .as_ref()
             .map(|d| d.files.len())
@@ -575,6 +735,38 @@ impl DetailPanel {
     /// `v`, `[`, `]` and `/` out of the way while it has focus, and the arrow
     /// keys keep working because they are not scoped that way.
     fn dispatch_command(&mut self, cmd: CommandId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.working_changes.is_some()
+            && matches!(
+                cmd,
+                CommandId::SelectNext
+                    | CommandId::SelectPrev
+                    | CommandId::SelectFirst
+                    | CommandId::SelectLast
+                    | CommandId::Confirm
+            )
+        {
+            let order =
+                working_display_order(&self.cached_working_rows, self.file_search_query.as_deref());
+            if let Some(target) = working_navigation(
+                &self.cached_working_rows,
+                order.as_deref(),
+                self.selected_file_index,
+                cmd,
+            ) {
+                self.selected_file_index = Some(target.file_index);
+                self.file_scroll
+                    .scroll_to_item(target.displayed_row, ScrollStrategy::Nearest);
+                if target.activate {
+                    // Confirm deliberately re-emits for an unchanged selection:
+                    // its Diff may have been closed or replaced since selection.
+                    self.emit_file_selected(cx);
+                }
+                cx.notify();
+            } else if self.selected_file_index.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         let file_count = self.file_count();
 
         match cmd {
@@ -645,6 +837,10 @@ impl DetailPanel {
     }
 
     fn request_file_view_mode_toggle(&mut self, cx: &mut Context<Self>) {
+        // Working changes uses grouped source lists, not the historical tree.
+        if self.working_changes.is_some() {
+            return;
+        }
         let is_searching = is_file_searching(self.file_search_active, &self.file_search_query);
         let next_mode = file_view_mode_after_toggle_request(
             self.file_view_mode,
@@ -676,6 +872,23 @@ impl DetailPanel {
     }
 
     fn emit_file_selected(&self, cx: &mut Context<Self>) {
+        if let (Some(status), Some(index)) = (&self.working_changes, self.selected_file_index) {
+            let staged = index < status.staged.len();
+            let file = if staged {
+                status.staged.get(index)
+            } else {
+                status.unstaged.get(index - status.staged.len())
+            };
+            if let Some(file) = file {
+                cx.emit(DetailPanelEvent::WorkingFileSelected {
+                    path: file.path.to_string_lossy().into_owned(),
+                    staged,
+                    conflicted: file.kind == FileChangeKind::Conflicted,
+                    checkout: self.working_checkout.clone(),
+                });
+            }
+            return;
+        }
         if let (Some(idx), Some(diff), Some(source)) = (
             self.selected_file_index,
             &self.commit_diff,
@@ -736,6 +949,7 @@ impl DetailPanel {
                 cached_file_tree.tree_rows.len()
             );
         }
+        self.working_changes = None;
         self.cached_file_tree = Some(cached_file_tree);
         self.commit = Some(commit);
         self.commit_diff = Some(diff);
@@ -755,6 +969,8 @@ impl DetailPanel {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         log::debug!("DetailPanel::clear");
         self.commit = None;
+        self.working_changes = None;
+        self.cached_working_rows = Arc::default();
         self.commit_diff = None;
         self.diff_source = None;
         self.cached_file_tree = None;
@@ -766,6 +982,38 @@ impl DetailPanel {
         self.description_expanded = false;
         self.contained_in.clear();
         self.contained_in_loading = false;
+        cx.notify();
+    }
+
+    /// Refresh only the working inspector; the commit composer is a separate
+    /// entity and its hidden draft is never touched here.
+    pub fn set_working_changes(
+        &mut self,
+        status: rgitui_git::WorkingTreeStatus,
+        checkout: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.working_changes.as_ref() == Some(&status) && self.working_checkout == checkout {
+            return;
+        }
+        if let Some(previous) = self
+            .working_changes
+            .as_ref()
+            .filter(|_| self.working_checkout == checkout)
+        {
+            self.selected_file_index =
+                reconcile_working_selection(previous, &status, self.selected_file_index);
+            // Keep the scroll handle, filter text/editor, and selected identity.
+            // A vanished index/worktree source clears selection, never rebinds it.
+        } else {
+            self.clear(cx);
+            self.file_search_editor
+                .update(cx, |editor, cx| editor.clear(cx));
+            self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.cached_working_rows = Arc::new(working_rows(&status));
+        self.working_changes = Some(status);
+        self.working_checkout = checkout;
         cx.notify();
     }
 
@@ -1274,9 +1522,123 @@ impl Render for DetailPanel {
         let msg_gap = px(compact.spacing(6.0));
         let avatar_size = px(compact.spacing(24.0));
 
+        if let Some(status) = &self.working_changes {
+            // Cache rows on status changes; an ordinary frame clones only the
+            // shared handle and the visible window, not hundreds of file paths.
+            let rows = self.cached_working_rows.clone();
+            let display_order = working_display_order(&rows, self.file_search_query.as_deref());
+            let row_count = display_order.as_ref().map_or(rows.len(), Vec::len);
+            let clean = status.staged.is_empty() && status.unstaged.is_empty();
+            let selected = self.selected_file_index;
+            let checkout = self.working_checkout.clone();
+            let weak = cx.entity().downgrade();
+            let selected_bg = colors.element_selected;
+            let hover_bg = colors.ghost_element_hover;
+            let section_bg = colors.surface_background;
+            return div()
+                .id("detail-panel")
+                .track_focus(&self.focus_handle)
+                .map(|el| keymap::bind_actions(el, "DetailPanel List", &["Menu", "DetailPanel"], cx, Self::dispatch_command))
+                .v_flex().size_full().min_h_0().bg(colors.panel_background)
+                .child(div().h_flex().px(px(10.)).py(px(8.)).gap(px(6.))
+                    .child(Label::new(t!("sidebar.working_changes")).size(LabelSize::Small))
+                    .child(div().flex_1())
+                    .child(IconButton::new("working-file-search", IconName::Search).size(ButtonSize::Compact)
+                        .tooltip(t!("detail.search_files_hint"))
+                        .on_click(cx.listener(|this, _, window, cx| this.dispatch_command(CommandId::FileSearch, window, cx)))))
+                .when(self.file_search_active || self.file_search_query.is_some(), |el| el.child(self.file_search_editor.clone()))
+                .when(clean, |el| el.child(div().p(px(10.)).child(Label::new(t!("sidebar.working_clean")).size(LabelSize::Small).color(Color::Muted))))
+                .child(uniform_list("working-inspector-files", row_count, move |range: std::ops::Range<usize>, _window: &mut Window, _cx: &mut App| {
+                    range.map(|row| {
+                        let actual_row = display_order.as_ref().map_or(row, |order| order[row]);
+                        let checkout = checkout.clone();
+                        let weak = weak.clone();
+                        match rows[actual_row].clone() {
+                            WorkingRow::Section { staged, count } => {
+                                div().id(row).h_flex().w_full().h(px(32.)).px(px(10.)).gap(px(6.)).bg(section_bg)
+                                    .child(Label::new(if staged { t!("sidebar.staged") } else { t!("sidebar.unstaged") }).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD))
+                                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                                    .child(div().flex_1())
+                                    .child(Button::new(ElementId::NamedInteger("working-all".into(), row as u64), if staged { t!("sidebar.unstage_all") } else { t!("sidebar.stage_all") })
+                                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(count == 0)
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            weak.update(cx, |_, cx| {
+                                                cx.emit(DetailPanelEvent::WorkingAction { checkout: checkout.clone(), action: if staged { WorkingChangesAction::UnstageAll } else { WorkingChangesAction::StageAll } });
+                                            }).ok();
+                                        }))
+                                    .into_any_element()
+                            }
+                            WorkingRow::File { index, file, staged } => {
+                                let path = file.path.to_string_lossy().into_owned();
+                                let file_name = file.path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.clone());
+                                let directory = file.path.parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                    .map(|parent| parent.to_string_lossy().into_owned());
+                                let action_path = path.clone();
+                                let action_checkout = checkout.clone();
+                                let action_weak = weak.clone();
+                                let discard_weak = weak.clone();
+                                let discard_path = path.clone();
+                                let discard_checkout = checkout.clone();
+                                let conflicted = file.kind == FileChangeKind::Conflicted;
+                                div().id(row).group("working-file-row").h_flex().w_full().h(px(32.)).px(px(10.)).gap(px(6.))
+                                    .cursor_pointer()
+                                    .when(selected == Some(index), |el| el.bg(selected_bg))
+                                    .when(selected != Some(index), |el| el.hover(move |s| s.bg(hover_bg)))
+                                    .child(Icon::new(file_change_icon(file.kind)).size(IconSize::Small).color(file_change_color(file.kind)))
+                                    .tooltip(Tooltip::text(path.clone()))
+                                    .child(div().h_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden()
+                                        .child(div().min_w_0().max_w(gpui::rems(12.)).flex_shrink_0()
+                                            .child(Label::new(file_name).size(LabelSize::Small).truncate()))
+                                        .when_some(directory, |el, directory| el.child(div().flex_1().min_w_0()
+                                            .child(Label::new(directory).size(LabelSize::XSmall).color(Color::Muted).truncate()))))
+                                    // Conflicts must go through the resolver, not blind staging.
+                                    .when(!conflicted, |el| el.child(IconButton::new(ElementId::NamedInteger("working-stage".into(), row as u64), if staged { IconName::Minus } else { IconName::Plus })
+                                        .size(ButtonSize::Compact)
+                                        .tooltip(if staged { t!("sidebar.unstage_file.tooltip") } else { t!("sidebar.stage_file.tooltip") })
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            action_weak.update(cx, |_, cx| {
+                                                cx.emit(DetailPanelEvent::WorkingAction { checkout: action_checkout.clone(), action: if staged { WorkingChangesAction::UnstageFile(action_path.clone()) } else { WorkingChangesAction::StageFile(action_path.clone()) } });
+                                            }).ok();
+                                        })))
+                                    .when(!staged, |el| el.child(
+                                        div().flex_shrink_0().invisible().group_hover("working-file-row", |style| style.visible())
+                                            .child(IconButton::new(ElementId::NamedInteger("working-discard".into(), row as u64), IconName::Trash)
+                                                .size(ButtonSize::Compact).color(Color::Muted)
+                                                .tooltip(t!("sidebar.discard_changes.tooltip"))
+                                                .on_click(move |_: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    discard_weak.update(cx, |_, cx| {
+                                                        cx.emit(DetailPanelEvent::WorkingAction {
+                                                            checkout: discard_checkout.clone(),
+                                                            action: WorkingChangesAction::DiscardFile(discard_path.clone()),
+                                                        });
+                                                    }).ok();
+                                                }))
+                                    ))
+                                    .on_click(move |_: &ClickEvent, window, cx| {
+                                        weak.update(cx, |this, cx| {
+                                            this.focus_handle.focus(window, cx);
+                                            this.selected_file_index = Some(index);
+                                            cx.emit(DetailPanelEvent::WorkingFileSelected { path: path.clone(), staged, conflicted, checkout: checkout.clone() });
+                                            cx.notify();
+                                        }).ok();
+                                    }).into_any_element()
+                            }
+                        }
+                    }).collect()
+                }).flex_1().min_h_0().track_scroll(&self.file_scroll))
+                .into_any_element();
+        }
+
         let Some(commit) = &self.commit else {
             return div()
                 .id("detail-panel")
+                .track_focus(&self.focus_handle)
                 .v_flex()
                 .size_full()
                 .bg(colors.panel_background)
@@ -2087,6 +2449,233 @@ mod census {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn working_test_rows(staged: &[&str], unstaged: &[&str]) -> Vec<WorkingRow> {
+        let files = |paths: &[&str]| {
+            paths
+                .iter()
+                .map(|path| rgitui_git::FileStatus {
+                    path: (*path).into(),
+                    kind: FileChangeKind::Modified,
+                    old_path: None,
+                    additions: 0,
+                    deletions: 0,
+                })
+                .collect()
+        };
+        working_rows(&rgitui_git::WorkingTreeStatus {
+            staged: files(staged),
+            unstaged: files(unstaged),
+        })
+    }
+
+    #[test]
+    fn working_unfiltered_display_uses_cached_identity_order() {
+        let rows = working_test_rows(&["a"], &["b"]);
+        assert!(working_display_order(&rows, None).is_none());
+        let first = working_navigation(&rows, None, None, CommandId::SelectFirst).unwrap();
+        let last = working_navigation(&rows, None, None, CommandId::SelectLast).unwrap();
+        assert_eq!((first.file_index, first.displayed_row), (0, 1));
+        assert_eq!((last.file_index, last.displayed_row), (1, 3));
+    }
+
+    #[test]
+    fn working_keyboard_uses_the_rendered_filter_order_and_skips_headers() {
+        let rows = working_test_rows(&["ignore", "src/a.rs"], &["docs", "src/b.rs"]);
+        let order = working_display_order(&rows, Some("SRC/")).unwrap();
+        assert_eq!(order, [0, 2, 3, 5]);
+        let next = working_navigation(&rows, Some(&order), Some(1), CommandId::SelectNext).unwrap();
+        assert_eq!((next.file_index, next.displayed_row), (3, 3));
+        assert!(matches!(
+            rows[order[next.displayed_row]],
+            WorkingRow::File { index: 3, .. }
+        ));
+        let previous =
+            working_navigation(&rows, Some(&order), Some(3), CommandId::SelectPrev).unwrap();
+        assert_eq!((previous.file_index, previous.displayed_row), (1, 1));
+        let first =
+            working_navigation(&rows, Some(&order), Some(3), CommandId::SelectFirst).unwrap();
+        let last = working_navigation(&rows, Some(&order), Some(1), CommandId::SelectLast).unwrap();
+        assert_eq!((first.file_index, last.file_index), (1, 3));
+        // A selection hidden by the query starts at the first displayed file.
+        for command in [CommandId::SelectNext, CommandId::SelectPrev] {
+            assert_eq!(
+                working_navigation(&rows, Some(&order), Some(0), command)
+                    .unwrap()
+                    .file_index,
+                1
+            );
+        }
+        assert!(working_navigation(&rows, Some(&order), Some(0), CommandId::Confirm).is_none());
+    }
+
+    #[test]
+    fn working_keyboard_keeps_both_source_versions_of_the_same_path() {
+        let rows = working_test_rows(&["partial.rs"], &["partial.rs"]);
+        let order = working_display_order(&rows, Some("partial"));
+        let staged =
+            working_navigation(&rows, order.as_deref(), None, CommandId::SelectNext).unwrap();
+        let unstaged = working_navigation(
+            &rows,
+            order.as_deref(),
+            Some(staged.file_index),
+            CommandId::SelectNext,
+        )
+        .unwrap();
+        assert_eq!((staged.file_index, staged.displayed_row), (0, 1));
+        assert_eq!((unstaged.file_index, unstaged.displayed_row), (1, 3));
+        assert!(matches!(
+            rows[staged.displayed_row],
+            WorkingRow::File { staged: true, .. }
+        ));
+        assert!(matches!(
+            rows[unstaged.displayed_row],
+            WorkingRow::File { staged: false, .. }
+        ));
+    }
+
+    #[test]
+    fn working_empty_results_never_select_headers_or_activate_hidden_files() {
+        for rows in [
+            working_test_rows(&["a"], &["b"]),
+            working_test_rows(&[], &[]),
+        ] {
+            let order = working_display_order(&rows, Some("missing"));
+            for command in [
+                CommandId::SelectNext,
+                CommandId::SelectPrev,
+                CommandId::SelectFirst,
+                CommandId::SelectLast,
+                CommandId::Confirm,
+            ] {
+                assert!(working_navigation(&rows, order.as_deref(), Some(0), command).is_none());
+                assert!(working_navigation(&rows, order.as_deref(), None, command).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn working_confirm_reopens_current_file_even_without_a_selection_change() {
+        let rows = working_test_rows(&["partial.rs"], &["partial.rs"]);
+        for _ in 0..2 {
+            let confirm = working_navigation(&rows, None, Some(1), CommandId::Confirm).unwrap();
+            assert_eq!(
+                confirm,
+                WorkingNavigation {
+                    file_index: 1,
+                    displayed_row: 3,
+                    activate: true
+                }
+            );
+        }
+        let boundary = working_navigation(&rows, None, Some(1), CommandId::SelectNext).unwrap();
+        assert!(!boundary.activate);
+        assert_eq!(boundary.displayed_row, 3);
+        assert!(working_navigation(&rows, None, None, CommandId::Confirm).is_none());
+    }
+
+    #[test]
+    fn working_long_list_scroll_target_is_displayed_row_not_file_index() {
+        let paths: Vec<_> = (0..450).map(|index| format!("file-{index}.rs")).collect();
+        let paths: Vec<_> = paths.iter().map(String::as_str).collect();
+        let rows = working_test_rows(&[], &paths);
+        let last = working_navigation(&rows, None, None, CommandId::SelectLast).unwrap();
+        assert_eq!((last.file_index, last.displayed_row), (449, 451));
+        let previous = working_navigation(&rows, None, Some(449), CommandId::SelectPrev).unwrap();
+        assert_eq!((previous.file_index, previous.displayed_row), (448, 450));
+        let order = working_display_order(&rows, Some("file-449.rs"));
+        let filtered =
+            working_navigation(&rows, order.as_deref(), Some(449), CommandId::Confirm).unwrap();
+        assert_eq!((filtered.file_index, filtered.displayed_row), (449, 2));
+    }
+
+    #[test]
+    fn working_rows_keep_index_and_worktree_versions_of_the_same_path_distinct() {
+        let file = rgitui_git::FileStatus {
+            path: "partial.rs".into(),
+            kind: FileChangeKind::Modified,
+            old_path: None,
+            additions: 1,
+            deletions: 0,
+        };
+        let status = rgitui_git::WorkingTreeStatus {
+            staged: vec![file.clone()],
+            unstaged: vec![file],
+        };
+        let rows = working_rows(&status);
+        assert!(matches!(
+            rows[0],
+            WorkingRow::Section {
+                staged: true,
+                count: 1
+            }
+        ));
+        assert!(matches!(
+            rows[1],
+            WorkingRow::File {
+                index: 0,
+                staged: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rows[2],
+            WorkingRow::Section {
+                staged: false,
+                count: 1
+            }
+        ));
+        assert!(matches!(
+            rows[3],
+            WorkingRow::File {
+                index: 1,
+                staged: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn working_refresh_preserves_identity_not_numeric_position_or_other_source() {
+        let file = |path: &str| rgitui_git::FileStatus {
+            path: path.into(),
+            kind: FileChangeKind::Modified,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+        };
+        let old = rgitui_git::WorkingTreeStatus {
+            staged: vec![file("same")],
+            unstaged: vec![file("same"), file("other")],
+        };
+        let new = rgitui_git::WorkingTreeStatus {
+            staged: vec![file("added"), file("same")],
+            unstaged: vec![file("other"), file("same")],
+        };
+        assert_eq!(reconcile_working_selection(&old, &new, Some(0)), Some(1));
+        assert_eq!(reconcile_working_selection(&old, &new, Some(1)), Some(3));
+        let staged_away = rgitui_git::WorkingTreeStatus {
+            staged: vec![file("same")],
+            unstaged: vec![file("other")],
+        };
+        assert_eq!(
+            reconcile_working_selection(&old, &staged_away, Some(1)),
+            None
+        );
+        assert_eq!(
+            reconcile_working_selection(&old, &staged_away, Some(2)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn clean_working_inspector_has_both_sections_and_no_historical_rows() {
+        let rows = working_rows(&rgitui_git::WorkingTreeStatus::default());
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| matches!(row, WorkingRow::Section { count: 0, .. })));
+    }
     use crate::time::format_relative_time_full;
 
     #[test]

@@ -109,10 +109,11 @@ may abbreviate headings/secondary statistics to keep actions and counts visible.
 
 ## Follow-up, after using the preview
 
-Consider progressive disclosure for empty panels, clearer single-click versus
-checkout cues, and a more task-oriented changes/details panel. Those are workflow
-changes, not palette fixes, and should be evaluated separately rather than hidden
-inside this visual pass. Syntax highlighting still uses the existing light/dark
-syntect palettes, not the owner's VS Code syntax theme; comments over colored diff
-backgrounds need a separate composited-contrast pass. Full keyboard-navigation
-audits and cross-platform screenshots also remain separate follow-up work.
+The subsequent [graph workspace pass](GRAPH_WORKSPACE.md) adds contextual
+changes/details and explicit worktree navigation, and removes implicit checkout
+from commit double-clicks. Its readability follow-up fixes proportional font
+inheritance in syntax-rendered code, softens diff backgrounds, and corrects syntax
+ink against composited row/selection/word backgrounds. The underlying syntax
+palettes are still syntect's light/dark palettes, not a VS Code theme import.
+Full keyboard-navigation audits, cross-platform screenshots, and comprehensive
+large-font/custom-theme acceptance remain follow-up work.

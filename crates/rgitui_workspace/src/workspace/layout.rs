@@ -55,6 +55,12 @@ fn clamp_diff_viewer_height(height: f32, available_height: f32) -> f32 {
     height.clamp(MIN_DIFF_VIEWER_HEIGHT, max)
 }
 
+/// History inspection must not compete with a composer for unrelated changes.
+/// Classic mode intentionally keeps its existing always-visible composer.
+fn show_commit_composer(graph_focused: bool, working_changes: bool, details_active: bool) -> bool {
+    !graph_focused || (working_changes && details_active)
+}
+
 /// What the title and status bars call a checkout's HEAD: its branch, or the
 /// short id of the commit a detached HEAD sits on, so the bars say where HEAD
 /// is rather than only that it has left every branch.
@@ -94,6 +100,88 @@ const WELCOME_SHORTCUTS: &[CommandId] = &[
 ];
 
 impl Workspace {
+    /// A visible escape hatch to the previous stacked graph/diff layout.
+    fn render_layout_toggle(&self, cx: &mut Context<Self>) -> Button {
+        let focused = self.layout.graph_focused;
+        Button::new(
+            "workspace-layout-toggle",
+            if focused {
+                t!("workspace.layout.classic")
+            } else {
+                t!("workspace.layout.focused")
+            },
+        )
+        .size(ButtonSize::Compact)
+        .style(ButtonStyle::Outlined)
+        .tooltip(if focused {
+            t!("workspace.layout.classic.tooltip")
+        } else {
+            t!("workspace.layout.focused.tooltip")
+        })
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            this.set_graph_focused_layout(!focused, window, cx);
+        }))
+    }
+
+    /// Repository tabs own entities; these tabs only choose which existing
+    /// center entity is rendered. Switching never recreates graph/diff state.
+    fn render_center_tab_bar(&self, cx: &mut Context<Self>) -> TabBar {
+        let mut bar = TabBar::new().tab(
+            Tab::new("center-tab-graph", t!("graph.title"))
+                .closeable(false)
+                .active(self.graph_is_visible())
+                .tooltip(t!("workspace.graph.show.tooltip"))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.show_graph_view(window, cx);
+                })),
+        );
+        if let Some(tab) = self
+            .tabs
+            .get(self.active_tab)
+            .filter(|tab| tab.content_open)
+        {
+            let mode = tab.bottom_panel_mode;
+            let title = match mode {
+                BottomPanelMode::Diff => t!("workspace.bottom.diff"),
+                BottomPanelMode::FileHistory => t!("workspace.bottom.history"),
+                BottomPanelMode::Blame => t!("common.blame"),
+                BottomPanelMode::Reflog => t!("reflog.title"),
+                BottomPanelMode::Submodules => t!("submodules.title"),
+                BottomPanelMode::Bisect => t!("bisect.title"),
+                BottomPanelMode::GlobalSearch => t!("search.title"),
+            };
+            let path = matches!(
+                mode,
+                BottomPanelMode::Diff | BottomPanelMode::FileHistory | BottomPanelMode::Blame
+            )
+            .then(|| tab.diff_tab_label(cx))
+            .flatten();
+            let label = path.as_ref().map_or_else(
+                || title.clone(),
+                |path| {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    t!("workspace.center.file", view = title.clone(), file = name)
+                },
+            );
+            bar = bar.tab(
+                Tab::new("center-tab-content", label)
+                    .active(self.content_is_visible())
+                    .tooltip(path.map(SharedString::from).unwrap_or(title))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.show_content_view(mode, window, cx);
+                    }))
+                    .on_close(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.close_content_view(window, cx);
+                    })),
+            );
+        }
+        bar.end_slot(self.render_layout_toggle(cx))
+    }
+
     /// Translate the configured base font size into a window rem size.
     ///
     /// Components render body text at `rems(0.875)`, so against GPUI's 16px
@@ -200,6 +288,15 @@ impl Render for Workspace {
         }
         self.track_focus(window, cx);
 
+        // The contextual inspector owns change lists in the focused layout.
+        // Keep the sidebar entity/data alive so classic mode can restore them.
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let show_sections = !self.layout.graph_focused;
+            tab.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_show_change_sections(show_sections, cx);
+            });
+        }
+
         // Nothing holds focus on a fresh launch. gpui dispatches an action
         // along the path from the focused node up to the root, so with no focus
         // at all every shortcut resolves against the dispatch-tree root — above
@@ -225,13 +322,22 @@ impl Render for Workspace {
         // rather than where the graph is hidden because the command palette
         // hides it without a `Window`, and containment is resolved against the
         // previous frame: the last one in which the graph was there to hold it.
-        if self.layout.graph_hidden
+        if !self.graph_is_visible()
             && self
                 .tabs
                 .get(self.active_tab)
                 .is_some_and(|tab| tab.graph.read(cx).contains_focus(window, cx))
         {
             self.focus_panel(FocusedPanel::DiffViewer, window, cx);
+        }
+
+        if !self.content_is_visible()
+            && self
+                .tabs
+                .get(self.active_tab)
+                .is_some_and(|tab| tab.bottom_panel_focused(window, cx))
+        {
+            self.focus_panel(FocusedPanel::Graph, window, cx);
         }
 
         // Apply the configured UI font size. Every `rgitui_ui` component sizes
@@ -409,7 +515,14 @@ impl Render for Workspace {
         let diff_focused = active_tab.bottom_panel_focused(window, cx);
         let focus_accent = colors.border_focused;
         let bottom_panel_mode = active_tab.bottom_panel_mode;
-        let graph_hidden = self.layout.graph_hidden;
+        let graph_hidden = !self.graph_is_visible();
+        let graph_focused_layout = self.layout.graph_focused;
+        let content_visible = self.content_is_visible();
+        let show_commit_panel = show_commit_composer(
+            graph_focused_layout,
+            active_tab.inspecting_working_changes(),
+            active_tab.right_panel_mode == RightPanelMode::Details,
+        );
         let diff_viewer_height = self.layout.diff_viewer_height;
         let current_view_key = active_tab.current_view_cache_key(cx);
         let (history_availability, blame_availability) = current_view_key
@@ -534,7 +647,7 @@ impl Render for Workspace {
             .ahead_behind(ahead, behind)
             .changes(staged_count, unstaged_count)
             .stash_count(stash_count)
-            .repo_path(repo_path_display)
+            .repo_path(repo_path_display.clone())
             .loading(!self.operations.active_operations.is_empty())
             .error(self.operations.last_failed_git_operation.is_some())
             .head_detached(head_detached);
@@ -784,19 +897,24 @@ impl Render for Workspace {
                         .py(px(4.))
                         .gap(px(6.))
                         .items_center()
-                        .bg(cx.status().warning_background)
+                        .bg(cx.status().info_background)
                         .border_b_1()
-                        .border_color(cx.status().warning)
+                        .border_color(cx.status().info)
                         .child(
-                            Icon::new(IconName::GitBranch)
+                            Icon::new(IconName::Folder)
                                 .size(IconSize::Small)
-                                .color(Color::Warning),
+                                .color(Color::Info),
                         )
                         .child(
-                            Label::new(label)
-                                .size(LabelSize::Small)
-                                .weight(gpui::FontWeight::SEMIBOLD)
-                                .truncate(),
+                            div()
+                                .id("worktree-context-label")
+                                .min_w_0()
+                                .overflow_hidden()
+                                .tooltip(Tooltip::text(t!("workspace.worktree.context.tooltip", path = repo_path_display.clone())))
+                                .child(Label::new(label)
+                                    .size(LabelSize::Small)
+                                    .weight(gpui::FontWeight::SEMIBOLD)
+                                    .truncate()),
                         )
                         .child(div().flex_1())
                         .child(
@@ -806,7 +924,8 @@ impl Render for Workspace {
                             Button::new("exit-worktree-inspection", t!("workspace.worktree.exit"))
                                 .size(ButtonSize::Compact)
                                 .style(ButtonStyle::Subtle)
-                                .color(Color::Warning)
+                                .color(Color::Info)
+                                .tooltip(t!("workspace.worktree.exit.tooltip"))
                                 .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                                     super::events::set_inspecting_worktree(this, None, cx);
                                 })),
@@ -988,19 +1107,27 @@ impl Render for Workspace {
                                         ),
                                 )
                             })
-                            // Graph view and the drag-to-resize strip below it,
-                            // both gone while the graph is hidden
+                            .when(graph_focused_layout, |el| {
+                                el.child(self.render_center_tab_bar(cx))
+                            })
+                            // The graph entity stays alive when a file view replaces it.
+                            // Only classic split mode needs the vertical resize strip.
                             .when(!graph_hidden, |el| {
                                 el.child(
                                     div()
                                         .flex_1()
-                                        .min_h(px(MIN_GRAPH_HEIGHT))
+                                        .min_h(if graph_focused_layout {
+                                            px(0.)
+                                        } else {
+                                            px(MIN_GRAPH_HEIGHT)
+                                        })
+                                        .overflow_hidden()
                                         .when(graph_focused, |el| {
                                             el.border_t_2().border_color(focus_accent)
                                         })
                                         .child(active_tab.graph.clone()),
                                 )
-                                .child(
+                                .when(!graph_focused_layout, |el| el.child(
                                     div()
                                         .id("diff-resize-handle")
                                         .w_full()
@@ -1027,10 +1154,10 @@ impl Render for Workspace {
                                                     },
                                                 )
                                         }),
-                                )
+                                ))
                             })
-                            // Bottom panel tabs + content
-                            .child({
+                            // File/tool subviews share the full center in focused mode.
+                            .when(content_visible, |el| el.child({
                                 let tab_bar_bg = colors.tab_bar_background;
                                 let tab_border = colors.border_variant;
                                 let tab_active_bg = colors.tab_active_background;
@@ -1169,15 +1296,9 @@ impl Render for Workspace {
                                             t!("workspace.bottom.diff.tooltip"),
                                         )
                                         .on_click(
-                                            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                                                 ws.update(cx, |this, cx| {
-                                                    if let Some(tab) =
-                                                        this.tabs.get_mut(this.active_tab)
-                                                    {
-                                                        tab.bottom_panel_mode =
-                                                            BottomPanelMode::Diff;
-                                                    }
-                                                    cx.notify();
+                                                    this.show_content_view(BottomPanelMode::Diff, window, cx);
                                                 })
                                                 .ok();
                                             },
@@ -1197,7 +1318,7 @@ impl Render for Workspace {
                                             |tab_element| {
                                                 tab_element.on_click(
                                                 move |_: &ClickEvent,
-                                                      _: &mut Window,
+                                                      window: &mut Window,
                                                       cx: &mut App| {
                                                     ws2.update(cx, |this, cx| {
                                                         if let Some(tab) =
@@ -1206,8 +1327,7 @@ impl Render for Workspace {
                                                             if tab.bottom_panel_mode
                                                                 == BottomPanelMode::FileHistory
                                                             {
-                                                                tab.bottom_panel_mode =
-                                                                    BottomPanelMode::Diff;
+                                                                this.show_content_view(BottomPanelMode::Diff, window, cx);
                                                             } else {
                                                                 this.execute_command(
                                                                     crate::CommandId::FileHistory,
@@ -1237,7 +1357,7 @@ impl Render for Workspace {
                                             |tab_element| {
                                                 tab_element.on_click(
                                                 move |_: &ClickEvent,
-                                                      _: &mut Window,
+                                                      window: &mut Window,
                                                       cx: &mut App| {
                                                     ws3.update(cx, |this, cx| {
                                                         if let Some(tab) =
@@ -1246,8 +1366,7 @@ impl Render for Workspace {
                                                             if tab.bottom_panel_mode
                                                                 == BottomPanelMode::Blame
                                                             {
-                                                                tab.bottom_panel_mode =
-                                                                    BottomPanelMode::Diff;
+                                                                this.show_content_view(BottomPanelMode::Diff, window, cx);
                                                             } else {
                                                                 this.execute_command(
                                                                     crate::CommandId::Blame,
@@ -1281,7 +1400,10 @@ impl Render for Workspace {
                                         )
                                     })
                                     .child(div().flex_1())
-                                    .child(graph_toggle);
+                                    .when(!graph_focused_layout, |el| {
+                                        el.child(graph_toggle)
+                                            .child(self.render_layout_toggle(cx))
+                                    });
 
                                 div()
                                     .v_flex()
@@ -1293,7 +1415,7 @@ impl Render for Workspace {
                                     // resolves that every frame, so a window resize
                                     // is reflected in the same frame it happens.
                                     .map(|el| {
-                                        if graph_hidden {
+                                        if graph_focused_layout || graph_hidden {
                                             el.flex_1().min_h_0()
                                         } else {
                                             el.h(px(diff_viewer_height))
@@ -1326,7 +1448,7 @@ impl Render for Workspace {
                                     .when(bottom_panel_mode == BottomPanelMode::Bisect, |el| {
                                         el.child(active_tab.bisect_view.clone())
                                     })
-                            }),
+                            })),
                     )
                     // Right panel: detail + resize handle + commit input
                     .child({
@@ -1625,7 +1747,7 @@ impl Render for Workspace {
                                     ),
                             )
                             // Resize handle between detail and commit input
-                            .when(!commit_panel_collapsed, |el| {
+                            .when(show_commit_panel && !commit_panel_collapsed, |el| {
                                 el.child(
                                     div()
                                         .id("commit-input-resize-handle")
@@ -1655,13 +1777,15 @@ impl Render for Workspace {
                                         }),
                                 )
                             })
-                            // Commit panel at bottom
-                            .child(
-                                div()
-                                    .h(px(commit_input_height))
-                                    .flex_shrink_0()
-                                    .child(active_tab.commit_panel.clone()),
-                            )
+                            // Hiding the composer during history inspection retains its draft.
+                            .when(show_commit_panel, |el| {
+                                el.child(
+                                    div()
+                                        .h(px(commit_input_height))
+                                        .flex_shrink_0()
+                                        .child(active_tab.commit_panel.clone()),
+                                )
+                            })
                             // Width resize handle on left edge
                             .child(
                                 div()
@@ -2256,6 +2380,7 @@ impl Workspace {
             settings.settings_mut().layout.diff_viewer_height = self.layout.diff_viewer_height;
             settings.settings_mut().layout.commit_input_height = self.layout.commit_input_height;
             settings.settings_mut().layout.graph_hidden = self.layout.graph_hidden;
+            settings.settings_mut().layout.graph_focused = self.layout.graph_focused;
             if let Err(e) = settings.save() {
                 log::error!("Failed to save layout: {}", e);
             }
@@ -3087,6 +3212,23 @@ mod terminal_args_cross_platform_tests {
 #[cfg(test)]
 mod diff_viewer_height_tests {
     use super::*;
+
+    #[test]
+    fn focused_composer_only_accompanies_working_changes_in_details() {
+        assert!(show_commit_composer(true, true, true));
+        assert!(!show_commit_composer(true, false, true));
+        assert!(!show_commit_composer(true, true, false));
+        assert!(!show_commit_composer(true, false, false));
+    }
+
+    #[test]
+    fn classic_layout_keeps_composer_for_every_inspection_context() {
+        for working_changes in [false, true] {
+            for details_active in [false, true] {
+                assert!(show_commit_composer(false, working_changes, details_active));
+            }
+        }
+    }
 
     /// The old fixed 600px ceiling left most of a tall window to the graph.
     #[test]

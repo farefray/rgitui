@@ -252,6 +252,9 @@ pub struct AppSettings {
     pub graph_style: GraphStyle,
     #[serde(default = "default_show_subject_column")]
     pub show_subject_column: bool,
+    /// Show commit hashes in the graph; copy-SHA remains available when hidden.
+    #[serde(default)]
+    pub show_hash_column: bool,
     #[serde(default = "default_author_column_width")]
     pub author_column_width: f32,
     #[serde(default = "default_date_column_width")]
@@ -318,6 +321,10 @@ fn default_font_size() -> u32 {
 }
 
 fn default_show_line_numbers_in_diff() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -398,6 +405,9 @@ pub struct LayoutSettings {
     /// panel. Files written before the option existed load with it off.
     #[serde(default)]
     pub graph_hidden: bool,
+    /// Prefer the graph-focused layout, including for legacy settings.
+    #[serde(default = "default_true")]
+    pub graph_focused: bool,
 }
 
 fn default_sidebar_width() -> f32 {
@@ -421,6 +431,7 @@ impl Default for LayoutSettings {
             diff_viewer_height: default_diff_viewer_height(),
             commit_input_height: default_commit_input_height(),
             graph_hidden: false,
+            graph_focused: true,
         }
     }
 }
@@ -809,6 +820,7 @@ impl Default for AppSettings {
             diff_wrap_lines: false,
             graph_style: GraphStyle::default(),
             show_subject_column: default_show_subject_column(),
+            show_hash_column: false,
             author_column_width: default_author_column_width(),
             date_column_width: default_date_column_width(),
             auto_fetch_interval: AutoFetchInterval::default(),
@@ -1829,6 +1841,7 @@ mod tests {
         )
         .expect("legacy layout parses");
         assert!(!layout.graph_hidden);
+        assert!(layout.graph_focused);
         assert_eq!(layout.diff_viewer_height, 500.0);
     }
 
@@ -1841,6 +1854,34 @@ mod tests {
         let json = serde_json::to_string(&layout).expect("layout serializes");
         let restored: LayoutSettings = serde_json::from_str(&json).expect("layout parses");
         assert_eq!(restored, layout);
+    }
+
+    #[test]
+    fn graph_focused_false_round_trips() {
+        assert!(LayoutSettings::default().graph_focused);
+        let layout = LayoutSettings {
+            graph_focused: false,
+            ..LayoutSettings::default()
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let restored: LayoutSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, layout);
+    }
+
+    #[test]
+    fn hash_column_defaults_hidden_and_round_trips() {
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.show_hash_column);
+        assert!(!AppSettings::default().show_hash_column);
+        for visible in [false, true] {
+            let settings = AppSettings {
+                show_hash_column: visible,
+                ..AppSettings::default()
+            };
+            let restored: AppSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.show_hash_column, visible);
+        }
     }
 
     // ── AI provider catalogue coherence ───────────────────────────

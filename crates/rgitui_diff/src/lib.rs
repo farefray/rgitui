@@ -1,5 +1,8 @@
 #[cfg(feature = "perf")]
 mod heap_size;
+mod readability;
+
+use readability::{composite, tint, CodeTypography, DiffSurfaces, InkCache, WORD_ALPHA};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -827,8 +830,9 @@ pub struct DiffViewer {
     partial_mode: bool,
     selection_anchor: Option<usize>,
     mouse_selecting: bool,
-    /// Tracks the current theme appearance to drive syntax highlighting.
-    current_appearance: Appearance,
+    /// Layout measurements must be invalidated when code font/size/density changes.
+    code_typography: Option<CodeTypography>,
+    max_line_number: std::cell::Cell<Option<usize>>,
     /// Top item index to restore after a display mode switch.
     pending_scroll_top: Option<usize>,
     /// True while a diff is being fetched in the background. Drives the loading
@@ -886,6 +890,8 @@ impl DiffViewer {
             this.rehighlight(cx);
         })
         .detach();
+        cx.observe_global::<rgitui_settings::SettingsState>(|_, cx| cx.notify())
+            .detach();
 
         Self {
             diff: None,
@@ -906,7 +912,8 @@ impl DiffViewer {
             partial_mode: false,
             selection_anchor: None,
             mouse_selecting: false,
-            current_appearance: Appearance::Dark,
+            code_typography: None,
+            max_line_number: std::cell::Cell::new(None),
             pending_scroll_top: None,
             loading: false,
             error: None,
@@ -917,16 +924,13 @@ impl DiffViewer {
         }
     }
 
-    /// Re-compute syntax-highlighted display rows when the theme appearance changes.
+    /// Word fills are theme-dependent even when the syntect appearance is not.
+    /// Invalidate on every theme notification, including custom-theme replacement
+    /// with the same name and appearance, and reject old in-flight preparation.
     fn rehighlight(&mut self, cx: &mut Context<Self>) {
-        log::debug!("DiffViewer::rehighlight: appearance changed");
+        log::debug!("DiffViewer::rehighlight: theme changed");
         let appearance = cx.theme().appearance;
-        if appearance == self.current_appearance {
-            return;
-        }
-        // Clear the display cache since the appearance changed.
         self.display_cache.clear();
-        self.current_appearance = appearance;
         // Three-way rows are plain text and theme-independent. In particular,
         // do not invalidate an in-flight three-way preparation, which would
         // otherwise leave its loading state waiting for a discarded result.
@@ -935,21 +939,7 @@ impl DiffViewer {
             return;
         }
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
-        let colors = cx.colors();
-        let added_word_bg = HighlightStyle {
-            background_color: Some(gpui::Hsla {
-                a: 0.25,
-                ..colors.vc_added
-            }),
-            ..Default::default()
-        };
-        let deleted_word_bg = HighlightStyle {
-            background_color: Some(gpui::Hsla {
-                a: 0.25,
-                ..colors.vc_deleted
-            }),
-            ..Default::default()
-        };
+        let (added_word_bg, deleted_word_bg) = Self::word_highlights(cx);
         if let (Some(diff), Some(path)) = (self.diff.clone(), self.file_path.clone()) {
             let cache_key = DisplayCacheKey::new(
                 path.clone(),
@@ -968,6 +958,20 @@ impl DiffViewer {
             );
         }
         cx.notify();
+    }
+
+    fn word_highlights(cx: &App) -> (HighlightStyle, HighlightStyle) {
+        let highlight = |color: gpui::Hsla| HighlightStyle {
+            background_color: Some(gpui::Hsla {
+                a: color.a * WORD_ALPHA,
+                ..color
+            }),
+            ..Default::default()
+        };
+        (
+            highlight(cx.colors().vc_added),
+            highlight(cx.colors().vc_deleted),
+        )
     }
 
     fn spawn_display_preparation(
@@ -1060,7 +1064,6 @@ impl DiffViewer {
         let diff = Arc::new(diff);
         let cache_key = DisplayCacheKey::new(path.clone(), is_dark, source.clone(), &diff);
 
-        self.current_appearance = appearance;
         self.diff = Some(Arc::clone(&diff));
         self.file_path = Some(path.clone());
         self.source = source;
@@ -1090,21 +1093,7 @@ impl DiffViewer {
         }
 
         log::debug!("DiffViewer: display_cache miss for path={}", path);
-        let colors = cx.colors();
-        let added_word_bg = HighlightStyle {
-            background_color: Some(gpui::Hsla {
-                a: 0.25,
-                ..colors.vc_added
-            }),
-            ..Default::default()
-        };
-        let deleted_word_bg = HighlightStyle {
-            background_color: Some(gpui::Hsla {
-                a: 0.25,
-                ..colors.vc_deleted
-            }),
-            ..Default::default()
-        };
+        let (added_word_bg, deleted_word_bg) = Self::word_highlights(cx);
         self.loading = true;
         self.display_rows = Arc::new(Vec::new());
         self.sbs_rows = Arc::new(Vec::new());
@@ -1153,8 +1142,6 @@ impl DiffViewer {
         self.generation = self.generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
-        let appearance = cx.theme().appearance;
-        self.current_appearance = appearance;
         self.diff = None; // No standard FileDiff when showing 3-way
         self.file_path = Some(diff.path.display().to_string());
         // A conflicted file lives in the working tree; the three-way renderer
@@ -1470,6 +1457,54 @@ impl DiffViewer {
         }
     }
 
+    fn max_line_number(&self) -> usize {
+        if let Some(max) = self.max_line_number.get() {
+            return max;
+        }
+        let max = match self.display_mode {
+            DiffDisplayMode::Unified => self
+                .display_rows
+                .iter()
+                .filter_map(|row| match row {
+                    DisplayRow::Line {
+                        old_num, new_num, ..
+                    } => (*old_num).max(*new_num),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1),
+            DiffDisplayMode::SideBySide => self
+                .sbs_rows
+                .iter()
+                .filter_map(|row| match row {
+                    SideBySideRow::Pair {
+                        left_num,
+                        right_num,
+                        ..
+                    } => (*left_num).max(*right_num),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1),
+            DiffDisplayMode::ThreeWay => self
+                .three_way_rows
+                .iter()
+                .filter_map(|row| match row {
+                    ThreeWayRow::Triple {
+                        left_num,
+                        mid_num,
+                        right_num,
+                        ..
+                    } => (*left_num).max(*mid_num).max(*right_num),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1),
+        };
+        self.max_line_number.set(Some(max));
+        max
+    }
+
     fn row_count(&self) -> usize {
         match self.display_mode {
             DiffDisplayMode::Unified => self.display_rows.len(),
@@ -1490,6 +1525,7 @@ impl DiffViewer {
     /// content refresh preserves the user's place. Callers that want a specific
     /// position (`toggle_display_mode`, `scroll_to_line`) set it afterward.
     fn sync_wrap_list_state(&self) {
+        self.max_line_number.set(None);
         let row_count = self.row_count();
         let prev = self.wrap_list_state.logical_scroll_top();
         self.wrap_list_state.reset(row_count);
@@ -2608,9 +2644,9 @@ impl DiffViewer {
         if style.font_style.contains(SyntectFontStyle::BOLD) {
             highlight.font_weight = Some(FontWeight::BOLD);
         }
-        if style.font_style.contains(SyntectFontStyle::ITALIC) {
-            highlight.font_style = Some(FontStyle::Italic);
-        }
+        // Upright comments are easier to scan at code sizes. Do not synthesize
+        // italics for themes whose code font has no matching italic face.
+        highlight.font_style = Some(FontStyle::Normal);
 
         highlight
     }
@@ -2677,7 +2713,8 @@ impl DiffViewer {
     /// Returns the row index of the longest line for the given mode, used to
     /// seed `UniformList::with_width_from_item` so horizontal scroll range
     /// covers the widest line in the diff. Byte length is a good-enough proxy
-    /// for code diffs, which are overwhelmingly ASCII.
+    /// for code diffs, which are overwhelmingly ASCII. Clipped proportional
+    /// hunk headings must not seed the width instead of the scrollable code.
     fn longest_row_ix(
         mode: DiffDisplayMode,
         display_rows: &[DisplayRow],
@@ -2691,7 +2728,7 @@ impl DiffViewer {
                 .map(|(i, row)| {
                     let len = match row {
                         DisplayRow::Line { styled, .. } => styled.text.len(),
-                        DisplayRow::HunkHeader { header, .. } => header.len(),
+                        DisplayRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
                 })
@@ -2708,7 +2745,7 @@ impl DiffViewer {
                             right_styled,
                             ..
                         } => left_styled.text.len().max(right_styled.text.len()),
-                        SideBySideRow::HunkHeader { header, .. } => header.len(),
+                        SideBySideRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
                 })
@@ -2730,7 +2767,7 @@ impl DiffViewer {
                             .len()
                             .max(mid_styled.text.len())
                             .max(right_styled.text.len()),
-                        ThreeWayRow::HunkHeader { header, .. } => header.len(),
+                        ThreeWayRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
                 })
@@ -2743,30 +2780,38 @@ impl DiffViewer {
     fn render_styled_text(
         window: &Window,
         text: &StyledLine,
+        background: gpui::Hsla,
+        typography: &CodeTypography,
+        ink: &InkCache,
         default_color: gpui::Hsla,
-        row_height: f32,
         wrap: bool,
     ) -> gpui::AnyElement {
         // Runs (colors / font) are built from this style. StyledText's layout
         // reads `window.text_style()` — NOT this local — for white_space,
         // line_height, etc., so we also push those onto the ancestor div below.
-        let mut run_style = window.text_style();
-        run_style.color = default_color;
-        run_style.line_height = px(row_height).into();
+        let row_height = typography.line_height;
+        let run_style =
+            typography.run_style(window.text_style(), ink.get(default_color, background));
 
         let styled_text = StyledText::new(text.text.clone());
         // Guard: if text is empty but highlights exist, GPUI panics on
         // StyledText::with_default_highlights (Text: '', run: len: N).
         // This can happen with word-level diff on whitespace-only lines.
-        // Pass highlights as a borrowed-iter (cloned per-element) to skip the
-        // Vec allocation per row per frame.
+        // Correct each run against its actual row + word surface, not the
+        // syntect palette's nominal background. Selection replaces the row fill.
+        let highlights = text.highlights.iter().map(|(range, style)| {
+            (
+                range.clone(),
+                ink.highlight(*style, default_color, background),
+            )
+        });
         let styled = if text.text.is_empty() {
             styled_text
                 .with_default_highlights(&run_style, std::iter::empty())
                 .into_any_element()
         } else {
             styled_text
-                .with_default_highlights(&run_style, text.highlights.iter().cloned())
+                .with_default_highlights(&run_style, highlights)
                 .into_any_element()
         };
 
@@ -2780,6 +2825,8 @@ impl DiffViewer {
             // zed's text.rs storybook example).
             div()
                 .overflow_hidden()
+                .font(typography.font.clone())
+                .text_size(px(typography.size))
                 .line_height(px(row_height))
                 .whitespace_normal()
                 .child(styled)
@@ -2789,6 +2836,8 @@ impl DiffViewer {
             // horizontal scrolling; the StyledText extends to its natural
             // width inside it.
             div()
+                .font(typography.font.clone())
+                .text_size(px(typography.size))
                 .line_height(px(row_height))
                 .whitespace_nowrap()
                 .child(styled)
@@ -3398,6 +3447,13 @@ impl DiffViewer {
     }
 }
 
+/// Accept both separators regardless of the host OS (Git paths normally use /).
+fn path_header_parts(path: &str) -> (&str, &str) {
+    path.rfind(['/', '\\']).map_or(("", path), |separator| {
+        (&path[..=separator], &path[separator + 1..])
+    })
+}
+
 /// Height of one row in the diff viewer's file-operations menu, in pixels.
 const FILE_MENU_ITEM_HEIGHT: f32 = 28.0;
 /// Minimum width of the file-operations menu, in pixels.
@@ -3669,7 +3725,9 @@ impl Render for DiffViewer {
         let display_mode = self.display_mode;
         let view: WeakEntity<DiffViewer> = cx.weak_entity();
 
-        let editor_bg = colors.editor_background;
+        let surfaces = DiffSurfaces::new(colors);
+        let ink = InkCache::default();
+        let editor_bg = surfaces.editor;
         let text_color = colors.text;
         let text_muted = colors.text_muted;
         let text_placeholder_color = colors.text_placeholder;
@@ -3677,37 +3735,17 @@ impl Render for DiffViewer {
         let vc_added = colors.vc_added;
         let vc_deleted = colors.vc_deleted;
         let conflict_color = Color::Conflict.color(cx);
-        let element_bg = colors.element_background;
+        // Hunk chrome should separate sections, not repeat a saturated band.
+        let element_bg = tint(colors.element_background, 0.45, editor_bg);
         let toolbar_bg = colors.toolbar_background;
         let border_focused = colors.border_focused;
 
-        let added_line_bg = gpui::Hsla {
-            a: 0.12,
-            ..vc_added
-        };
-        let deleted_line_bg = gpui::Hsla {
-            a: 0.12,
-            ..vc_deleted
-        };
-
-        let added_gutter_bg = gpui::Hsla {
-            a: 0.20,
-            ..vc_added
-        };
-        let deleted_gutter_bg = gpui::Hsla {
-            a: 0.20,
-            ..vc_deleted
-        };
-
-        let empty_fill_bg = gpui::Hsla {
-            a: 0.04,
-            ..text_color
-        };
-
-        let gutter_bg = gpui::Hsla {
-            a: 0.04,
-            ..text_color
-        };
+        let added_line_bg = surfaces.added;
+        let deleted_line_bg = surfaces.deleted;
+        let added_gutter_bg = surfaces.added_gutter;
+        let deleted_gutter_bg = surfaces.deleted_gutter;
+        let empty_fill_bg = surfaces.gutter;
+        let gutter_bg = surfaces.gutter;
 
         let settings_state = cx.global::<rgitui_settings::SettingsState>();
         let compactness = settings_state.settings().compactness;
@@ -3721,31 +3759,45 @@ impl Render for DiffViewer {
                 self.display_mode,
                 DiffDisplayMode::SideBySide | DiffDisplayMode::ThreeWay
             );
-        let row_height = compactness.spacing(20.0);
+        let typography = CodeTypography::resolve(
+            window,
+            &settings_state.settings().ui_font,
+            settings_state.settings().font_size,
+            compactness,
+        );
+        let row_height = typography.line_height;
+        // Uniform-list headers and code rows must have exactly the same height.
         let hunk_header_height = row_height;
+        if self.code_typography.as_ref() != Some(&typography) {
+            if self.code_typography.is_some() && !wrap_enabled && self.pending_scroll_top.is_none()
+            {
+                self.pending_scroll_top = Some(self.first_visible_row(cx));
+            }
+            self.code_typography = Some(typography.clone());
+            self.sync_wrap_list_state();
+        }
+        let gutter_width = typography.gutter_width(self.max_line_number());
 
         let highlighted_row = self.highlighted_row;
-        let highlight_bg = gpui::Hsla {
-            a: 0.10,
-            ..colors.text_accent
-        };
-        let row_hover_bg = gpui::Hsla {
-            a: 0.04,
-            ..text_color
-        };
-        let selection_bg = gpui::Hsla {
-            a: 0.15,
-            ..colors.text_accent
-        };
+        let highlight_bg = surfaces.active;
+        let selection_bg = surfaces.selected;
         let selected_lines = self.selected_lines.clone();
         let display_longest_row_ix = self.display_longest_row_ix;
 
-        // Restore scroll position after a display mode switch. The deferred scroll is
-        // applied by GPUI's layout pass before the list content is painted, so the
-        // user sees the correct scroll position immediately.
+        // Restore the top row after a mode/metric change, not merely its visibility.
+        // Non-strict reveal can leave this row lower in the viewport when larger
+        // metrics move it down but it still fits inside the visible range.
         if let Some(top_ix) = self.pending_scroll_top.take() {
             let target_ix = top_ix.min(self.row_count().saturating_sub(1));
-            self.scroll_row_into_view(target_ix, ScrollStrategy::Top, cx);
+            if wrap_enabled {
+                self.wrap_list_state.scroll_to(gpui::ListOffset {
+                    item_ix: target_ix,
+                    offset_in_item: px(0.),
+                });
+            } else {
+                self.scroll_handle
+                    .scroll_to_item_strict(target_ix, ScrollStrategy::Top);
+            }
         }
 
         log::debug!(
@@ -3800,11 +3852,9 @@ impl Render for DiffViewer {
                                         .min_w_0()
                                         .overflow_hidden()
                                         .px(px(8.))
-                                        .py(px(4.))
                                         .items_center()
                                         .gap(px(6.))
                                         .bg(hunk_bg)
-                                        .border_t_1()
                                         .border_b_1()
                                         .border_color(border_variant)
                                         .cursor(CursorStyle::IBeam)
@@ -3837,9 +3887,8 @@ impl Render for DiffViewer {
                                         .child(
                                             div()
                                                 .flex_shrink_0()
-                                                .text_xs()
-                                                .font_family("Lilex")
-                                                .text_color(text_muted)
+                                                .text_sm()
+                                                .text_color(ink.get(text_muted, composite(hunk_bg, editor_bg)))
                                                 .child(line_range),
                                         );
 
@@ -3849,14 +3898,10 @@ impl Render for DiffViewer {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .overflow_hidden()
-                                                .text_xs()
-                                                .text_color(text_placeholder_color)
-                                                .italic()
                                                 .child(
                                                     Label::new(ctx_name)
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Placeholder)
-                                                        .italic()
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Custom(ink.get(text_muted, composite(hunk_bg, editor_bg))))
                                                         .truncate(),
                                                 ),
                                         );
@@ -3950,7 +3995,6 @@ impl Render for DiffViewer {
                                             i as u64,
                                         ))
                                         .bg(effective_bg)
-                                        .hover(move |s| s.bg(row_hover_bg))
                                         .cursor(CursorStyle::IBeam)
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -4009,9 +4053,10 @@ impl Render for DiffViewer {
                                             .bg(gutter_accent)
                                             .border_r_1()
                                             .border_color(border_variant)
-                                            .text_xs()
-                                            .font_family("Lilex")
-                                            .text_color(text_muted)
+                                            .font(typography.font.clone())
+                                            .text_size(px(typography.size))
+                                            .line_height(px(row_height))
+                                            .text_color(ink.get(text_muted, gutter_accent))
                                             .pr(px(4.))
                                             .child(val)
                                     };
@@ -4022,10 +4067,10 @@ impl Render for DiffViewer {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_xs()
-                                        .font_family("Lilex")
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(text_col)
+                                        .text_size(px(typography.size))
+                                        .font(typography.font.clone())
+                                        .line_height(px(row_height))
+                                        .text_color(ink.get(text_col, effective_bg))
                                         .child(prefix_str);
 
                                     // Text content. Wrap mode uses a flex child with min_w_0 so
@@ -4039,32 +4084,26 @@ impl Render for DiffViewer {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .pl(px(6.))
-                                            .text_xs()
-                                            .font_family("Lilex")
-                                            .text_color(text_col)
+                                            .pl(px(8.))
                                             .child(Self::render_styled_text(
-                                                window, styled, text_col, row_height, true,
+                                                window, styled, effective_bg, &typography, &ink, text_color, true,
                                             ))
                                             .into_any_element()
                                     } else {
                                         div()
                                             .h_flex()
                                             .h_full()
-                                            .pl(px(6.))
+                                            .pl(px(8.))
                                             .pr(px(12.))
-                                            .text_xs()
-                                            .font_family("Lilex")
-                                            .text_color(text_col)
                                             .child(Self::render_styled_text(
-                                                window, styled, text_col, row_height, false,
+                                                window, styled, effective_bg, &typography, &ink, text_color, false,
                                             ))
                                             .into_any_element()
                                     };
 
                                     row_div
-                                        .child(make_gutter_cell(old_str, 44.))
-                                        .child(make_gutter_cell(new_str, 44.))
+                                        .child(make_gutter_cell(old_str, gutter_width))
+                                        .child(make_gutter_cell(new_str, gutter_width))
                                         .child(prefix_cell)
                                         .child(content_area)
                                         .into_any_element()
@@ -4136,7 +4175,7 @@ impl Render for DiffViewer {
                                     let view_sbs_hunk_drag = view.clone();
                                     let is_sbs_hunk_selected =
                                         selected_lines.as_ref().is_some_and(|r| r.contains(&i));
-                                    let sbs_hunk_bg = if is_sbs_hunk_selected {
+                                    let hunk_bg = if is_sbs_hunk_selected {
                                         selection_bg
                                     } else {
                                         element_bg
@@ -4153,11 +4192,9 @@ impl Render for DiffViewer {
                                         .min_w_0()
                                         .overflow_hidden()
                                         .px(px(8.))
-                                        .py(px(4.))
                                         .items_center()
                                         .gap(px(6.))
-                                        .bg(sbs_hunk_bg)
-                                        .border_t_1()
+                                        .bg(hunk_bg)
                                         .border_b_1()
                                         .border_color(border_variant)
                                         .cursor(CursorStyle::IBeam)
@@ -4190,9 +4227,8 @@ impl Render for DiffViewer {
                                         .child(
                                             div()
                                                 .flex_shrink_0()
-                                                .text_xs()
-                                                .font_family("Lilex")
-                                                .text_color(text_muted)
+                                                .text_sm()
+                                                .text_color(ink.get(text_muted, composite(hunk_bg, editor_bg)))
                                                 .child(line_range),
                                         );
 
@@ -4202,14 +4238,10 @@ impl Render for DiffViewer {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .overflow_hidden()
-                                                .text_xs()
-                                                .text_color(text_placeholder_color)
-                                                .italic()
                                                 .child(
                                                     Label::new(ctx_name)
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Placeholder)
-                                                        .italic()
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Custom(ink.get(text_muted, composite(hunk_bg, editor_bg))))
                                                         .truncate(),
                                                 ),
                                         );
@@ -4327,7 +4359,6 @@ impl Render for DiffViewer {
                                             i as u64,
                                         ))
                                         .w_full()
-                                        .hover(move |s| s.bg(row_hover_bg))
                                         .cursor(CursorStyle::IBeam)
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -4370,7 +4401,7 @@ impl Render for DiffViewer {
                                                        gutter_bg_val: gpui::Hsla|
                                      -> gpui::AnyElement {
                                         let mut g = div()
-                                            .w(px(44.))
+                                            .w(px(gutter_width))
                                             .flex_shrink_0()
                                             .flex()
                                             .items_center()
@@ -4378,9 +4409,10 @@ impl Render for DiffViewer {
                                             .bg(gutter_bg_val)
                                             .border_r_1()
                                             .border_color(border_variant)
-                                            .text_xs()
-                                            .font_family("Lilex")
-                                            .text_color(text_muted)
+                                            .font(typography.font.clone())
+                                            .text_size(px(typography.size))
+                                            .line_height(px(row_height))
+                                            .text_color(ink.get(text_muted, gutter_bg_val))
                                             .pr(px(4.))
                                             .child(num_str);
                                         g = if wrap_enabled {
@@ -4411,15 +4443,15 @@ impl Render for DiffViewer {
                                             let text_div = div()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .pl(px(6.))
-                                                .text_xs()
-                                                .font_family("Lilex")
+                                                .pl(px(8.))
                                                 .text_color(text_col_val)
                                                 .child(Self::render_styled_text(
                                                     window,
                                                     styled,
-                                                    text_col_val,
-                                                    row_height,
+                                                    bg_val,
+                                                    &typography,
+                                                    &ink,
+                                                    text_color,
                                                     true,
                                                 ));
                                             div()
@@ -4446,16 +4478,16 @@ impl Render for DiffViewer {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .h_full()
-                                                .pl(px(6.))
-                                                .text_xs()
-                                                .font_family("Lilex")
+                                                .pl(px(8.))
                                                 .text_color(text_col_val)
                                                 .overflow_x_scroll()
                                                 .child(Self::render_styled_text(
                                                     window,
                                                     styled,
-                                                    text_col_val,
-                                                    row_height,
+                                                    bg_val,
+                                                    &typography,
+                                                    &ink,
+                                                    text_color,
                                                     false,
                                                 ));
                                             div()
@@ -4578,11 +4610,9 @@ impl Render for DiffViewer {
                                         .h(px(hunk_header_height))
                                         .w_full()
                                         .px(px(8.))
-                                        .py(px(4.))
                                         .items_center()
                                         .gap(px(6.))
                                         .bg(header_bg)
-                                        .border_t_1()
                                         .border_b_1()
                                         .border_color(border_variant)
                                         .cursor(CursorStyle::IBeam)
@@ -4614,21 +4644,19 @@ impl Render for DiffViewer {
                                         )
                                         .child(
                                             div()
-                                                .text_xs()
-                                                .font_family("Lilex")
-                                                .text_color(if *resolved {
+                                                .text_sm()
+                                                .text_color(ink.get(if *resolved {
                                                     vc_added
                                                 } else {
                                                     conflict_color
-                                                })
+                                                }, composite(header_bg, editor_bg)))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(header.clone()),
                                         )
                                         .child(
                                             div()
-                                                .text_xs()
-                                                .font_family("Lilex")
-                                                .text_color(text_muted)
+                                                .text_sm()
+                                                .text_color(ink.get(text_muted, composite(header_bg, editor_bg)))
                                                 .ml(px(8.))
                                                 .child(format!("[{}]", context_name)),
                                         )
@@ -4773,13 +4801,8 @@ impl Render for DiffViewer {
                                     let conflict_bg =
                                         |kind: ThreeWayLineKind, base: gpui::Hsla| -> gpui::Hsla {
                                             match kind {
-                                                ThreeWayLineKind::Conflict => {
-                                                    gpui::Hsla { a: 0.2, ..base }
-                                                }
-                                                ThreeWayLineKind::Resolved => gpui::Hsla {
-                                                    a: 0.12,
-                                                    ..vc_added
-                                                },
+                                                ThreeWayLineKind::Conflict => tint(conflict_color, 0.07, base),
+                                                ThreeWayLineKind::Resolved => added_line_bg,
                                                 _ => base,
                                             }
                                         };
@@ -4870,12 +4893,16 @@ impl Render for DiffViewer {
                                                     window: &mut Window|
                                      -> gpui::AnyElement {
                                         let mut num_div = div()
-                                            .w(px(32.))
+                                            .w(px(gutter_width))
                                             .flex_shrink_0()
-                                            .text_xs()
-                                            .font_family("Lilex")
-                                            .text_color(text_muted)
-                                            .justify_end();
+                                            .font(typography.font.clone())
+                                            .text_size(px(typography.size))
+                                            .line_height(px(row_height))
+                                            .text_color(ink.get(text_muted, bg))
+                                            .flex()
+                                            .items_center()
+                                            .justify_end()
+                                            .pr(px(4.));
                                         if wrap_enabled {
                                             num_div = num_div.min_h(px(row_height));
                                         }
@@ -4883,14 +4910,14 @@ impl Render for DiffViewer {
                                             let text_div = div()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .text_xs()
-                                                .font_family("Lilex")
                                                 .text_color(text_col_val)
                                                 .child(Self::render_styled_text(
                                                     window,
                                                     styled,
-                                                    text_col_val,
-                                                    row_height,
+                                                    bg,
+                                                    &typography,
+                                                    &ink,
+                                                    text_color,
                                                     true,
                                                 ));
                                             let mut col = div()
@@ -4924,15 +4951,15 @@ impl Render for DiffViewer {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .h_full()
-                                                .text_xs()
-                                                .font_family("Lilex")
                                                 .text_color(text_col_val)
                                                 .overflow_x_scroll()
                                                 .child(Self::render_styled_text(
                                                     window,
                                                     styled,
-                                                    text_col_val,
-                                                    row_height,
+                                                    bg,
+                                                    &typography,
+                                                    &ink,
+                                                    text_color,
                                                     false,
                                                 ));
                                             let mut col = div()
@@ -5061,7 +5088,7 @@ impl Render for DiffViewer {
                 .map(|diff| diff.conflict_count())
                 .unwrap_or(0);
             let file_icon = Self::icon_for_path(path);
-            let path_str: SharedString = path.clone().into();
+            let (directory, filename) = path_header_parts(path);
             let mode_label = match self.display_mode {
                 DiffDisplayMode::Unified => "Split",
                 DiffDisplayMode::SideBySide => "Unified",
@@ -5085,10 +5112,25 @@ impl Render for DiffViewer {
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new(path_str)
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM)
-                            .truncate(),
+                        div()
+                            .h_flex()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap(px(8.))
+                            .child(
+                                Label::new(SharedString::from(filename.to_string()))
+                                    .size(LabelSize::Small)
+                                    .weight(FontWeight::MEDIUM)
+                                    .truncate(),
+                            )
+                            .when(!directory.is_empty(), |header| header.child(
+                                div().min_w_0().overflow_hidden().child(
+                                    Label::new(SharedString::from(directory.to_string()))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                            )),
                     )
                     .child({
                         // A commit or stash diff has no staged/unstaged state —
@@ -5122,7 +5164,6 @@ impl Render for DiffViewer {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_family("Lilex")
                                     .text_color(vc_added)
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(SharedString::from(format!("+{}", additions))),
@@ -5130,7 +5171,6 @@ impl Render for DiffViewer {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_family("Lilex")
                                     .text_color(vc_deleted)
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(SharedString::from(format!("-{}", deletions))),
@@ -5362,6 +5402,98 @@ impl Render for DiffViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_width_is_seeded_from_code_not_a_clipped_heading() {
+        let rows = vec![
+            DisplayRow::HunkHeader {
+                header: "heading".repeat(100),
+                context_name: String::new(),
+                hunk_index: 0,
+            },
+            DisplayRow::Line {
+                old_num: Some(1),
+                new_num: Some(1),
+                styled: StyledLine::plain("wide code".repeat(40)),
+                kind: DisplayLineKind::Context,
+            },
+        ];
+        assert_eq!(
+            DiffViewer::longest_row_ix(DiffDisplayMode::Unified, &rows, &[], &[]),
+            1
+        );
+    }
+
+    #[test]
+    fn path_header_emphasizes_only_the_filename() {
+        assert_eq!(path_header_parts("README.md"), ("", "README.md"));
+        assert_eq!(
+            path_header_parts("src/nested/main.rs"),
+            ("src/nested/", "main.rs")
+        );
+        assert_eq!(
+            path_header_parts("src\\nested\\main.rs"),
+            ("src\\nested\\", "main.rs")
+        );
+        assert_eq!(path_header_parts("文档/说明.md"), ("文档/", "说明.md"));
+    }
+
+    #[test]
+    fn actual_syntect_comments_and_links_are_readable_on_row_word_and_selection_surfaces() {
+        use readability::MIN_CONTRAST;
+        use rgitui_theme::contrast_ratio;
+        for theme in rgitui_theme::builtin_themes() {
+            let surfaces = DiffSurfaces::new(&theme.colors);
+            let ink = InkCache::default();
+            for (path, text) in [
+                (
+                    "main.rs",
+                    "// A comment with https://example.com and some words",
+                ),
+                ("main.rs", "let value = call(42, \"string\");"),
+                ("README.md", "A [link](https://example.com) and `code`"),
+            ] {
+                let mut highlighter = DiffViewer::syntax_line_highlighter(path, theme.appearance);
+                let line = DiffViewer::highlight_text(text, &mut highlighter);
+                assert!(!line.highlights.is_empty());
+                for bg in [
+                    surfaces.editor,
+                    surfaces.added,
+                    surfaces.deleted,
+                    surfaces.selected,
+                    surfaces.active,
+                ] {
+                    for (_, style) in &line.highlights {
+                        assert_ne!(style.font_style, Some(FontStyle::Italic));
+                        for word in [
+                            None,
+                            Some(theme.colors.vc_added),
+                            Some(theme.colors.vc_deleted),
+                        ] {
+                            let style = HighlightStyle {
+                                background_color: word.map(|color| gpui::Hsla {
+                                    a: color.a * WORD_ALPHA,
+                                    ..color
+                                }),
+                                ..*style
+                            };
+                            let corrected = ink.highlight(style, theme.colors.text, bg);
+                            let surface = corrected.background_color.unwrap_or(bg);
+                            assert!(
+                                contrast_ratio(
+                                    composite(corrected.color.unwrap(), surface),
+                                    surface
+                                ) >= MIN_CONTRAST,
+                                "{} {path}",
+                                theme.name
+                            );
+                            assert_eq!(surface.a, 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn text_conflict_diff(sections: Vec<MergeSection>) -> ThreeWayFileDiff {
         ThreeWayFileDiff {
@@ -6673,6 +6805,71 @@ mod view_tests {
         }
     }
 
+    #[test]
+    fn font_metrics_refresh_without_repreparing_rows_or_losing_selection() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        let (rows, generation) = probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.select_all_lines(cx);
+                (viewer.display_rows.clone(), viewer.preparation_generation)
+            })
+        });
+        probe.update(|_, _, cx| {
+            cx.update_global::<rgitui_settings::SettingsState, _>(|state, _| {
+                let settings = state.settings_mut();
+                settings.font_size = 24;
+                settings.compactness = rgitui_settings::Compactness::Compact;
+                settings.diff_wrap_lines = true;
+            });
+        });
+        probe.draw();
+        probe.read(|probe, cx| {
+            let viewer = probe.viewer.read(cx);
+            let metrics = viewer
+                .code_typography
+                .as_ref()
+                .expect("rendered code metrics");
+            assert_eq!(metrics.size, 24.0);
+            assert!(metrics.line_height > metrics.size);
+            assert_eq!(viewer.selected_lines, Some(0..viewer.row_count()));
+            assert_eq!(viewer.preparation_generation, generation);
+            assert!(std::sync::Arc::ptr_eq(&rows, &viewer.display_rows));
+        });
+    }
+
+    #[test]
+    fn same_appearance_custom_theme_replacement_invalidates_rows_and_in_flight_work() {
+        use rgitui_theme::ActiveTheme;
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        let mut another = one_hunk_diff();
+        another.hunks[0].lines[1] = DiffLine::Addition("    call();".into());
+        show(&mut probe, another, DiffSource::Worktree);
+        let before = probe.read(|probe, cx| {
+            let viewer = probe.viewer.read(cx);
+            assert_eq!(viewer.display_cache.entries.len(), 2);
+            viewer.preparation_generation
+        });
+        probe.update(|_, _, cx| {
+            let mut theme = (**cx.theme()).clone();
+            // Same name AND appearance, as when a custom theme is edited/reloaded.
+            theme.colors.vc_added = rgitui_theme::hex_to_hsla("#56aabb");
+            cx.update_global::<rgitui_theme::ThemeState, _>(|state, _| {
+                state.set_active_theme(std::sync::Arc::new(theme));
+            });
+        });
+        probe.read(|probe, cx| {
+            let viewer = probe.viewer.read(cx);
+            assert!(viewer.preparation_generation > before);
+            assert!(!super::should_apply_prepared(
+                viewer.preparation_generation,
+                before
+            ));
+            assert_eq!(viewer.display_cache.entries.len(), 1);
+        });
+    }
+
     /// Shows `source` in a focused viewer, selects every row so a staging
     /// request would have a target, invokes stage-then-unstage, and returns
     /// whatever staging requests came back.
@@ -7394,6 +7591,104 @@ mod view_tests {
             let viewer = probe.viewer.read(cx);
             (viewer.highlighted_row, viewer.first_visible_row(cx))
         })
+    }
+
+    #[test]
+    fn nonwrap_metric_changes_preserve_the_first_visible_row() {
+        use rgitui_settings::{Compactness, SettingsState};
+
+        // Small increases deliberately keep the old top row visible after the
+        // metrics change: a non-strict Top request then incorrectly does nothing.
+        for (font_size, compactness) in [
+            (16, Compactness::Default),
+            (14, Compactness::Comfortable),
+            (16, Compactness::Comfortable),
+        ] {
+            let mut probe = ViewTest::open(StagingProbe::new);
+            probe.update(|_, _, cx| {
+                cx.update_global::<SettingsState, _>(|state, _| {
+                    let settings = state.settings_mut();
+                    settings.font_size = 14;
+                    settings.compactness = Compactness::Default;
+                    settings.diff_wrap_lines = false;
+                });
+            });
+            show(&mut probe, tall_diff(800), DiffSource::Worktree);
+            probe.draw();
+            probe.simulate_scroll(
+                gpui::point(gpui::px(400.), gpui::px(400.)),
+                gpui::point(gpui::px(0.), gpui::px(-2400.)),
+            );
+            probe.draw();
+            let (_, old_top) = cursor_and_top_row(&probe);
+            assert!(
+                old_top > 50,
+                "the fixture must be well below the first page"
+            );
+
+            probe.update(|_, _, cx| {
+                cx.update_global::<SettingsState, _>(|state, _| {
+                    let settings = state.settings_mut();
+                    settings.font_size = font_size;
+                    settings.compactness = compactness;
+                });
+            });
+            probe.draw();
+            assert_eq!(
+                cursor_and_top_row(&probe),
+                (None, old_top),
+                "font size {font_size}, density {compactness:?} must restore the old top row"
+            );
+            probe.read(|probe, cx| {
+                let viewer = probe.viewer.read(cx);
+                let height = viewer.code_typography.as_ref().unwrap().line_height;
+                let offset = viewer.scroll_handle.0.borrow().base_handle.offset().y;
+                assert!(
+                    (f32::from(offset) + old_top as f32 * height).abs() < 0.01,
+                    "restored row must be at the top edge, not merely visible"
+                );
+            });
+            // The restored position must also survive the next layout pass.
+            probe.draw();
+            assert_eq!(cursor_and_top_row(&probe), (None, old_top));
+        }
+    }
+
+    #[test]
+    fn wrapped_pending_restoration_places_an_already_visible_row_at_the_top() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        probe.update(|_, _, cx| {
+            cx.update_global::<rgitui_settings::SettingsState, _>(|state, _| {
+                state.settings_mut().diff_wrap_lines = true;
+            });
+        });
+        show(&mut probe, tall_diff(800), DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.wrap_list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 100,
+                    offset_in_item: gpui::px(3.),
+                });
+                cx.notify();
+            });
+        });
+        probe.draw();
+        let (_, old_top) = cursor_and_top_row(&probe);
+        assert_eq!(old_top, 100);
+        let target = old_top + 2;
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.pending_scroll_top = Some(target);
+                cx.notify();
+            });
+        });
+        probe.draw();
+        probe.read(|probe, cx| {
+            let offset = probe.viewer.read(cx).wrap_list_state.logical_scroll_top();
+            assert_eq!(offset.item_ix, target);
+            assert_eq!(offset.offset_in_item, gpui::px(0.));
+        });
     }
 
     /// Stepping past the bottom edge used to bring the cursor to the top of the
