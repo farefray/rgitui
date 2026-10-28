@@ -354,12 +354,33 @@ pub struct StoredWorkspace {
     pub repos: Vec<PathBuf>,
     #[serde(default)]
     pub active_repo_index: usize,
+    /// Stable across missing repositories and reordered session entries.
+    #[serde(default)]
+    pub active_repo_path: Option<PathBuf>,
+    /// Selected linked checkout for each repository; absent means its main checkout.
+    #[serde(default)]
+    pub selected_worktrees: BTreeMap<PathBuf, PathBuf>,
     #[serde(default)]
     pub layout: LayoutSettings,
     #[serde(default = "utc_now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "utc_now")]
     pub last_opened_at: DateTime<Utc>,
+}
+
+impl StoredWorkspace {
+    /// Old snapshots only stored an index. Resolve it before filtering missing paths.
+    pub fn selected_repo_path(&self) -> Option<&Path> {
+        self.active_repo_path
+            .as_deref()
+            .or_else(|| self.repos.get(self.active_repo_index).map(PathBuf::as_path))
+    }
+
+    pub fn restored_active_repo_index(&self, opened: &[PathBuf]) -> usize {
+        self.selected_repo_path()
+            .and_then(|selected| opened.iter().position(|path| path == selected))
+            .unwrap_or(0)
+    }
 }
 
 /// Persisted layout dimensions.
@@ -949,6 +970,8 @@ impl SettingsState {
         active_repo_index: usize,
         layout: LayoutSettings,
     ) -> Option<String> {
+        // Resolve selection before deduplication changes positional indices.
+        let selected = repos.get(active_repo_index).cloned();
         let repos = dedup_paths(repos);
         if repos.is_empty() {
             self.clear_active_workspace();
@@ -965,11 +988,18 @@ impl SettingsState {
                     .position(|ws| ws.repos == repos)
             });
 
-        let active_repo_index = active_repo_index.min(repos.len().saturating_sub(1));
+        let active_repo_index = selected
+            .as_ref()
+            .and_then(|selected| repos.iter().position(|path| path == selected))
+            .unwrap_or_else(|| active_repo_index.min(repos.len().saturating_sub(1)));
         let id = if let Some(index) = existing_index {
             let workspace = &mut self.settings.workspaces[index];
             workspace.repos = repos.clone();
             workspace.active_repo_index = active_repo_index;
+            workspace.active_repo_path = repos.get(active_repo_index).cloned();
+            workspace
+                .selected_worktrees
+                .retain(|repo, _| repos.contains(repo));
             workspace.layout = layout.clone();
             workspace.last_opened_at = now;
             workspace.id.clone()
@@ -979,6 +1009,8 @@ impl SettingsState {
                 name: workspace_name_from_repos(&repos),
                 repos: repos.clone(),
                 active_repo_index,
+                active_repo_path: repos.get(active_repo_index).cloned(),
+                selected_worktrees: BTreeMap::new(),
                 layout,
                 created_at: now,
                 last_opened_at: now,
@@ -1020,6 +1052,8 @@ impl SettingsState {
                 name: workspace_name_from_repos(&self.settings.last_workspace),
                 repos: self.settings.last_workspace.clone(),
                 active_repo_index: 0,
+                active_repo_path: self.settings.last_workspace.first().cloned(),
+                selected_worktrees: BTreeMap::new(),
                 layout: self.settings.layout.clone(),
                 created_at: now,
                 last_opened_at: now,
@@ -2046,6 +2080,84 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_dedup_preserves_selected_identity() {
+        for (active, expected) in [(1, "/a"), (2, "/b")] {
+            let mut state = test_settings_state();
+            let id = state
+                .save_workspace_snapshot(
+                    None,
+                    vec!["/a".into(), "/a".into(), "/b".into()],
+                    active,
+                    LayoutSettings::default(),
+                )
+                .unwrap();
+            let snapshot = state
+                .settings
+                .workspaces
+                .iter()
+                .find(|ws| ws.id == id)
+                .unwrap();
+            assert_eq!(
+                snapshot.repos,
+                vec![PathBuf::from("/a"), PathBuf::from("/b")]
+            );
+            assert_eq!(snapshot.selected_repo_path(), Some(Path::new(expected)));
+            assert_eq!(
+                snapshot.repos[snapshot.active_repo_index],
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_session_selection_survives_missing_paths() {
+        let snapshot: StoredWorkspace = serde_json::from_str(
+            r#"{"id":"legacy","name":"Legacy","repos":["/missing","/a","/b"],"active_repo_index":1}"#,
+        ).unwrap();
+        assert!(snapshot.selected_worktrees.is_empty());
+        assert_eq!(snapshot.selected_repo_path(), Some(Path::new("/a")));
+        assert_eq!(
+            snapshot.restored_active_repo_index(&["/a".into(), "/b".into()]),
+            0
+        );
+        assert_eq!(snapshot.restored_active_repo_index(&["/b".into()]), 0);
+    }
+
+    #[test]
+    fn session_paths_and_worktrees_round_trip() {
+        let mut state = test_settings_state();
+        let id = state
+            .save_workspace_snapshot(
+                None,
+                vec!["/a".into(), "/b".into()],
+                1,
+                LayoutSettings::default(),
+            )
+            .unwrap();
+        let snapshot = state
+            .settings
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.id == id)
+            .unwrap();
+        snapshot
+            .selected_worktrees
+            .insert("/b".into(), "/b-feature".into());
+        // Path identity takes precedence over an outdated positional index.
+        snapshot.active_repo_index = 0;
+        let decoded: StoredWorkspace =
+            serde_json::from_str(&serde_json::to_string(snapshot).unwrap()).unwrap();
+        assert_eq!(
+            decoded.restored_active_repo_index(&["/a".into(), "/b".into()]),
+            1
+        );
+        assert_eq!(
+            decoded.selected_worktrees.get(Path::new("/b")),
+            Some(&PathBuf::from("/b-feature"))
+        );
+    }
+
+    #[test]
     fn recent_workspaces_are_sorted_newest_first() {
         let mut state = test_settings_state();
         let now = Utc::now();
@@ -2055,6 +2167,8 @@ mod tests {
                 name: "Older".into(),
                 repos: vec![PathBuf::from("/tmp/older")],
                 active_repo_index: 0,
+                active_repo_path: None,
+                selected_worktrees: BTreeMap::new(),
                 layout: LayoutSettings::default(),
                 created_at: now,
                 last_opened_at: now,
@@ -2064,6 +2178,8 @@ mod tests {
                 name: "Newer".into(),
                 repos: vec![PathBuf::from("/tmp/newer")],
                 active_repo_index: 0,
+                active_repo_path: None,
+                selected_worktrees: BTreeMap::new(),
                 layout: LayoutSettings::default(),
                 created_at: now,
                 last_opened_at: now + chrono::TimeDelta::seconds(10),

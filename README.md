@@ -31,7 +31,7 @@
 ## Highlights
 
 - **GPU-accelerated** rendering via [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (Zed's UI framework) — smooth 60 fps, even on large repos
-- **Multi-repo tabs** — open several repositories at once and switch between them
+- **Multi-repo tabs** — scroll through open repositories, search open/recent repos, and switch back to the previous repository
 - **Interactive rebase** — pick, squash, reword, fixup, and drop commits visually
 - **AI commit messages** — optional Google Gemini integration to draft commit messages from your staged diff
 - **Cross-platform** — Windows, Linux (AppImage), and macOS (Intel + Apple Silicon)
@@ -157,6 +157,8 @@ rgitui /path/to/repo
 | `Ctrl+P` | Command palette |
 | `Ctrl+,` | Settings |
 | `Ctrl+O` | Open repository |
+| `Ctrl+Shift+O` | Search open and recent repositories |
+| `` Ctrl+` `` | Switch to the previously used repository |
 | `Ctrl+F` | Search commit graph |
 | `Ctrl+Shift+F` | Global search (`git grep`) |
 | `Ctrl+Shift+G` | Hide / show the commit graph |
@@ -172,6 +174,25 @@ rgitui /path/to/repo
 | `Ctrl+W` | Close tab |
 | `F5` | Refresh |
 | `?` | Shortcuts help |
+
+### Multiple repositories and worktrees
+
+The **Repositories** button and `Ctrl+Shift+O` search open repositories first,
+then recently used repositories. Search by name, path, or selected worktree.
+Tabs scroll horizontally; keyboard activation reveals the selected tab. Hover a
+tab to see its full checkout path. On macOS, the repository search and
+previous-repository shortcuts use Command instead of Ctrl.
+
+Worktrees stay inside their repository's tab. Select one in the sidebar, then use
+**Exit worktree** to return to the main checkout without deleting anything. Commit
+drafts are kept separately for each checkout while its repository tab stays open.
+The next session restores repository order, the active repository, and selected
+worktrees. Closing a tab while a tracked Git operation is running is refused;
+wait for the operation to finish first.
+
+Interactive rebase/squash, bisect, and previous-branch switching are currently
+main-checkout-only. In a linked worktree these actions show a warning instead of
+silently operating on the main checkout; use Git in that worktree's terminal.
 
 ### Navigation
 

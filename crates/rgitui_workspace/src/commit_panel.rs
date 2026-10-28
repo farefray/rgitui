@@ -11,7 +11,47 @@ use rgitui_ui::{
     TextInput, TextInputEvent,
 };
 
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
 const COMMIT_PANEL_HEADER_HEIGHT: f32 = 34.0;
+
+/// In-session storage only. Keys are checkout roots, not the shared git directory.
+struct CheckoutDraftStore<T> {
+    path: Option<PathBuf>,
+    generation: u64,
+    inactive: HashMap<PathBuf, T>,
+}
+
+impl<T> Default for CheckoutDraftStore<T> {
+    fn default() -> Self {
+        Self {
+            path: None,
+            generation: 0,
+            inactive: HashMap::new(),
+        }
+    }
+}
+
+impl<T> CheckoutDraftStore<T> {
+    /// First binding adopts the current draft; rebinding the same path is a no-op.
+    /// Only a real checkout change returns a replacement draft.
+    fn switch(&mut self, path: PathBuf, current: T, empty: impl FnOnce() -> T) -> Option<T> {
+        if self.path.as_ref() == Some(&path) {
+            return None;
+        }
+        // Never reuse a context token, including after an A -> B -> A switch.
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("checkout generation overflow");
+        let previous_path = self.path.replace(path.clone())?;
+        self.inactive.insert(previous_path, current);
+        Some(self.inactive.remove(&path).unwrap_or_else(empty))
+    }
+}
 
 pub(crate) fn commit_panel_height(expanded_height: f32, collapsed: bool) -> f32 {
     if collapsed {
@@ -39,6 +79,9 @@ pub enum CommitPanelEvent {
     CommitRequested {
         message: String,
         amend: bool,
+        /// Captured before clearing the draft or delivering queued events.
+        checkout_path: PathBuf,
+        checkout_generation: u64,
     },
     GenerateAiMessage,
     /// Regenerate, optionally overriding the configured commit style for this
@@ -135,7 +178,22 @@ enum AiState {
     Failed,
 }
 
+/// Keep the actual editors rather than round-tripping through `message` or
+/// `split_message`: raw whitespace, cursor and selection must survive a switch.
+struct CheckoutDraft {
+    summary_editor: Entity<TextInput>,
+    description_editor: Entity<TextInput>,
+    amend: bool,
+    co_authors: Vec<CoAuthor>,
+    adding_co_author: bool,
+    new_author_name: Entity<TextInput>,
+    new_author_email: Entity<TextInput>,
+    ai_state: AiState,
+    ai_undo: Option<PreviousMessage>,
+}
+
 pub struct CommitPanel {
+    checkout_drafts: CheckoutDraftStore<CheckoutDraft>,
     summary_editor: Entity<TextInput>,
     description_editor: Entity<TextInput>,
     amend: bool,
@@ -172,8 +230,8 @@ impl PreviousMessage {
 
 impl EventEmitter<CommitPanelEvent> for CommitPanel {}
 
-impl CommitPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+impl CheckoutDraft {
+    fn new(cx: &mut Context<CommitPanel>) -> Self {
         let summary_editor = cx.new(|cx| {
             let mut ti = TextInput::new(cx);
             ti.set_placeholder_message(key!("commit.summary.placeholder"));
@@ -198,17 +256,13 @@ impl CommitPanel {
 
         cx.subscribe(
             &summary_editor,
-            |this: &mut Self, _, event: &TextInputEvent, cx| {
-                if let TextInputEvent::Submit = event {
+            |this: &mut CommitPanel, editor, event: &TextInputEvent, cx| {
+                // A queued submit from an editor we just hid must not commit
+                // the newly selected checkout's draft.
+                if editor == this.summary_editor && matches!(event, TextInputEvent::Submit) {
                     this.request_commit(cx);
                 }
             },
-        )
-        .detach();
-
-        cx.subscribe(
-            &description_editor,
-            |_this: &mut Self, _, _event: &TextInputEvent, _cx| {},
         )
         .detach();
 
@@ -216,17 +270,103 @@ impl CommitPanel {
             summary_editor,
             description_editor,
             amend: false,
-            staged_count: 0,
             ai_state: AiState::Idle,
             ai_undo: None,
-            regenerate_menu_open: false,
-            focus_handle: cx.focus_handle(),
             co_authors: Vec::new(),
             adding_co_author: false,
             new_author_name,
             new_author_email,
+        }
+    }
+}
+
+impl CommitPanel {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let draft = CheckoutDraft::new(cx);
+        Self {
+            checkout_drafts: CheckoutDraftStore::default(),
+            summary_editor: draft.summary_editor,
+            description_editor: draft.description_editor,
+            amend: draft.amend,
+            staged_count: 0,
+            ai_state: draft.ai_state,
+            ai_undo: draft.ai_undo,
+            regenerate_menu_open: false,
+            focus_handle: cx.focus_handle(),
+            co_authors: draft.co_authors,
+            adding_co_author: draft.adding_co_author,
+            new_author_name: draft.new_author_name,
+            new_author_email: draft.new_author_email,
             collapsed: false,
         }
+    }
+
+    /// The effective checkout root, not the repository's shared git directory.
+    pub fn checkout_path(&self) -> Option<&Path> {
+        self.checkout_drafts.path.as_deref()
+    }
+
+    /// Panel-local checkout context token. Capture this at AI request dispatch
+    /// (before any async diff preparation), alongside the panel and AI sequence.
+    /// Every async start/progress/completion/failure/cancel callback must compare
+    /// it again before calling the existing AI methods. A path comparison alone
+    /// is insufficient when switching away and back to the same checkout.
+    pub fn checkout_generation(&self) -> u64 {
+        self.checkout_drafts.generation
+    }
+
+    /// Select an in-session draft. Returns false only for the already-bound path.
+    /// The first binding retains the existing editors and draft; unseen checkouts
+    /// start empty. Use consistent checkout-root paths: no filesystem work or
+    /// canonicalization is performed here.
+    ///
+    /// The caller must cancel/invalidate the associated external AI generation
+    /// and target when changing checkout, and guard asynchronous callbacks with
+    /// `checkout_generation()`. This method cancels only local generating state
+    /// and unlocks the editors; it deliberately emits no asynchronous cancel
+    /// event that could accidentally cancel a newer request.
+    ///
+    /// Staged count is reset on actual checkout changes and must be refreshed by
+    /// the caller. Collapse/layout stays tab-wide; AI undo and co-author form
+    /// contents belong to the draft. Transient menus close on a switch.
+    pub fn switch_checkout(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        if self.checkout_path() == Some(path.as_path()) {
+            return false;
+        }
+        if self.is_ai_generating() {
+            self.cancel_ai_generation(cx);
+        }
+        self.set_editors_read_only(false, cx);
+        self.regenerate_menu_open = false;
+
+        let current = CheckoutDraft {
+            summary_editor: self.summary_editor.clone(),
+            description_editor: self.description_editor.clone(),
+            amend: self.amend,
+            co_authors: self.co_authors.clone(),
+            adding_co_author: self.adding_co_author,
+            new_author_name: self.new_author_name.clone(),
+            new_author_email: self.new_author_email.clone(),
+            ai_state: self.ai_state.clone(),
+            ai_undo: self.ai_undo.clone(),
+        };
+        if let Some(draft) = self
+            .checkout_drafts
+            .switch(path, current, || CheckoutDraft::new(cx))
+        {
+            self.summary_editor = draft.summary_editor;
+            self.description_editor = draft.description_editor;
+            self.amend = draft.amend;
+            self.co_authors = draft.co_authors;
+            self.adding_co_author = draft.adding_co_author;
+            self.new_author_name = draft.new_author_name;
+            self.new_author_email = draft.new_author_email;
+            self.ai_state = draft.ai_state;
+            self.ai_undo = draft.ai_undo;
+            self.staged_count = 0;
+        }
+        cx.notify();
+        true
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -266,10 +406,16 @@ impl CommitPanel {
         if !self.can_commit(cx) {
             return false;
         }
+        // An unbound panel has no safe destination. Do not clear its draft.
+        let Some(checkout_path) = self.checkout_path().map(Path::to_path_buf) else {
+            return false;
+        };
 
         cx.emit(CommitPanelEvent::CommitRequested {
             message: self.message(cx),
             amend: self.amend,
+            checkout_path,
+            checkout_generation: self.checkout_generation(),
         });
 
         self.summary_editor
@@ -1187,6 +1333,305 @@ impl Render for CommitPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkout_store_first_binding_and_same_path_do_not_replace_draft() {
+        let mut store = CheckoutDraftStore::default();
+        let main = PathBuf::from("repo/main");
+        assert_eq!(store.generation, 0);
+        assert_eq!(
+            store.switch(main.clone(), "existing", || panic!("must adopt draft")),
+            None
+        );
+        let generation = store.generation;
+        assert!(generation > 0);
+        assert_eq!(
+            store.switch(main, "edited", || panic!("must retain draft")),
+            None
+        );
+        assert_eq!(store.generation, generation);
+        assert!(store.inactive.is_empty());
+    }
+
+    #[test]
+    fn checkout_store_round_trip_preserves_exact_text_and_invalidates_old_context() {
+        let mut store = CheckoutDraftStore::default();
+        let main = PathBuf::from("repo/main");
+        let linked = PathBuf::from("repo/linked");
+        let original = ("  résumé  ".to_string(), "\n\n body\r\n\t\n".to_string());
+        assert!(store
+            .switch(main.clone(), original.clone(), Default::default)
+            .is_none());
+        let main_generation = store.generation;
+        let empty = store
+            .switch(linked.clone(), original.clone(), Default::default)
+            .unwrap();
+        assert_eq!(empty, (String::new(), String::new()));
+        let linked_generation = store.generation;
+        assert!(linked_generation > main_generation);
+        let linked_text = (" linked ".to_string(), " \n ".to_string());
+        assert_eq!(
+            store.switch(main.clone(), linked_text.clone(), Default::default),
+            Some(original)
+        );
+        assert!(store.generation > linked_generation);
+        // Coming back to the same path must not resurrect a dispatch token.
+        assert_ne!(store.generation, main_generation);
+        assert!(!store.inactive.contains_key(&main));
+        assert_eq!(
+            store.switch(linked, Default::default(), Default::default),
+            Some(linked_text)
+        );
+        // Clearing/committing the active draft also replaces its saved version.
+        assert_eq!(
+            store.switch(main, Default::default(), Default::default),
+            Some(Default::default())
+        );
+    }
+
+    #[gpui::test]
+    fn checkout_drafts_keep_editors_attribution_amend_and_ai_undo(cx: &mut gpui::TestAppContext) {
+        let panel = cx.new(CommitPanel::new);
+        panel.update(cx, |panel, cx| {
+            let main = PathBuf::from("repo/main");
+            let linked = PathBuf::from("repo/linked");
+            let summary = "  résumé  ";
+            let body = "\n\n body\r\n\t\n";
+            panel
+                .summary_editor
+                .update(cx, |editor, cx| editor.set_text(summary, cx));
+            panel
+                .description_editor
+                .update(cx, |editor, cx| editor.set_text(body, cx));
+            panel.co_authors.push(CoAuthor {
+                name: "Alice".into(),
+                email: "alice@example.com".into(),
+            });
+            panel.amend = true;
+            panel.adding_co_author = true;
+            panel
+                .new_author_name
+                .update(cx, |editor, cx| editor.set_text("  Bob ", cx));
+            panel
+                .new_author_email
+                .update(cx, |editor, cx| editor.set_text(" bob@ ", cx));
+            panel.ai_state = AiState::Completed;
+            panel.ai_undo = Some(PreviousMessage {
+                summary: "before AI".into(),
+                ..Default::default()
+            });
+            panel.regenerate_menu_open = true;
+            panel.collapsed = true;
+            panel.set_staged_count(3, cx);
+            let editors = (
+                panel.summary_editor.clone(),
+                panel.description_editor.clone(),
+                panel.new_author_name.clone(),
+                panel.new_author_email.clone(),
+            );
+
+            assert!(panel.switch_checkout(main.clone(), cx));
+            assert_eq!(panel.checkout_path(), Some(main.as_path()));
+            assert_eq!(panel.summary_editor, editors.0);
+            assert_eq!(panel.summary_editor.read(cx).text(), summary);
+            assert_eq!(panel.staged_count(), 3);
+            assert!(panel.amend);
+            assert!(panel.switch_checkout(linked.clone(), cx));
+            assert_ne!(panel.summary_editor, editors.0);
+            assert!(panel.summary_editor.read(cx).is_empty());
+            assert!(panel.description_editor.read(cx).is_empty());
+            assert!(panel.co_authors.is_empty());
+            assert!(!panel.amend);
+            assert!(!panel.adding_co_author);
+            assert!(panel.ai_undo.is_none());
+            assert_eq!(panel.ai_state, AiState::Idle);
+            assert_eq!(panel.staged_count(), 0);
+            assert!(panel.is_collapsed());
+            panel.set_message("linked draft".into(), cx);
+
+            assert!(panel.switch_checkout(main, cx));
+            assert_eq!(panel.summary_editor, editors.0);
+            assert_eq!(panel.description_editor, editors.1);
+            assert_eq!(panel.new_author_name, editors.2);
+            assert_eq!(panel.new_author_email, editors.3);
+            assert_eq!(panel.summary_editor.read(cx).text(), summary);
+            assert_eq!(panel.description_editor.read(cx).text(), body);
+            assert_eq!(
+                panel.co_authors[0].trailer(),
+                "Co-Authored-By: Alice <alice@example.com>"
+            );
+            assert!(panel.amend);
+            assert!(panel.adding_co_author);
+            assert_eq!(panel.new_author_name.read(cx).text(), "  Bob ");
+            assert_eq!(panel.new_author_email.read(cx).text(), " bob@ ");
+            assert_eq!(panel.ai_state, AiState::Completed);
+            assert_eq!(panel.ai_undo.as_ref().unwrap().summary, "before AI");
+            assert!(!panel.regenerate_menu_open);
+            panel.undo_ai_message(cx);
+            assert_eq!(panel.summary_editor.read(cx).text(), "before AI");
+            assert!(panel.switch_checkout(linked, cx));
+            assert_eq!(panel.summary_editor.read(cx).text(), "linked draft");
+            assert!(panel.ai_undo.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn checkout_switch_does_not_save_a_generating_spinner(cx: &mut gpui::TestAppContext) {
+        let panel = cx.new(CommitPanel::new);
+        panel.update(cx, |panel, cx| {
+            let main = PathBuf::from("repo/main");
+            panel.switch_checkout(main.clone(), cx);
+            panel.set_message("keep me".into(), cx);
+            panel.begin_ai_generation(cx);
+            panel.set_ai_progress(Some("Reading diff".into()), cx);
+            let generation = panel.checkout_generation();
+            assert!(!panel.switch_checkout(main.clone(), cx));
+            assert_eq!(panel.checkout_generation(), generation);
+            assert!(panel.is_ai_generating());
+
+            panel.switch_checkout(PathBuf::from("repo/linked"), cx);
+            assert!(!panel.is_ai_generating());
+            assert_ne!(panel.checkout_generation(), generation);
+            panel.switch_checkout(main, cx);
+            assert_eq!(panel.ai_state, AiState::Idle);
+            assert_eq!(panel.summary_editor.read(cx).text(), "keep me");
+            assert_ne!(panel.checkout_generation(), generation);
+        });
+    }
+
+    #[gpui::test]
+    fn committing_one_checkout_does_not_clear_another_draft(cx: &mut gpui::TestAppContext) {
+        let panel = cx.new(CommitPanel::new);
+        panel.update(cx, |panel, cx| {
+            let main = PathBuf::from("repo/main");
+            let linked = PathBuf::from("repo/linked");
+            panel.switch_checkout(main.clone(), cx);
+            panel.set_message("main draft".into(), cx);
+            panel.switch_checkout(linked.clone(), cx);
+            panel.set_message("linked draft".into(), cx);
+            panel.set_staged_count(1, cx);
+            assert!(panel.request_commit(cx));
+            panel.switch_checkout(main, cx);
+            assert_eq!(panel.summary_editor.read(cx).text(), "main draft");
+            panel.switch_checkout(linked, cx);
+            assert!(panel.summary_editor.read(cx).is_empty());
+            assert!(!panel.amend);
+        });
+    }
+
+    #[gpui::test]
+    fn queued_commit_carries_original_checkout_and_leaves_new_draft_intact(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let panel = cx.new(CommitPanel::new);
+        let received = cx.new(|cx| {
+            cx.subscribe(&panel, |events: &mut Vec<CommitPanelEvent>, _, event, _| {
+                events.push(event.clone())
+            })
+            .detach();
+            Vec::<CommitPanelEvent>::new()
+        });
+        let main = PathBuf::from("repo/main");
+        let linked = PathBuf::from("repo/linked");
+        let generation = panel.update(cx, |panel, cx| {
+            panel.switch_checkout(main.clone(), cx);
+            panel.set_message("original draft".into(), cx);
+            panel.amend = true;
+            panel.set_staged_count(1, cx);
+            let generation = panel.checkout_generation();
+            assert!(panel.request_commit(cx));
+            // The subscriber has not run yet. A checkout change must neither
+            // retarget the issued commit nor clear this new draft on delivery.
+            panel.switch_checkout(linked.clone(), cx);
+            panel.set_message("new checkout draft".into(), cx);
+            generation
+        });
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0],
+                CommitPanelEvent::CommitRequested {
+                    message, amend: true, checkout_path, checkout_generation,
+                } if message == "original draft"
+                    && checkout_path == &main
+                    && *checkout_generation == generation
+            ));
+        });
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.checkout_path(), Some(linked.as_path()));
+            assert_eq!(panel.message(cx), "new checkout draft");
+            panel.switch_checkout(main, cx);
+            assert!(panel.message(cx).is_empty());
+            assert!(!panel.amend);
+            assert_ne!(panel.checkout_generation(), generation);
+            panel.switch_checkout(linked, cx);
+            assert_eq!(panel.message(cx), "new checkout draft");
+        });
+    }
+
+    #[gpui::test]
+    fn draft_editor_subscriptions_submit_once_and_ignore_hidden_editors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let panel = cx.new(CommitPanel::new);
+        let received = cx.new(|cx| {
+            cx.subscribe(&panel, |events: &mut Vec<CommitPanelEvent>, _, event, _| {
+                events.push(event.clone())
+            })
+            .detach();
+            Vec::<CommitPanelEvent>::new()
+        });
+        let main = PathBuf::from("repo/main");
+        let linked = PathBuf::from("repo/linked");
+        panel.update(cx, |panel, cx| {
+            panel.switch_checkout(main.clone(), cx);
+            panel.set_message("main draft".into(), cx);
+            let hidden_editor = panel.summary_editor.clone();
+            panel.switch_checkout(linked.clone(), cx);
+            panel.set_message("linked draft".into(), cx);
+            panel.set_staged_count(1, cx);
+            hidden_editor.update(cx, |_, cx| cx.emit(TextInputEvent::Submit));
+        });
+        received.update(cx, |events, _| assert!(events.is_empty()));
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.message(cx), "linked draft");
+            panel.summary_editor.update(cx, |_, cx| {
+                cx.emit(TextInputEvent::Submit);
+                cx.emit(TextInputEvent::Submit);
+            });
+        });
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], CommitPanelEvent::CommitRequested {
+                message, checkout_path, ..
+            } if message == "linked draft" && checkout_path == &linked));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.switch_checkout(main.clone(), cx);
+            panel.set_staged_count(1, cx);
+            assert_eq!(panel.message(cx), "main draft");
+            panel
+                .summary_editor
+                .update(cx, |_, cx| cx.emit(TextInputEvent::Submit));
+        });
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 2);
+            assert!(matches!(&events[1], CommitPanelEvent::CommitRequested {
+                message, checkout_path, ..
+            } if message == "main draft" && checkout_path == &main));
+        });
+    }
+
+    #[gpui::test]
+    fn unbound_commit_request_preserves_the_draft(cx: &mut gpui::TestAppContext) {
+        let panel = cx.new(CommitPanel::new);
+        panel.update(cx, |panel, cx| {
+            panel.set_message("keep until bound".into(), cx);
+            panel.set_staged_count(1, cx);
+            assert!(!panel.request_commit(cx));
+            assert_eq!(panel.message(cx), "keep until bound");
+        });
+    }
 
     #[test]
     fn collapsed_panel_uses_only_header_height() {

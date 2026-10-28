@@ -29,9 +29,32 @@ use crate::{
 };
 
 use super::{
-    ActiveOperation, AiGenerationTarget, BottomPanelMode, OperationOutput, UndoAction,
-    ViewCacheKey, ViewCaches, Workspace,
+    ActiveOperation, AiGenerationTarget, BottomPanelMode, GitOperationTarget, OperationOutput,
+    RepositoryTarget, UndoAction, ViewCacheKey, ViewCaches, Workspace,
 };
+
+/// User gestures queued by a hidden or closed tab must not act on the new tab.
+fn is_active_project(workspace: &Workspace, project: &Entity<GitProject>) -> bool {
+    workspace
+        .active_project()
+        .is_some_and(|active| active == project)
+}
+
+/// Async tasks may retain panels after close. Updating them would emit new
+/// events into the workspace, so reject those completions explicitly.
+fn diff_target_is_live(
+    workspace: &gpui::WeakEntity<Workspace>,
+    viewer: &Entity<DiffViewer>,
+    cx: &gpui::App,
+) -> bool {
+    workspace.upgrade().is_some_and(|workspace| {
+        workspace
+            .read(cx)
+            .tabs
+            .iter()
+            .any(|tab| tab.diff_viewer == *viewer)
+    })
+}
 
 pub(super) fn build_worktree_graph_infos(
     worktrees: &[rgitui_git::WorktreeInfo],
@@ -170,11 +193,12 @@ fn extract_stash_summary(msg: &str) -> String {
     first_line.to_string()
 }
 
-pub(super) fn update_commit_panel_for_active_worktree(
+fn update_commit_panel_for_tab(
     workspace: &mut Workspace,
+    tab_index: usize,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(tab) = workspace.tabs.get(workspace.active_tab) else {
+    let Some(tab) = workspace.tabs.get(tab_index) else {
         return;
     };
     let staged_count = {
@@ -187,11 +211,12 @@ pub(super) fn update_commit_panel_for_active_worktree(
     });
 }
 
-pub(super) fn update_toolbar_for_active_worktree(
+fn update_toolbar_for_tab(
     workspace: &mut Workspace,
+    tab_index: usize,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(tab) = workspace.tabs.get(workspace.active_tab) else {
+    let Some(tab) = workspace.tabs.get(tab_index) else {
         return;
     };
     let (has_changes, has_stashes, ahead, behind, has_github_token) = {
@@ -235,31 +260,70 @@ pub(super) fn set_inspecting_worktree_for_tab(
     let Some(tab) = workspace.tabs.get_mut(tab_index) else {
         return;
     };
+    let previous_path = tab.effective_repo_path(cx);
     let leaving = inspecting.is_none();
     let watch_path = inspecting.as_ref().map(|worktree| worktree.path.clone());
     tab.inspecting_worktree = inspecting;
+    let next_path = tab.effective_repo_path(cx);
+    if next_path == previous_path {
+        return;
+    }
+    // Search hits, drafts and pending AI requests belong to a checkout.
+    tab.global_search_view
+        .update(cx, |search, cx| search.clear(cx));
+    let commit_panel = tab.commit_panel.clone();
+    commit_panel.update(cx, |panel, cx| {
+        panel.switch_checkout(next_path, cx);
+    });
 
     let project = tab.project.clone();
     let detail_panel = tab.detail_panel.clone();
     let diff_viewer = tab.diff_viewer.clone();
     let graph = tab.graph.clone();
 
-    project.update(cx, |proj, _| proj.set_inspected_worktree(watch_path));
-    if tab_index == workspace.active_tab {
-        update_sidebar_for_active_worktree(workspace, cx);
+    // Do not cancel a generation belonging to a different repository tab.
+    if workspace
+        .operations
+        .ai_target
+        .as_ref()
+        .is_some_and(|target| {
+            target
+                .panel
+                .upgrade()
+                .is_some_and(|panel| panel == commit_panel)
+        })
+    {
+        workspace.operations.ai_target = None;
+        workspace.ai.update(cx, |ai, cx| ai.cancel(cx));
     }
+    if tab_index == workspace.active_tab {
+        workspace.dismiss_checkout_dialogs(cx);
+    }
+    project.update(cx, |proj, _| proj.set_inspected_worktree(watch_path));
+    update_sidebar_for_tab(workspace, tab_index, cx);
     detail_panel.update(cx, |dp, cx| dp.clear(cx));
     diff_viewer.update(cx, |dv, cx| dv.clear(cx));
     if leaving {
         graph.update(cx, |g, cx| g.clear_worktree_selection(cx));
     }
+    workspace.update_command_context(cx);
+    workspace.persist_workspace_snapshot(cx);
+    cx.notify();
 }
 
 pub(super) fn update_sidebar_for_active_worktree(
     workspace: &mut Workspace,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(tab) = workspace.tabs.get(workspace.active_tab) else {
+    update_sidebar_for_tab(workspace, workspace.active_tab, cx);
+}
+
+fn update_sidebar_for_tab(
+    workspace: &mut Workspace,
+    tab_index: usize,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(tab) = workspace.tabs.get(tab_index) else {
         return;
     };
     let (status, selected_path) = {
@@ -270,8 +334,8 @@ pub(super) fn update_sidebar_for_active_worktree(
         sidebar.update_status(status.staged.clone(), status.unstaged.clone(), cx);
         sidebar.set_selected_worktree_by_path(Some(&selected_path), cx);
     });
-    update_commit_panel_for_active_worktree(workspace, cx);
-    update_toolbar_for_active_worktree(workspace, cx);
+    update_commit_panel_for_tab(workspace, tab_index, cx);
+    update_toolbar_for_tab(workspace, tab_index, cx);
 }
 
 pub(super) fn subscribe_interactive_rebase(
@@ -282,6 +346,9 @@ pub(super) fn subscribe_interactive_rebase(
         interactive_rebase,
         |this, _ir, event: &InteractiveRebaseEvent, cx| match event {
             InteractiveRebaseEvent::Execute(entries) => {
+                if !this.require_main_checkout(cx) {
+                    return;
+                }
                 use crate::interactive_rebase::RebaseAction;
 
                 if let Some(tab) = this.tabs.get(this.active_tab) {
@@ -335,13 +402,19 @@ pub(super) fn subscribe_interactive_rebase(
 /// worktree, so a generation that outlived that click matched no tab at all.
 /// The panel handle is therefore captured at dispatch, in
 /// [`register_ai_target`], and matched by sequence.
-fn commit_panel_for(workspace: &Workspace, id: &GenerationId) -> Option<Entity<CommitPanel>> {
-    workspace
-        .operations
-        .ai_target
-        .as_ref()
-        .filter(|target| target.sequence == id.sequence)
-        .and_then(|target| target.panel.upgrade())
+fn commit_panel_for(
+    workspace: &Workspace,
+    id: &GenerationId,
+    cx: &gpui::App,
+) -> Option<Entity<CommitPanel>> {
+    let target = workspace.operations.ai_target.as_ref()?;
+    if target.sequence != id.sequence {
+        return None;
+    }
+    let panel = target.panel.upgrade()?;
+    (panel.read(cx).checkout_generation() == target.checkout_generation
+        && workspace.tabs.iter().any(|tab| tab.commit_panel == panel))
+    .then_some(panel)
 }
 
 /// Forget the captured panel once a generation reaches a terminal event.
@@ -357,85 +430,100 @@ fn clear_ai_target(workspace: &mut Workspace, id: &GenerationId) {
 }
 
 pub(super) fn subscribe_ai(cx: &mut Context<Workspace>, ai: &Entity<AiGenerator>) {
-    cx.subscribe(ai, |this, ai, event: &AiEvent, cx| match event {
-        AiEvent::GenerationStarted(id) => {
-            if let Some(panel) = commit_panel_for(this, id) {
-                panel.update(cx, |cp, cx| cp.begin_ai_generation(cx));
+    cx.subscribe(ai, |this, ai, event: &AiEvent, cx| {
+        match event {
+            AiEvent::GenerationStarted(id)
+            | AiEvent::ToolCallStarted(id, _)
+            | AiEvent::GenerationCompleted(id, _)
+            | AiEvent::GenerationFailed(id, _)
+            | AiEvent::GenerationCancelled(id) => {
+                if commit_panel_for(this, id, cx).is_none() {
+                    clear_ai_target(this, id);
+                    return;
+                }
             }
-            // The status bar alone. A toast here was a third signal for one
-            // event, and it expired at 3s while a tool-calling generation runs
-            // 30s or more.
-            this.set_status_message(Message::verbatim("Generating AI commit message..."), cx);
+            AiEvent::RateLimited { .. } => {}
         }
-        AiEvent::ToolCallStarted(id, description) => {
-            // Routed to the chip as well as the status bar: this text is the
-            // real progress trace ("Reading diff.rs"), and it used to go only
-            // to the least-watched surface in the app.
-            if let Some(panel) = commit_panel_for(this, id) {
-                let description = description.clone();
-                panel.update(cx, |cp, cx| cp.set_ai_progress(Some(description), cx));
+        match event {
+            AiEvent::GenerationStarted(id) => {
+                if let Some(panel) = commit_panel_for(this, id, cx) {
+                    panel.update(cx, |cp, cx| cp.begin_ai_generation(cx));
+                }
+                // The status bar alone. A toast here was a third signal for one
+                // event, and it expired at 3s while a tool-calling generation runs
+                // 30s or more.
+                this.set_status_message(Message::verbatim("Generating AI commit message..."), cx);
             }
-            this.set_status_message(Message::verbatim(format!("AI: {}", description)), cx);
-        }
-        AiEvent::GenerationCompleted(id, message) => {
-            let panel = commit_panel_for(this, id);
-            clear_ai_target(this, id);
-            let Some(panel) = panel else {
-                // The tab closed mid-flight. Nothing to write to, and nothing
-                // to report.
-                return;
-            };
-            let message = message.clone();
-            panel.update(cx, |cp, cx| cp.apply_ai_message(message, cx));
-            this.set_status_message(Message::verbatim("AI commit message ready."), cx);
-        }
-        AiEvent::GenerationFailed(id, error) => {
-            log::error!("AI generation failed: {}", error);
-            if let Some(panel) = commit_panel_for(this, id) {
-                panel.update(cx, |cp, cx| cp.fail_ai_generation(cx));
+            AiEvent::ToolCallStarted(id, description) => {
+                // Routed to the chip as well as the status bar: this text is the
+                // real progress trace ("Reading diff.rs"), and it used to go only
+                // to the least-watched surface in the app.
+                if let Some(panel) = commit_panel_for(this, id, cx) {
+                    let description = description.clone();
+                    panel.update(cx, |cp, cx| cp.set_ai_progress(Some(description), cx));
+                }
+                this.set_status_message(Message::verbatim(format!("AI: {}", description)), cx);
             }
-            clear_ai_target(this, id);
-            this.set_status_message(Message::verbatim(error.clone()), cx);
-            // Sticky, and carrying the fix: an AI failure is almost always a
-            // key or a model choice, both of which live one click away.
-            let workspace = cx.entity().downgrade();
-            this.show_toast_with_action(
-                error.clone(),
-                ToastKind::Error,
-                "Open Settings",
-                move |_event, _window, cx| {
-                    workspace
-                        .update(cx, |this, cx| this.open_ai_settings(cx))
-                        .ok();
-                },
-                cx,
-            );
-        }
-        AiEvent::GenerationCancelled(id) => {
-            // Back to idle, not to failed: the user asked for this, and a red
-            // "AI failed — retry" control is the wrong answer to it.
-            if let Some(panel) = commit_panel_for(this, id) {
-                panel.update(cx, |cp, cx| cp.cancel_ai_generation(cx));
+            AiEvent::GenerationCompleted(id, message) => {
+                let panel = commit_panel_for(this, id, cx);
+                clear_ai_target(this, id);
+                let Some(panel) = panel else {
+                    // The tab closed mid-flight. Nothing to write to, and nothing
+                    // to report.
+                    return;
+                };
+                let message = message.clone();
+                panel.update(cx, |cp, cx| cp.apply_ai_message(message, cx));
+                this.set_status_message(Message::verbatim("AI commit message ready."), cx);
             }
-            clear_ai_target(this, id);
-            this.set_status_message(Message::verbatim("AI generation cancelled."), cx);
-        }
-        AiEvent::RateLimited { wait } => {
-            // Info, not an error, and deliberately without touching any
-            // panel's spinner: reporting the cooldown as a failure used to
-            // clear the indicator of a request that was still running.
-            let message = format!(
-                "Waiting {}s before the next AI request.",
-                wait.as_secs() + 1
-            );
-            // A refused request that nothing else is covering leaves the user
-            // watching a button they just pressed do nothing: retrying inside
-            // the cooldown clears the "AI failed" marker first, so the status
-            // line was the only sign anything had happened at all.
-            if !ai.read(cx).is_generating() {
-                this.show_toast(message.clone(), ToastKind::Info, cx);
+            AiEvent::GenerationFailed(id, error) => {
+                log::error!("AI generation failed: {}", error);
+                if let Some(panel) = commit_panel_for(this, id, cx) {
+                    panel.update(cx, |cp, cx| cp.fail_ai_generation(cx));
+                }
+                clear_ai_target(this, id);
+                this.set_status_message(Message::verbatim(error.clone()), cx);
+                // Sticky, and carrying the fix: an AI failure is almost always a
+                // key or a model choice, both of which live one click away.
+                let workspace = cx.entity().downgrade();
+                this.show_toast_with_action(
+                    error.clone(),
+                    ToastKind::Error,
+                    "Open Settings",
+                    move |_event, _window, cx| {
+                        workspace
+                            .update(cx, |this, cx| this.open_ai_settings(cx))
+                            .ok();
+                    },
+                    cx,
+                );
             }
-            this.set_status_message(Message::verbatim(message), cx);
+            AiEvent::GenerationCancelled(id) => {
+                // Back to idle, not to failed: the user asked for this, and a red
+                // "AI failed — retry" control is the wrong answer to it.
+                if let Some(panel) = commit_panel_for(this, id, cx) {
+                    panel.update(cx, |cp, cx| cp.cancel_ai_generation(cx));
+                }
+                clear_ai_target(this, id);
+                this.set_status_message(Message::verbatim("AI generation cancelled."), cx);
+            }
+            AiEvent::RateLimited { wait } => {
+                // Info, not an error, and deliberately without touching any
+                // panel's spinner: reporting the cooldown as a failure used to
+                // clear the indicator of a request that was still running.
+                let message = format!(
+                    "Waiting {}s before the next AI request.",
+                    wait.as_secs() + 1
+                );
+                // A refused request that nothing else is covering leaves the user
+                // watching a button they just pressed do nothing: retrying inside
+                // the cooldown clears the "AI failed" marker first, so the status
+                // line was the only sign anything had happened at all.
+                if !ai.read(cx).is_generating() {
+                    this.show_toast(message.clone(), ToastKind::Info, cx);
+                }
+                this.set_status_message(Message::verbatim(message), cx);
+            }
         }
     })
     .detach();
@@ -656,20 +744,32 @@ pub(super) fn subscribe_confirm_dialog(
     cx.subscribe(
         confirm_dialog,
         |this, _cd, event: &ConfirmDialogEvent, cx| match event {
-            ConfirmDialogEvent::Confirmed(action) => {
-                if let Some(tab) = this.tabs.get(this.active_tab) {
+            ConfirmDialogEvent::Confirmed { action, target } => {
+                let target = RepositoryTarget {
+                    project_id: target.project_id,
+                    worktree_path: target.worktree_path.clone(),
+                };
+                let Some(tab_index) = this.resolve_repository_target(&target, cx) else {
+                    this.show_toast(
+                        rgitui_i18n::t!("workspace.safety.target_closed").to_string(),
+                        ToastKind::Warning,
+                        cx,
+                    );
+                    return;
+                };
+                if let Some(tab) = this.tabs.get(tab_index) {
                     let project = tab.project.clone();
+                    let repo_path = project.read(cx).repo_path().to_path_buf();
+                    let worktree_path = target.worktree_path;
                     match action {
                         ConfirmAction::DiscardFile(path) => {
                             let path_buf = std::path::PathBuf::from(path);
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 proj.discard_changes_at(&[path_buf], &worktree_path, cx)
                                     .detach();
                             });
                         }
                         ConfirmAction::ForcePush => {
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 proj.push_default_at(true, &worktree_path, cx).detach();
                             });
@@ -687,9 +787,11 @@ pub(super) fn subscribe_confirm_dialog(
                                 proj.delete_branch(&name, cx).detach();
                             });
                             if let Some(oid_hex) = tip_oid {
-                                this.push_undo(
+                                this.push_undo_for_paths(
                                     msg!("workspace.undo.label.delete_branch", branch = &name),
                                     UndoAction::RecreateBranch { name, oid_hex },
+                                    repo_path.clone(),
+                                    worktree_path.clone(),
                                     cx,
                                 );
                                 this.show_toast(
@@ -706,20 +808,17 @@ pub(super) fn subscribe_confirm_dialog(
                             });
                         }
                         ConfirmAction::DiscardAll => {
-                            // Discard what the user is *looking at*. Reading the
-                            // main checkout's status here meant confirming
-                            // "discard all" while inspecting a worktree stashed
-                            // the main repository's work instead.
-                            let worktree_path = this.effective_worktree_path(cx);
-                            let has_changes = this
-                                .tabs
-                                .get(this.active_tab)
-                                .map(|tab| {
-                                    let (status, _) =
-                                        active_worktree_status(tab, tab.project.read(cx));
-                                    !status.staged.is_empty() || !status.unstaged.is_empty()
-                                })
-                                .unwrap_or(false);
+                            // The dialog's checkout, not whatever is inspected now.
+                            let proj = project.read(cx);
+                            let status = if worktree_path == proj.repo_path() {
+                                Some(proj.status())
+                            } else {
+                                proj.worktree_at(&worktree_path)
+                                    .and_then(|wt| wt.status.as_ref())
+                            };
+                            let has_changes = status.is_some_and(|status| {
+                                !status.staged.is_empty() || !status.unstaged.is_empty()
+                            });
                             if has_changes {
                                 project.update(cx, |proj, cx| {
                                     proj.stash_save_at(
@@ -729,9 +828,11 @@ pub(super) fn subscribe_confirm_dialog(
                                     )
                                     .detach();
                                 });
-                                this.push_undo(
+                                this.push_undo_for_paths(
                                     msg!("workspace.undo.label.discard_all"),
                                     UndoAction::PopStash(0),
+                                    repo_path.clone(),
+                                    worktree_path.clone(),
                                     cx,
                                 );
                                 this.show_toast(
@@ -742,7 +843,6 @@ pub(super) fn subscribe_confirm_dialog(
                             }
                         }
                         ConfirmAction::CleanUntracked => {
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 proj.clean_untracked_at(&worktree_path, cx).detach();
                             });
@@ -759,9 +859,11 @@ pub(super) fn subscribe_confirm_dialog(
                                 proj.delete_tag(&name, cx).detach();
                             });
                             if let Some(oid_hex) = tag_oid {
-                                this.push_undo(
+                                this.push_undo_for_paths(
                                     msg!("workspace.undo.label.delete_tag", tag = &name),
                                     UndoAction::RecreateTag { name, oid_hex },
+                                    repo_path.clone(),
+                                    worktree_path.clone(),
                                     cx,
                                 );
                                 this.show_toast(
@@ -773,7 +875,6 @@ pub(super) fn subscribe_confirm_dialog(
                         }
                         ConfirmAction::ResetHard(target) => {
                             let target = target.clone();
-                            let worktree_path = this.effective_worktree_path(cx);
                             // The graph's first row is the repository-wide log,
                             // which is a different branch's tip whenever the
                             // inspected worktree is on its own branch. Undo has
@@ -791,12 +892,14 @@ pub(super) fn subscribe_confirm_dialog(
                                 }
                             });
                             if let Some(oid_hex) = previous_head_oid {
-                                this.push_undo(
+                                this.push_undo_for_paths(
                                     msg!(
                                         "workspace.undo.label.reset",
                                         commit = &target[..7.min(target.len())]
                                     ),
                                     UndoAction::ResetTo(oid_hex),
+                                    repo_path.clone(),
+                                    worktree_path.clone(),
                                     cx,
                                 );
                                 this.show_toast(
@@ -808,7 +911,6 @@ pub(super) fn subscribe_confirm_dialog(
                         }
                         ConfirmAction::ResetSoft(target) => {
                             let target = target.clone();
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 if let Ok(oid) = git2::Oid::from_str(&target) {
                                     proj.reset_soft_at(oid, &worktree_path, cx).detach();
@@ -817,7 +919,6 @@ pub(super) fn subscribe_confirm_dialog(
                         }
                         ConfirmAction::ResetMixed(target) => {
                             let target = target.clone();
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 if let Ok(oid) = git2::Oid::from_str(&target) {
                                     proj.reset_mixed_at(oid, &worktree_path, cx).detach();
@@ -831,7 +932,6 @@ pub(super) fn subscribe_confirm_dialog(
                             });
                         }
                         ConfirmAction::AbortOperation(_) => {
-                            let worktree_path = this.effective_worktree_path(cx);
                             project.update(cx, |proj, cx| {
                                 proj.abort_operation_at(&worktree_path, cx).detach();
                             });
@@ -840,16 +940,16 @@ pub(super) fn subscribe_confirm_dialog(
                             let path = std::path::PathBuf::from(path.clone());
                             let removing_inspected = this
                                 .tabs
-                                .get(this.active_tab)
+                                .get(tab_index)
                                 .and_then(|tab| tab.inspecting_worktree.as_ref())
                                 .is_some_and(|inspecting| inspecting.path == path);
                             if removing_inspected {
-                                set_inspecting_worktree(this, None, cx);
+                                set_inspecting_worktree_for_tab(this, tab_index, None, cx);
                             }
                             project.update(cx, |proj, cx| {
                                 proj.remove_worktree(path, cx).detach();
                             });
-                            update_sidebar_for_active_worktree(this, cx);
+                            update_sidebar_for_tab(this, tab_index, cx);
                         }
                     }
                 }
@@ -865,10 +965,30 @@ pub(super) fn subscribe_repo_opener(cx: &mut Context<Workspace>, repo_opener: &E
         repo_opener,
         |this, _ro, event: &RepoOpenerEvent, cx| match event {
             RepoOpenerEvent::OpenRepo(path) => {
-                if let Err(e) = this.open_repo(path.clone(), cx) {
+                let path = rgitui_git::normalize_repo_path(path.clone());
+                // Selecting an open repository is navigation, not a request to
+                // refresh the entire session. A newly inspected linked checkout
+                // still needs its own project's snapshot refreshed.
+                let refresh_selected = this
+                    .tabs
+                    .iter()
+                    .find_map(|tab| {
+                        let project = tab.project.read(cx);
+                        if project.repo_path() == path {
+                            Some(false)
+                        } else if project.worktree_at(&path).is_some() {
+                            Some(tab.effective_repo_path(cx) != path)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(true);
+                if let Err(e) = this.open_repo(path, cx) {
                     this.show_toast(format!("Failed to open: {}", e), ToastKind::Error, cx);
-                } else {
-                    this.refresh_all_tabs_prioritized(cx);
+                } else if refresh_selected {
+                    if let Some(project) = this.active_project().cloned() {
+                        project.update(cx, |project, cx| project.refresh(cx).detach());
+                    }
                 }
             }
             RepoOpenerEvent::Dismissed => {}
@@ -902,28 +1022,37 @@ pub(super) fn subscribe_shortcuts_help(
 pub(super) fn subscribe_global_search(
     cx: &mut Context<Workspace>,
     global_search: &Entity<GlobalSearchView>,
-) {
+) -> gpui::Subscription {
     // Clone once before subscribe so we can use the owned clone inside the async block.
     let gs_for_async = global_search.clone();
     cx.subscribe(
         global_search,
         move |this, gs, event: &GlobalSearchViewEvent, cx| match event {
             GlobalSearchViewEvent::SearchSubmit { query, generation } => {
-                let Some(project) = this.active_project().cloned() else {
+                let Some(tab) = this.tabs.iter().find(|tab| tab.global_search_view == gs) else {
                     return;
+                };
+                let target = RepositoryTarget {
+                    project_id: tab.project.entity_id(),
+                    worktree_path: tab.effective_repo_path(cx),
                 };
                 gs.update(cx, |g, cx| g.set_loading(true, cx));
                 let gs_clone = gs_for_async.clone();
-                let repo_path = project.read(cx).repo_path().to_path_buf();
+                let repo_path = target.worktree_path.clone();
+                let query = query.clone();
                 let generation = *generation;
-                let task = project.update(cx, |proj, cx| proj.git_grep_async(query.clone(), cx));
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { rgitui_git::git_grep(&repo_path, &query) });
                 cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
                     let result = task.await;
                     this.update(cx, |workspace, cx| {
-                        let same_repo = workspace.active_project().is_some_and(|active| {
-                            active.read(cx).repo_path() == repo_path.as_path()
+                        let origin_is_live = workspace.tabs.iter().any(|tab| {
+                            tab.global_search_view == gs_clone
+                                && target
+                                    .matches(&tab.project.entity_id(), &tab.effective_repo_path(cx))
                         });
-                        if !same_repo {
+                        if !origin_is_live {
                             return;
                         }
                         match result {
@@ -943,18 +1072,14 @@ pub(super) fn subscribe_global_search(
                 // Dismiss search panel
                 gs.update(cx, |g, cx| g.hide(cx));
 
-                // Need an open tab to show the diff in
-                if this.tabs.is_empty() {
+                let Some(tab) = this
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.global_search_view == gs)
+                else {
                     return;
-                }
-
-                // Get repo_path before borrowing this mutably for the tab
-                let repo_path = match this.active_project() {
-                    Some(project) => project.read(cx).repo_path().to_path_buf(),
-                    None => return,
                 };
-
-                let tab = &mut this.tabs[this.active_tab];
+                let repo_path = tab.effective_repo_path(cx);
                 tab.bottom_panel_mode = BottomPanelMode::Diff;
                 cx.notify();
 
@@ -967,7 +1092,7 @@ pub(super) fn subscribe_global_search(
                     dv.set_diff_loading(path.clone(), DiffSource::Worktree, cx)
                 });
 
-                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+                cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                     let path_buf_owned = path_buf;
                     let path_str = path_buf_owned.to_string_lossy().to_string();
                     let result = cx
@@ -977,7 +1102,9 @@ pub(super) fn subscribe_global_search(
                         })
                         .await;
                     cx.update(|cx| {
-                        if dv.read(cx).generation() != request_generation {
+                        if !diff_target_is_live(&workspace, &dv, cx)
+                            || dv.read(cx).generation() != request_generation
+                        {
                             return;
                         }
                         match result {
@@ -1012,7 +1139,11 @@ pub(super) fn subscribe_global_search(
             }
             GlobalSearchViewEvent::Dismissed => {
                 gs.update(cx, |g, cx| g.hide(cx));
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                if let Some(tab) = this
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.global_search_view == gs)
+                {
                     if tab.bottom_panel_mode == BottomPanelMode::GlobalSearch {
                         tab.bottom_panel_mode = BottomPanelMode::Diff;
                     }
@@ -1021,7 +1152,6 @@ pub(super) fn subscribe_global_search(
             }
         },
     )
-    .detach();
 }
 
 // ---- Per-tab subscriptions (called from open_repo) ----
@@ -1040,7 +1170,10 @@ pub(super) struct ProjectSubscriptions<'a> {
     pub diff_prefetch: DiffPrefetchScheduler,
 }
 
-pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscriptions) {
+pub(super) fn subscribe_project(
+    cx: &mut Context<Workspace>,
+    subs: ProjectSubscriptions,
+) -> gpui::Subscription {
     let project = subs.project;
     let graph = subs.graph.clone();
     let sidebar = subs.sidebar.clone();
@@ -1052,14 +1185,18 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
     let has_prewarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     cx.subscribe(project, {
-        move |this, project, event: &GitProjectEvent, cx| match event {
+        move |this, project, event: &GitProjectEvent, cx| {
+            let Some(tab_index) = this.tabs.iter().position(|tab| tab.project == project) else {
+                return; // A task can retain a project after its tab closes.
+            };
+            match event {
             GitProjectEvent::AheadBehindRefreshed => {
                 // `is_head` is the branch the *main* checkout has out. Reading
                 // it here would undo the inspected worktree's own counts every
                 // time this fires — which is after every refresh and every
                 // staging operation, so the toolbar would spend most of its
                 // life labelled with a branch the user is not on.
-                update_toolbar_for_active_worktree(this, cx);
+                update_toolbar_for_tab(this, tab_index, cx);
             }
             GitProjectEvent::WorktreePatchApplied {
                 label,
@@ -1187,7 +1324,7 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     );
                 }
 
-                update_sidebar_for_active_worktree(this, cx);
+                update_sidebar_for_tab(this, tab_index, cx);
 
                 // Refresh diff viewer if currently displaying a working-tree
                 // diff. Commit and stash diffs are immutable (don't refresh)
@@ -1250,7 +1387,7 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     let dv = diff_viewer.clone();
                     let path_str_for_spawn = path_str.clone();
                     let path_str_for_update = path_str.clone();
-                    cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
@@ -1264,7 +1401,8 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                         if let Ok(diff) = result {
                             cx.update(|cx| {
                                 // Bail if a newer selection superseded this refresh.
-                                if dv.read(cx).generation() != viewer_generation {
+                                if !diff_target_is_live(&workspace, &dv, cx)
+                                    || dv.read(cx).generation() != viewer_generation {
                                     return;
                                 }
                                 if diff.hunks.is_empty() {
@@ -1297,9 +1435,13 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     .detach();
                 }
 
-                // Pre-warm diff cache once for the first 30 commits.
-                if has_prewarmed.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    // Already prewarmed — skip on subsequent StatusChanged events
+                // Speculative work must not scale with every restored tab.
+                // Inactive repos still prefetch on selection, but only the visible
+                // repo prewarms its first page on a status refresh.
+                if !is_active_project(this, &project)
+                    || has_prewarmed.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    // Inactive or already prewarmed.
                 } else {
                     let proj = project.read(cx);
                     let prewarm_oids: Vec<git2::Oid> = {
@@ -1321,6 +1463,33 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
             GitProjectEvent::OperationUpdated(update) => {
                 let is_running = update.state == GitOperationState::Running;
                 let operation_id = update.id;
+                let project_id = project.entity_id();
+                let target = GitOperationTarget {
+                    repository: RepositoryTarget {
+                        project_id,
+                        // Missing paths mean a legacy main-checkout operation,
+                        // never the checkout currently being inspected.
+                        worktree_path: update.worktree_path.clone().unwrap_or_else(|| {
+                            project.read(cx).repo_path().to_path_buf()
+                        }),
+                    },
+                    operation_id,
+                };
+                let repo_path = project.read(cx).repo_path().to_path_buf();
+                let origin_label = |summary: &Message| {
+                    if target.repository.worktree_path == repo_path {
+                        msg!("workspace.operation.origin",
+                            repository = repo_path.display().to_string(), summary = summary)
+                    } else {
+                        msg!("workspace.operation.origin_worktree",
+                            repository = repo_path.display().to_string(),
+                            worktree = target.repository.worktree_path.display().to_string(),
+                            summary = summary)
+                    }
+                };
+                let output_label = origin_label(&update.kind.name());
+                let mut update = update.clone();
+                update.summary = origin_label(&update.summary);
                 // Everything kept past this event holds the `Message` and
                 // translates it when drawn; only the toasts, which are gone in
                 // seconds, are translated here.
@@ -1337,33 +1506,37 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     GitOperationState::Running => {
                         this.set_status_message(update.summary.clone(), cx);
                         this.operations.active_git_operation = Some(update.clone());
-                        this.operations.active_operations.push(ActiveOperation {
-                            id: operation_id,
-                            label: update.summary.clone(),
-                            started_at: Instant::now(),
-                        });
+                        this.operations.active_git_operation_target = Some(target.clone());
+                        if !this.operations.active_operations.iter().any(|op| {
+                            target.matches(&op.project_id, op.id)
+                        }) {
+                            this.operations.active_operations.push(ActiveOperation {
+                                project_id,
+                                id: operation_id,
+                                label: update.summary.clone(),
+                                started_at: Instant::now(),
+                            });
+                        }
                         this.show_toast(update.summary.translated(), ToastKind::Info, cx);
                     }
                     GitOperationState::Succeeded => {
                         this.operations
                             .active_operations
-                            .retain(|op| op.id != operation_id);
+                            .retain(|op| !target.matches(&op.project_id, op.id));
                         this.set_status_message(update.summary.clone(), cx);
-                        if this
-                            .operations
-                            .active_git_operation
-                            .as_ref()
-                            .is_some_and(|op| op.id == operation_id)
+                        if this.operations.active_git_operation_target.as_ref()
+                            .is_some_and(|origin| origin.matches(&project_id, operation_id))
                         {
                             this.operations.active_git_operation = None;
+                            this.operations.active_git_operation_target = None;
                         }
-                        if this
-                            .operations
-                            .last_failed_git_operation
-                            .as_ref()
-                            .is_some_and(|op| update.kind.settles(op.kind))
+                        if this.operations.last_failed_git_operation_target.as_ref()
+                            .is_some_and(|origin| origin.repository == target.repository)
+                            && this.operations.last_failed_git_operation.as_ref()
+                                .is_some_and(|op| update.kind.settles(op.kind))
                         {
                             this.operations.last_failed_git_operation = None;
+                            this.operations.last_failed_git_operation_target = None;
                         }
                         if let Some(details) = update
                             .details
@@ -1372,7 +1545,7 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                         {
                             let now = Instant::now();
                             this.operations.last_operation_output = Some(OperationOutput {
-                                operation: update.kind.name(),
+                                operation: output_label.clone(),
                                 output: details.clone(),
                                 is_error: false,
                                 timestamp: now,
@@ -1385,21 +1558,20 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     GitOperationState::Failed => {
                         this.operations
                             .active_operations
-                            .retain(|op| op.id != operation_id);
-                        if this
-                            .operations
-                            .active_git_operation
-                            .as_ref()
-                            .is_some_and(|op| op.id == operation_id)
+                            .retain(|op| !target.matches(&op.project_id, op.id));
+                        if this.operations.active_git_operation_target.as_ref()
+                            .is_some_and(|origin| origin.matches(&project_id, operation_id))
                         {
                             this.operations.active_git_operation = None;
+                            this.operations.active_git_operation_target = None;
                         }
                         this.operations.last_failed_git_operation = Some(update.clone());
+                        this.operations.last_failed_git_operation_target = Some(target.clone());
                         this.set_status_message(failure.clone(), cx);
                         let error_output =
                             update.details.clone().unwrap_or_else(|| failure.clone());
                         this.operations.last_operation_output = Some(OperationOutput {
-                            operation: update.kind.name(),
+                            operation: output_label,
                             output: error_output,
                             is_error: true,
                             timestamp: Instant::now(),
@@ -1415,9 +1587,9 @@ pub(super) fn subscribe_project(cx: &mut Context<Workspace>, subs: ProjectSubscr
                     tb.set_pushing(is_running && update.kind.is_push(), cx);
                 });
             }
+            }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_sidebar(
@@ -1426,7 +1598,7 @@ pub(super) fn subscribe_sidebar(
     sidebar: &Entity<Sidebar>,
     diff_viewer: &Entity<DiffViewer>,
     detail_panel: &Entity<DetailPanel>,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let diff_viewer = diff_viewer.clone();
     let detail_panel_ref = detail_panel.clone();
@@ -1436,401 +1608,407 @@ pub(super) fn subscribe_sidebar(
     let sidebar = sidebar_owned;
 
     cx.subscribe(&sidebar, {
-        move |this, _sidebar, event: &SidebarEvent, cx| match event {
-            SidebarEvent::FileSelected { path, staged } => {
-                log::info!("FileSelected: path={} staged={}", path, staged);
-                let path_buf = std::path::PathBuf::from(path);
-                let p = path.clone();
-                let is_staged = *staged;
-                let repo_path = this.effective_worktree_path(cx);
-                let dv = diff_viewer.clone();
-                let dp = detail_panel_ref.clone();
-                let source = DiffSource::working_tree(is_staged);
-                let request_generation = dv.update(cx, |dv, cx| {
-                    dv.set_diff_loading(p.clone(), source.clone(), cx)
-                });
-                dp.update(cx, |panel, cx| panel.clear(cx));
+        move |this, _sidebar, event: &SidebarEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
+            }
+            match event {
+                SidebarEvent::FileSelected { path, staged } => {
+                    log::info!("FileSelected: path={} staged={}", path, staged);
+                    let path_buf = std::path::PathBuf::from(path);
+                    let p = path.clone();
+                    let is_staged = *staged;
+                    let repo_path = this.effective_worktree_path(cx);
+                    let dv = diff_viewer.clone();
+                    let dp = detail_panel_ref.clone();
+                    let source = DiffSource::working_tree(is_staged);
+                    let request_generation = dv.update(cx, |dv, cx| {
+                        dv.set_diff_loading(p.clone(), source.clone(), cx)
+                    });
+                    dp.update(cx, |panel, cx| panel.clear(cx));
 
-                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            rgitui_git::compute_file_diff(&repo_path, &path_buf, is_staged)
-                        })
-                        .await;
-                    cx.update(|cx| match result {
-                        Ok(diff) => {
+                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                rgitui_git::compute_file_diff(&repo_path, &path_buf, is_staged)
+                            })
+                            .await;
+                        if !cx.update(|cx| diff_target_is_live(&workspace, &dv, cx)) {
+                            return;
+                        }
+                        cx.update(|cx| match result {
+                            Ok(diff) => {
+                                dv.update(cx, |dv, cx| {
+                                    if dv.generation() != request_generation
+                                        || dv.file_path() != Some(p.as_str())
+                                    {
+                                        return;
+                                    }
+                                    dv.set_diff(diff, p, source, cx)
+                                });
+                            }
+                            Err(error) => {
+                                log::error!("Failed to get diff: {}", error);
+                                dv.update(cx, |dv, cx| {
+                                    if dv.generation() == request_generation
+                                        && dv.file_path() == Some(p.as_str())
+                                    {
+                                        dv.set_error(
+                                            format!("Failed to load '{}': {}", p, error),
+                                            cx,
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                SidebarEvent::ConflictFileSelected(path) => {
+                    let path_buf = std::path::PathBuf::from(path);
+                    let path_string = path.clone();
+                    let repo_path = this
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.sidebar == sidebar_ref)
+                        .map(|tab| tab.effective_repo_path(cx))
+                        .unwrap_or_else(|| this.effective_worktree_path(cx));
+                    let dv = diff_viewer.clone();
+                    let dp = detail_panel_ref.clone();
+                    let request_generation = dv.update(cx, |dv, cx| {
+                        dv.set_conflict_loading(path_string.clone(), cx)
+                    });
+                    dp.update(cx, |panel, cx| panel.clear(cx));
+                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                rgitui_git::compute_three_way_conflict_diff(&repo_path, &path_buf)
+                            })
+                            .await;
+                        cx.update(|cx| {
+                            if !diff_target_is_live(&workspace, &dv, cx) {
+                                return;
+                            }
                             dv.update(cx, |dv, cx| {
                                 if dv.generation() != request_generation
-                                    || dv.file_path() != Some(p.as_str())
+                                    || dv.file_path() != Some(path_string.as_str())
                                 {
                                     return;
                                 }
-                                dv.set_diff(diff, p, source, cx)
-                            });
-                        }
-                        Err(error) => {
-                            log::error!("Failed to get diff: {}", error);
-                            dv.update(cx, |dv, cx| {
-                                if dv.generation() == request_generation
-                                    && dv.file_path() == Some(p.as_str())
-                                {
-                                    dv.set_error(format!("Failed to load '{}': {}", p, error), cx);
+                                match result {
+                                    Ok(three_way_diff) => dv.set_three_way_diff(three_way_diff, cx),
+                                    Err(error) => dv.set_error(
+                                        format!("Failed to load '{}': {}", path_string, error),
+                                        cx,
+                                    ),
                                 }
                             });
-                        }
+                        });
+                    })
+                    .detach();
+                }
+                SidebarEvent::StageFile(path) => {
+                    let path_buf = std::path::PathBuf::from(path);
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.stage_files_at(&[path_buf], &worktree_path, cx)
+                            .detach();
                     });
-                })
-                .detach();
-            }
-            SidebarEvent::ConflictFileSelected(path) => {
-                let path_buf = std::path::PathBuf::from(path);
-                let path_string = path.clone();
-                let repo_path = this
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.sidebar == sidebar_ref)
-                    .map(|tab| tab.effective_repo_path(cx))
-                    .unwrap_or_else(|| this.effective_worktree_path(cx));
-                let dv = diff_viewer.clone();
-                let dp = detail_panel_ref.clone();
-                let request_generation = dv.update(cx, |dv, cx| {
-                    dv.set_conflict_loading(path_string.clone(), cx)
-                });
-                dp.update(cx, |panel, cx| panel.clear(cx));
-                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            rgitui_git::compute_three_way_conflict_diff(&repo_path, &path_buf)
-                        })
-                        .await;
-                    cx.update(|cx| {
-                        dv.update(cx, |dv, cx| {
-                            if dv.generation() != request_generation
-                                || dv.file_path() != Some(path_string.as_str())
+                }
+                SidebarEvent::UnstageFile(path) => {
+                    let path_buf = std::path::PathBuf::from(path);
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.unstage_files_at(&[path_buf], &worktree_path, cx)
+                            .detach();
+                    });
+                }
+                SidebarEvent::StageAll => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.stage_all_at(&worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::UnstageAll => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.unstage_all_at(&worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::BranchCheckout(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.checkout_branch_at(&name, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::RemoteFetch(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.fetch_at(&name, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::RemotePull(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.pull_at(&name, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::RemotePush(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.push_at(&name, false, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::RemoteRemove(name) => {
+                    let name = name.clone();
+                    this.show_confirmation(ConfirmAction::RemoveRemote(name), cx);
+                }
+                SidebarEvent::DiscardFile(path) => {
+                    let path = path.clone();
+                    this.show_confirmation(ConfirmAction::DiscardFile(path), cx);
+                }
+                SidebarEvent::StashSelected(index) => {
+                    let idx = *index;
+                    let repo_path = project.read(cx).repo_path().to_path_buf();
+                    let dv = diff_viewer.clone();
+                    let dp = detail_panel_ref.clone();
+                    // Capture stash metadata before spawning so we can build a synthetic CommitInfo
+                    let stash_info = project
+                        .read(cx)
+                        .stashes()
+                        .get(idx)
+                        .map(|s| (s.message.clone(), s.oid));
+                    let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
+                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { rgitui_git::compute_stash_diff(&repo_path, idx) })
+                            .await;
+                        cx.update(|cx| {
+                            if !diff_target_is_live(&workspace, &dv, cx)
+                                || dv.read(cx).generation() != request_generation
                             {
                                 return;
                             }
                             match result {
-                                Ok(three_way_diff) => dv.set_three_way_diff(three_way_diff, cx),
-                                Err(error) => dv.set_error(
-                                    format!("Failed to load '{}': {}", path_string, error),
-                                    cx,
-                                ),
-                            }
-                        });
-                    });
-                })
-                .detach();
-            }
-            SidebarEvent::StageFile(path) => {
-                let path_buf = std::path::PathBuf::from(path);
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.stage_files_at(&[path_buf], &worktree_path, cx)
-                        .detach();
-                });
-            }
-            SidebarEvent::UnstageFile(path) => {
-                let path_buf = std::path::PathBuf::from(path);
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.unstage_files_at(&[path_buf], &worktree_path, cx)
-                        .detach();
-                });
-            }
-            SidebarEvent::StageAll => {
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.stage_all_at(&worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::UnstageAll => {
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.unstage_all_at(&worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::BranchCheckout(name) => {
-                let name = name.clone();
-                project.update(cx, |proj, cx| {
-                    proj.checkout_branch(&name, cx).detach();
-                });
-            }
-            SidebarEvent::RemoteFetch(name) => {
-                let name = name.clone();
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.fetch_at(&name, &worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::RemotePull(name) => {
-                let name = name.clone();
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.pull_at(&name, &worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::RemotePush(name) => {
-                let name = name.clone();
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.push_at(&name, false, &worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::RemoteRemove(name) => {
-                let name = name.clone();
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::RemoveRemote(name), cx);
-                });
-            }
-            SidebarEvent::DiscardFile(path) => {
-                let path = path.clone();
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::DiscardFile(path), cx);
-                });
-            }
-            SidebarEvent::StashSelected(index) => {
-                let idx = *index;
-                let repo_path = project.read(cx).repo_path().to_path_buf();
-                let dv = diff_viewer.clone();
-                let dp = detail_panel_ref.clone();
-                // Capture stash metadata before spawning so we can build a synthetic CommitInfo
-                let stash_info = project
-                    .read(cx)
-                    .stashes()
-                    .get(idx)
-                    .map(|s| (s.message.clone(), s.oid));
-                let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
-                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move { rgitui_git::compute_stash_diff(&repo_path, idx) })
-                        .await;
-                    cx.update(|cx| {
-                        if dv.read(cx).generation() != request_generation {
-                            return;
-                        }
-                        match result {
-                            Ok(commit_diff) => {
-                                // Show first file in diff viewer immediately. A stash is
-                                // an immutable snapshot, so it must carry `Stash`
-                                // provenance — otherwise the viewer treats it as an
-                                // unstaged working-tree diff and the StatusChanged
-                                // refresh above would clobber it. Without the stash's
-                                // identity there is no honest provenance to attach, so
-                                // show nothing rather than something mislabelled; the
-                                // detail panel is cleared below for the same reason.
-                                match (commit_diff.files.first(), stash_info.as_ref()) {
-                                    (Some(first_file), Some((_, oid))) => {
-                                        let path = first_file.path.display().to_string();
-                                        let source = DiffSource::Stash(oid.to_string());
-                                        dv.update(cx, |dv, cx| {
-                                            dv.set_diff(first_file.clone(), path, source, cx)
-                                        });
-                                    }
-                                    (Some(_), None) => {
-                                        log::warn!(
-                                            "stash {} is missing from the cached stash list; \
+                                Ok(commit_diff) => {
+                                    // Show first file in diff viewer immediately. A stash is
+                                    // an immutable snapshot, so it must carry `Stash`
+                                    // provenance — otherwise the viewer treats it as an
+                                    // unstaged working-tree diff and the StatusChanged
+                                    // refresh above would clobber it. Without the stash's
+                                    // identity there is no honest provenance to attach, so
+                                    // show nothing rather than something mislabelled; the
+                                    // detail panel is cleared below for the same reason.
+                                    match (commit_diff.files.first(), stash_info.as_ref()) {
+                                        (Some(first_file), Some((_, oid))) => {
+                                            let path = first_file.path.display().to_string();
+                                            let source = DiffSource::Stash(oid.to_string());
+                                            dv.update(cx, |dv, cx| {
+                                                dv.set_diff(first_file.clone(), path, source, cx)
+                                            });
+                                        }
+                                        (Some(_), None) => {
+                                            log::warn!(
+                                                "stash {} is missing from the cached stash list; \
                                          skipping its diff",
-                                            idx
-                                        );
-                                        dv.update(cx, |dv, cx| dv.clear(cx));
+                                                idx
+                                            );
+                                            dv.update(cx, |dv, cx| dv.clear(cx));
+                                        }
+                                        (None, _) => {
+                                            dv.update(cx, |dv, cx| dv.clear(cx));
+                                        }
                                     }
-                                    (None, _) => {
-                                        dv.update(cx, |dv, cx| dv.clear(cx));
+                                    // Populate detail panel with the full stash file list so users
+                                    // can click any file in the stash to view its diff.
+                                    if let Some((msg, oid)) = stash_info {
+                                        let unknown_sig = Signature {
+                                            name: String::from("stash"),
+                                            email: String::new(),
+                                        };
+                                        // git stash messages are "WIP on <branch>: <sha> <subject>" or
+                                        // "On <branch>: <sha> <subject>". We want just the subject.
+                                        // Strip the WIP/On prefix and the trailing hash+subject.
+                                        let summary = extract_stash_summary(&msg);
+                                        let synthetic = CommitInfo {
+                                            oid,
+                                            short_id: oid.to_string()[..7].to_string(),
+                                            summary,
+                                            message: msg,
+                                            author: unknown_sig.clone(),
+                                            committer: unknown_sig,
+                                            co_authors: vec![],
+                                            time: chrono::Utc::now(),
+                                            parent_oids: vec![],
+                                            refs: vec![],
+                                            is_signed: false,
+                                        };
+                                        dp.update(cx, |dp, cx| {
+                                            dp.set_stash(synthetic, commit_diff, cx)
+                                        });
+                                    } else {
+                                        dp.update(cx, |dp, cx| dp.clear(cx));
                                     }
                                 }
-                                // Populate detail panel with the full stash file list so users
-                                // can click any file in the stash to view its diff.
-                                if let Some((msg, oid)) = stash_info {
-                                    let unknown_sig = Signature {
-                                        name: String::from("stash"),
-                                        email: String::new(),
-                                    };
-                                    // git stash messages are "WIP on <branch>: <sha> <subject>" or
-                                    // "On <branch>: <sha> <subject>". We want just the subject.
-                                    // Strip the WIP/On prefix and the trailing hash+subject.
-                                    let summary = extract_stash_summary(&msg);
-                                    let synthetic = CommitInfo {
-                                        oid,
-                                        short_id: oid.to_string()[..7].to_string(),
-                                        summary,
-                                        message: msg,
-                                        author: unknown_sig.clone(),
-                                        committer: unknown_sig,
-                                        co_authors: vec![],
-                                        time: chrono::Utc::now(),
-                                        parent_oids: vec![],
-                                        refs: vec![],
-                                        is_signed: false,
-                                    };
-                                    dp.update(cx, |dp, cx| {
-                                        dp.set_stash(synthetic, commit_diff, cx)
+                                Err(e) => {
+                                    log::error!("Failed to get stash diff: {}", e);
+                                    dv.update(cx, |dv, cx| {
+                                        dv.set_error(format!("Failed to load stash: {}", e), cx)
                                     });
-                                } else {
-                                    dp.update(cx, |dp, cx| dp.clear(cx));
                                 }
                             }
-                            Err(e) => {
-                                log::error!("Failed to get stash diff: {}", e);
-                                dv.update(cx, |dv, cx| {
-                                    dv.set_error(format!("Failed to load stash: {}", e), cx)
-                                });
-                            }
-                        }
-                    });
-                })
-                .detach();
-            }
-            SidebarEvent::TagSelected(name) => {
-                let proj = project.read(cx);
-                if let Ok(oid) = proj.resolve_tag_to_oid(name) {
-                    if let Some(tab) = this.tabs.get(this.active_tab) {
-                        tab.graph.update(cx, |g, cx| {
-                            g.scroll_to_commit(oid, cx);
                         });
-                    }
-                } else {
-                    log::warn!("Could not resolve tag '{}' to a commit", name);
+                    })
+                    .detach();
                 }
-            }
-            SidebarEvent::WorktreeSelected(index) => {
-                let worktrees = project.read(cx).worktrees().to_vec();
-                if let Some(wt) = worktrees.get(*index) {
-                    let inspecting = (!wt.is_current).then(|| super::InspectingWorktree {
-                        name: wt.name.clone(),
-                        path: wt.path.clone(),
-                    });
-                    set_inspecting_worktree(this, inspecting, cx);
-                    if let Some(oid) = wt.head_oid {
+                SidebarEvent::TagSelected(name) => {
+                    let proj = project.read(cx);
+                    if let Ok(oid) = proj.resolve_tag_to_oid(name) {
                         if let Some(tab) = this.tabs.get(this.active_tab) {
                             tab.graph.update(cx, |g, cx| {
                                 g.scroll_to_commit(oid, cx);
                             });
                         }
-                    }
-                }
-            }
-            SidebarEvent::WorktreeCreate => {
-                let branch = project.read(cx).head_branch().map(|s| s.to_string());
-                this.dialogs.worktree_dialog.update(cx, |wd, cx| {
-                    wd.show_visible(branch, cx);
-                });
-            }
-            SidebarEvent::WorktreeRemove(index) => {
-                let worktrees = project.read(cx).worktrees().to_vec();
-                if let Some(wt) = worktrees.get(*index) {
-                    if wt.is_current {
-                        this.show_toast(
-                            "Cannot remove the current worktree".to_string(),
-                            ToastKind::Error,
-                            cx,
-                        );
                     } else {
-                        let path = wt.path.to_string_lossy().to_string();
-                        this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                            cd.show_visible(ConfirmAction::WorktreeRemove(path), cx);
-                        });
+                        log::warn!("Could not resolve tag '{}' to a commit", name);
                     }
                 }
-            }
-            SidebarEvent::BranchSelected(name) => {
-                let proj = project.read(cx);
-                if let Ok(oid) = proj.resolve_branch_to_oid(name) {
-                    if let Some(tab) = this.tabs.get(this.active_tab) {
-                        tab.graph.update(cx, |g, cx| {
-                            g.scroll_to_commit(oid, cx);
+                SidebarEvent::WorktreeSelected(index) => {
+                    let worktrees = project.read(cx).worktrees().to_vec();
+                    if let Some(wt) = worktrees.get(*index) {
+                        let inspecting = (!wt.is_current).then(|| super::InspectingWorktree {
+                            name: wt.name.clone(),
+                            path: wt.path.clone(),
                         });
+                        set_inspecting_worktree(this, inspecting, cx);
+                        if let Some(oid) = wt.head_oid {
+                            if let Some(tab) = this.tabs.get(this.active_tab) {
+                                tab.graph.update(cx, |g, cx| {
+                                    g.scroll_to_commit(oid, cx);
+                                });
+                            }
+                        }
                     }
-                } else {
-                    log::warn!("Could not resolve branch '{}' to a commit", name);
                 }
-            }
-            SidebarEvent::BranchCopyName(name) => {
-                let name = name.clone();
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
-                this.show_toast(format!("Copied: {}", name), ToastKind::Info, cx);
-            }
-            SidebarEvent::MergeBranch(name) => {
-                let name = name.clone();
-                project.update(cx, |proj, cx| {
-                    proj.merge_branch(&name, cx).detach();
-                });
-            }
-            SidebarEvent::BranchCreate => {
-                this.dialogs.branch_dialog.update(cx, |bd, cx| {
-                    bd.show_visible(None, cx);
-                });
-            }
-            SidebarEvent::BranchDelete(name) => {
-                let name = name.clone();
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::BranchDelete(name), cx);
-                });
-            }
-            SidebarEvent::OpenRepo => {
-                this.overlays.repo_opener.update(cx, |ro, cx| {
-                    ro.toggle_visible(cx);
-                });
-            }
-            SidebarEvent::TagCheckout(name) => {
-                let name = name.clone();
-                project.update(cx, |proj, cx| {
-                    proj.checkout_tag(&name, cx).detach();
-                });
-            }
-            SidebarEvent::TagDelete(name) => {
-                let name = name.clone();
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::TagDelete(name), cx);
-                });
-            }
-            SidebarEvent::StashApply(index) => {
-                let index = *index;
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.stash_apply_at(index, &worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::BranchRename(name) => {
-                let name = name.clone();
-                this.dialogs.rename_dialog.update(cx, |rd, cx| {
-                    rd.show_visible(name, cx);
-                });
-            }
-            SidebarEvent::StashDrop(index) => {
-                let index = *index;
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::StashDrop(index), cx);
-                });
-            }
-            SidebarEvent::StashPop(index) => {
-                let index = *index;
-                let worktree_path = this.effective_worktree_path(cx);
-                project.update(cx, |proj, cx| {
-                    proj.stash_pop_at(index, &worktree_path, cx).detach();
-                });
-            }
-            SidebarEvent::StashBranch(index) => {
-                let index = *index;
-                this.dialogs.stash_branch_dialog.update(cx, |d, cx| {
-                    d.show_visible(index, cx);
-                });
-            }
-            SidebarEvent::ToggleDir(dir_key) => {
-                let (prefix, dir) = dir_key.split_once(':').unwrap_or(("", ""));
-                _sidebar.update(cx, |s, cx| {
-                    s.toggle_dir(prefix, dir, cx);
-                });
-            }
-            SidebarEvent::SetChangeLineStats(enabled) => {
-                this.set_change_line_stats(*enabled, cx);
+                SidebarEvent::WorktreeCreate => {
+                    let branch = project.read(cx).head_branch().map(|s| s.to_string());
+                    this.dialogs.worktree_dialog.update(cx, |wd, cx| {
+                        wd.show_visible(branch, cx);
+                    });
+                }
+                SidebarEvent::WorktreeRemove(index) => {
+                    let worktrees = project.read(cx).worktrees().to_vec();
+                    if let Some(wt) = worktrees.get(*index) {
+                        if wt.is_current {
+                            this.show_toast(
+                                "Cannot remove the current worktree".to_string(),
+                                ToastKind::Error,
+                                cx,
+                            );
+                        } else {
+                            let path = wt.path.to_string_lossy().to_string();
+                            this.show_confirmation(ConfirmAction::WorktreeRemove(path), cx);
+                        }
+                    }
+                }
+                SidebarEvent::BranchSelected(name) => {
+                    let proj = project.read(cx);
+                    if let Ok(oid) = proj.resolve_branch_to_oid(name) {
+                        if let Some(tab) = this.tabs.get(this.active_tab) {
+                            tab.graph.update(cx, |g, cx| {
+                                g.scroll_to_commit(oid, cx);
+                            });
+                        }
+                    } else {
+                        log::warn!("Could not resolve branch '{}' to a commit", name);
+                    }
+                }
+                SidebarEvent::BranchCopyName(name) => {
+                    let name = name.clone();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
+                    this.show_toast(format!("Copied: {}", name), ToastKind::Info, cx);
+                }
+                SidebarEvent::MergeBranch(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.merge_branch_at(&name, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::BranchCreate => {
+                    this.dialogs.branch_dialog.update(cx, |bd, cx| {
+                        bd.show_visible(None, cx);
+                    });
+                }
+                SidebarEvent::BranchDelete(name) => {
+                    let name = name.clone();
+                    this.show_confirmation(ConfirmAction::BranchDelete(name), cx);
+                }
+                SidebarEvent::OpenRepo => {
+                    this.overlays.repo_opener.update(cx, |ro, cx| {
+                        ro.toggle_visible(cx);
+                    });
+                }
+                SidebarEvent::TagCheckout(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.checkout_tag_at(&name, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::TagDelete(name) => {
+                    let name = name.clone();
+                    this.show_confirmation(ConfirmAction::TagDelete(name), cx);
+                }
+                SidebarEvent::StashApply(index) => {
+                    let index = *index;
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.stash_apply_at(index, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::BranchRename(name) => {
+                    let name = name.clone();
+                    this.dialogs.rename_dialog.update(cx, |rd, cx| {
+                        rd.show_visible(name, cx);
+                    });
+                }
+                SidebarEvent::StashDrop(index) => {
+                    let index = *index;
+                    this.show_confirmation(ConfirmAction::StashDrop(index), cx);
+                }
+                SidebarEvent::StashPop(index) => {
+                    let index = *index;
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.stash_pop_at(index, &worktree_path, cx).detach();
+                    });
+                }
+                SidebarEvent::StashBranch(index) => {
+                    let index = *index;
+                    this.dialogs.stash_branch_dialog.update(cx, |d, cx| {
+                        d.show_visible(index, cx);
+                    });
+                }
+                SidebarEvent::ToggleDir(dir_key) => {
+                    let (prefix, dir) = dir_key.split_once(':').unwrap_or(("", ""));
+                    _sidebar.update(cx, |s, cx| {
+                        s.toggle_dir(prefix, dir, cx);
+                    });
+                }
+                SidebarEvent::SetChangeLineStats(enabled) => {
+                    this.set_change_line_stats(*enabled, cx);
+                }
             }
         }
     })
-    .detach();
 }
 
 type CommitDiffCache = LruCache<git2::Oid, Arc<rgitui_git::CommitDiff>>;
@@ -1986,7 +2164,7 @@ pub(super) fn subscribe_graph(
     detail_panel: &Entity<DetailPanel>,
     diff_cache: Arc<Mutex<CommitDiffCache>>,
     diff_prefetch: DiffPrefetchScheduler,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let diff_viewer = diff_viewer.clone();
     let detail_panel_ref = detail_panel.clone();
@@ -1995,6 +2173,9 @@ pub(super) fn subscribe_graph(
 
     cx.subscribe(graph, {
         move |this, _graph, event: &GraphViewEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
+            }
             match event {
                 // Availability of the multi-commit operations follows the graph
                 // selection, so the palette context is refreshed here rather than
@@ -2062,7 +2243,7 @@ pub(super) fn subscribe_graph(
                         // Enrich commit info (is_signed, co_authors) in background
                         if let Some(mut info) = commit_info.clone() {
                             let enrich_path = repo_path.clone();
-                            cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+                            cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                                 let enriched = cx
                                     .background_executor()
                                     .spawn(async move {
@@ -2074,7 +2255,9 @@ pub(super) fn subscribe_graph(
                                     info.co_authors = co_authors;
                                 }
                                 cx.update(|cx| {
-                                    if dv.read(cx).generation() != display_generation {
+                                    if !diff_target_is_live(&workspace, &dv, cx)
+                                        || dv.read(cx).generation() != display_generation
+                                    {
                                         return;
                                     }
                                     dp.update(cx, |dp, cx| dp.set_commit_arc(info, cached, cx));
@@ -2092,7 +2275,7 @@ pub(super) fn subscribe_graph(
                         let enrich_path = repo_path.clone();
                         let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
 
-                        cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+                        cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
                             // Compute diff and enrich commit info in parallel
                             let diff_task = cx.background_executor().spawn(async move {
                                 rgitui_git::compute_commit_diff(&repo_path, commit_oid)
@@ -2104,6 +2287,9 @@ pub(super) fn subscribe_graph(
                             let diff_result = diff_task.await;
                             let enrich_result = enrich_task.await;
 
+                            if !cx.update(|cx| diff_target_is_live(&workspace, &dv, cx)) {
+                                return;
+                            }
                             cx.update(|cx| match diff_result {
                                 Ok(commit_diff) => {
                                     let diff_arc = Arc::new(commit_diff);
@@ -2221,12 +2407,14 @@ pub(super) fn subscribe_graph(
                 }
                 GraphViewEvent::CheckoutCommit(oid) => {
                     let oid = *oid;
+                    let worktree_path = this.effective_worktree_path(cx);
                     project.update(cx, |proj, cx| {
-                        proj.checkout_commit(oid, cx).detach();
+                        proj.checkout_commit_at(oid, &worktree_path, cx).detach();
                     });
                 }
                 GraphViewEvent::CommitActivated(oid) => {
                     let oid = *oid;
+                    let worktree_path = this.effective_worktree_path(cx);
                     let checkout = {
                         let proj = project.read(cx);
                         let refs = proj
@@ -2235,7 +2423,10 @@ pub(super) fn subscribe_graph(
                             .find(|commit| commit.oid == oid)
                             .map(|commit| commit.refs.as_slice())
                             .unwrap_or_default();
-                        rgitui_git::commit_checkout(refs, proj.head_branch())
+                        rgitui_git::commit_checkout(
+                            refs,
+                            proj.head_branch_at(&worktree_path).as_deref(),
+                        )
                     };
                     match checkout {
                         CommitCheckout::AlreadyCheckedOut(branch) => {
@@ -2247,12 +2438,13 @@ pub(super) fn subscribe_graph(
                         }
                         CommitCheckout::Branch(branch) => {
                             project.update(cx, |proj, cx| {
-                                proj.checkout_branch(&branch, cx).detach();
+                                proj.checkout_branch_at(&branch, &worktree_path, cx)
+                                    .detach();
                             });
                         }
                         CommitCheckout::Detached => {
                             project.update(cx, |proj, cx| {
-                                proj.checkout_commit(oid, cx).detach();
+                                proj.checkout_commit_at(oid, &worktree_path, cx).detach();
                             });
                         }
                     }
@@ -2325,11 +2517,12 @@ pub(super) fn subscribe_graph(
                 }
                 GraphViewEvent::ResetToCommit(oid) => {
                     let oid = *oid;
-                    this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                        cd.show_visible(ConfirmAction::ResetHard(oid.to_string()), cx);
-                    });
+                    this.show_confirmation(ConfirmAction::ResetHard(oid.to_string()), cx);
                 }
                 GraphViewEvent::BisectGood(oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
                     let oid = *oid;
                     let state = project.read(cx).repo_state();
                     if !matches!(state, rgitui_git::RepoState::Bisect) {
@@ -2345,6 +2538,9 @@ pub(super) fn subscribe_graph(
                     }
                 }
                 GraphViewEvent::BisectBad(oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
                     let oid = *oid;
                     let state = project.read(cx).repo_state();
                     if !matches!(state, rgitui_git::RepoState::Bisect) {
@@ -2406,6 +2602,9 @@ pub(super) fn subscribe_graph(
                     set_inspecting_worktree(this, inspecting, cx);
                 }
                 GraphViewEvent::InteractiveRebase(target_oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
                     let target = *target_oid;
                     let commits = project.read(cx).recent_commits().to_vec();
 
@@ -2467,7 +2666,6 @@ pub(super) fn subscribe_graph(
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_detail_panel(
@@ -2475,134 +2673,144 @@ pub(super) fn subscribe_detail_panel(
     project: &Entity<GitProject>,
     diff_viewer: &Entity<DiffViewer>,
     detail_panel: &Entity<DetailPanel>,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let diff_viewer = diff_viewer.clone();
     let detail_panel_cloned = detail_panel.clone();
 
     cx.subscribe(detail_panel, {
-        move |this, _dp, event: &DetailPanelEvent, cx| match event {
-            DetailPanelEvent::FileSelected(file_diff, path, source) => {
-                let p = path.clone();
-                let fd = file_diff.clone();
-                let source = source.clone();
-                diff_viewer.update(cx, |dv, cx| {
-                    dv.set_diff(fd, p, source, cx);
-                });
+        move |this, _dp, event: &DetailPanelEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
             }
-            DetailPanelEvent::CopySha(sha) => {
-                let short = &sha[..7.min(sha.len())];
-                this.show_toast(format!("Copied SHA: {}", short), ToastKind::Success, cx);
-            }
-            DetailPanelEvent::CherryPick(sha) => {
-                if let Some(project) = this.active_project().cloned() {
-                    if let Ok(oid) = git2::Oid::from_str(sha) {
-                        // Capture HEAD before cherry-pick for undo support
-                        let worktree_path = this.effective_worktree_path(cx);
-                        let previous_head_oid: Option<String> = project
-                            .read(cx)
-                            .head_oid_at(&worktree_path)
-                            .map(|oid| oid.to_string());
+            match event {
+                DetailPanelEvent::FileSelected(file_diff, path, source) => {
+                    let p = path.clone();
+                    let fd = file_diff.clone();
+                    let source = source.clone();
+                    diff_viewer.update(cx, |dv, cx| {
+                        dv.set_diff(fd, p, source, cx);
+                    });
+                }
+                DetailPanelEvent::CopySha(sha) => {
+                    let short = &sha[..7.min(sha.len())];
+                    this.show_toast(format!("Copied SHA: {}", short), ToastKind::Success, cx);
+                }
+                DetailPanelEvent::CherryPick(sha) => {
+                    if let Some(project) = this.active_project().cloned() {
+                        if let Ok(oid) = git2::Oid::from_str(sha) {
+                            // Capture HEAD before cherry-pick for undo support
+                            let worktree_path = this.effective_worktree_path(cx);
+                            let previous_head_oid: Option<String> = project
+                                .read(cx)
+                                .head_oid_at(&worktree_path)
+                                .map(|oid| oid.to_string());
 
-                        project.update(cx, |proj, cx| {
-                            proj.cherry_pick_at(oid, &worktree_path, cx).detach();
-                        });
+                            project.update(cx, |proj, cx| {
+                                proj.cherry_pick_at(oid, &worktree_path, cx).detach();
+                            });
 
-                        if let Some(oid_hex) = previous_head_oid {
-                            let label = msg!(
-                                "workspace.undo.label.cherry_pick",
-                                commit = &oid_hex[..7.min(oid_hex.len())]
-                            );
-                            this.push_undo(label, UndoAction::ResetTo(oid_hex), cx);
+                            if let Some(oid_hex) = previous_head_oid {
+                                let label = msg!(
+                                    "workspace.undo.label.cherry_pick",
+                                    commit = &oid_hex[..7.min(oid_hex.len())]
+                                );
+                                this.push_undo(label, UndoAction::ResetTo(oid_hex), cx);
+                            }
                         }
                     }
                 }
-            }
-            DetailPanelEvent::NavigatePrevCommit | DetailPanelEvent::NavigateNextCommit => {
-                let is_prev = matches!(event, DetailPanelEvent::NavigatePrevCommit);
-                let proj = project.read(cx);
-                let commits = proj.recent_commits();
-                if commits.is_empty() {
-                    return;
-                }
-                // Get current commit OID from detail panel's displayed commit
-                let Some(current_oid) = detail_panel_cloned.read(cx).commit().map(|c| c.oid) else {
-                    return;
-                };
-                let Some(pos) = commits.iter().position(|c| c.oid == current_oid) else {
-                    return;
-                };
-                let target_pos = if is_prev {
-                    pos.saturating_sub(1) // older = higher index (next older)
-                } else {
-                    pos.saturating_add(1) // newer = lower index (next newer)
-                };
-                if target_pos >= commits.len() || target_pos == pos {
-                    return;
-                }
-                let target_oid = commits[target_pos].oid;
-                let _ = proj;
+                DetailPanelEvent::NavigatePrevCommit | DetailPanelEvent::NavigateNextCommit => {
+                    let is_prev = matches!(event, DetailPanelEvent::NavigatePrevCommit);
+                    let proj = project.read(cx);
+                    let commits = proj.recent_commits();
+                    if commits.is_empty() {
+                        return;
+                    }
+                    // Get current commit OID from detail panel's displayed commit
+                    let Some(current_oid) = detail_panel_cloned.read(cx).commit().map(|c| c.oid)
+                    else {
+                        return;
+                    };
+                    let Some(pos) = commits.iter().position(|c| c.oid == current_oid) else {
+                        return;
+                    };
+                    let target_pos = if is_prev {
+                        pos.saturating_sub(1) // older = higher index (next older)
+                    } else {
+                        pos.saturating_add(1) // newer = lower index (next newer)
+                    };
+                    if target_pos >= commits.len() || target_pos == pos {
+                        return;
+                    }
+                    let target_oid = commits[target_pos].oid;
+                    let _ = proj;
 
-                // Re-fetch commit info and diff for the target
-                let repo_path = project.read(cx).repo_path().to_path_buf();
-                let dv = diff_viewer.clone();
-                let dp = detail_panel_cloned.clone();
-                let project_for_async = project.clone();
-                let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
-                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(
-                            async move { rgitui_git::compute_commit_diff(&repo_path, target_oid) },
-                        )
-                        .await;
-                    cx.update(|cx| {
-                        if dv.read(cx).generation() != request_generation {
-                            return;
-                        }
-                        let commit_info = project_for_async
-                            .read(cx)
-                            .recent_commits()
-                            .iter()
-                            .find(|c| c.oid == target_oid)
-                            .cloned();
-                        match (commit_info, result) {
-                            (Some(info), Ok(commit_diff)) => {
-                                dp.update(cx, |dp, cx| {
-                                    dp.set_commit(info.clone(), commit_diff.clone(), cx)
-                                });
-                                if let Some(first_file) = commit_diff.files.first() {
-                                    let path = first_file.path.display().to_string();
-                                    let oid_str = target_oid.to_string();
+                    // Re-fetch commit info and diff for the target
+                    let repo_path = project.read(cx).repo_path().to_path_buf();
+                    let dv = diff_viewer.clone();
+                    let dp = detail_panel_cloned.clone();
+                    let project_for_async = project.clone();
+                    let request_generation = dv.update(cx, |dv, cx| dv.begin_diff_request(cx));
+                    cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                rgitui_git::compute_commit_diff(&repo_path, target_oid)
+                            })
+                            .await;
+                        cx.update(|cx| {
+                            if !diff_target_is_live(&workspace, &dv, cx)
+                                || dv.read(cx).generation() != request_generation
+                            {
+                                return;
+                            }
+                            let commit_info = project_for_async
+                                .read(cx)
+                                .recent_commits()
+                                .iter()
+                                .find(|c| c.oid == target_oid)
+                                .cloned();
+                            match (commit_info, result) {
+                                (Some(info), Ok(commit_diff)) => {
+                                    dp.update(cx, |dp, cx| {
+                                        dp.set_commit(info.clone(), commit_diff.clone(), cx)
+                                    });
+                                    if let Some(first_file) = commit_diff.files.first() {
+                                        let path = first_file.path.display().to_string();
+                                        let oid_str = target_oid.to_string();
+                                        dv.update(cx, |dv, cx| {
+                                            dv.set_diff(
+                                                first_file.clone(),
+                                                path,
+                                                DiffSource::Commit(oid_str),
+                                                cx,
+                                            )
+                                        });
+                                    } else {
+                                        dv.update(cx, |dv, cx| dv.clear(cx));
+                                    }
+                                }
+                                (_, Err(error)) => {
+                                    log::error!("Failed to get commit diff: {}", error);
                                     dv.update(cx, |dv, cx| {
-                                        dv.set_diff(
-                                            first_file.clone(),
-                                            path,
-                                            DiffSource::Commit(oid_str),
+                                        dv.set_error(
+                                            format!("Failed to load commit: {}", error),
                                             cx,
                                         )
                                     });
-                                } else {
+                                }
+                                (None, Ok(_)) => {
                                     dv.update(cx, |dv, cx| dv.clear(cx));
                                 }
                             }
-                            (_, Err(error)) => {
-                                log::error!("Failed to get commit diff: {}", error);
-                                dv.update(cx, |dv, cx| {
-                                    dv.set_error(format!("Failed to load commit: {}", error), cx)
-                                });
-                            }
-                            (None, Ok(_)) => {
-                                dv.update(cx, |dv, cx| dv.clear(cx));
-                            }
-                        }
-                    });
-                })
-                .detach();
+                        });
+                    })
+                    .detach();
+                }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_diff_viewer(
@@ -2610,12 +2818,15 @@ pub(super) fn subscribe_diff_viewer(
     project: &Entity<GitProject>,
     diff_viewer: &Entity<DiffViewer>,
     caches: ViewCaches,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let diff_viewer_ref = diff_viewer.clone();
 
     cx.subscribe(diff_viewer, {
         move |this, _dv, event: &DiffViewerEvent, cx| {
+            if !this.tabs.iter().any(|tab| tab.project == project) {
+                return;
+            }
             if let DiffViewerEvent::DiffChanged {
                 path,
                 commit_id,
@@ -2652,6 +2863,9 @@ pub(super) fn subscribe_diff_viewer(
                 return;
             }
 
+            if !is_active_project(this, &project) {
+                return;
+            }
             let file_path = diff_viewer_ref
                 .read(cx)
                 .file_path()
@@ -2856,7 +3070,6 @@ pub(super) fn subscribe_diff_viewer(
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_commit_panel(
@@ -2864,56 +3077,82 @@ pub(super) fn subscribe_commit_panel(
     project: &Entity<GitProject>,
     ai: &Entity<AiGenerator>,
     commit_panel: &Entity<CommitPanel>,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let ai = ai.clone();
-    let commit_panel_ref = commit_panel.clone();
-
     cx.subscribe(commit_panel, {
-        move |this, _cp, event: &CommitPanelEvent, cx| match event {
-            CommitPanelEvent::CommitRequested { message, amend } => {
-                let worktree_path = this.effective_worktree_path(cx);
-                // Capture the pre-commit HEAD of the worktree the commit targets
-                // (not the main repo's log, which may be a different branch) so a
-                // later undo soft-resets the branch the commit was actually made on.
-                let previous_head_oid = project
-                    .read(cx)
-                    .head_oid_at(&worktree_path)
-                    .map(|o| o.to_string());
-                let msg = message.clone();
-                let is_amend = *amend;
-                project.update(cx, |proj, cx| {
-                    proj.commit_at(&msg, is_amend, &worktree_path, cx).detach();
-                });
-                commit_panel_ref.update(cx, |cp, cx| {
-                    cp.set_message(String::new(), cx);
-                });
-                if !is_amend {
-                    if let Some(oid_hex) = previous_head_oid {
-                        this.push_undo(
-                            msg!("workspace.undo.label.commit"),
-                            UndoAction::SoftResetHead(oid_hex),
+        move |this, _cp, event: &CommitPanelEvent, cx| {
+            // Commit requests already captured their checkout and cleared only
+            // that draft. Unlike gestures, they must survive a selection change.
+            if !matches!(event, CommitPanelEvent::CommitRequested { .. })
+                && !is_active_project(this, &project)
+            {
+                return;
+            }
+            match event {
+                CommitPanelEvent::CommitRequested {
+                    message,
+                    amend,
+                    checkout_path,
+                    checkout_generation: _,
+                } => {
+                    let target = RepositoryTarget {
+                        project_id: project.entity_id(),
+                        worktree_path: checkout_path.clone(),
+                    };
+                    if this.resolve_repository_target(&target, cx).is_none() {
+                        this.show_toast(
+                            rgitui_i18n::t!("workspace.safety.target_closed").to_string(),
+                            ToastKind::Warning,
                             cx,
                         );
+                        return;
+                    }
+                    // Do not compare the panel's current generation: switching
+                    // away (even A -> B -> A) must not discard an issued commit.
+                    // No completion writes back into the now-selected draft.
+                    let worktree_path = &target.worktree_path;
+                    let repo_path = project.read(cx).repo_path().to_path_buf();
+                    // Capture the pre-commit HEAD of the worktree the commit targets
+                    // (not the main repo's log, which may be a different branch) so a
+                    // later undo soft-resets the branch the commit was actually made on.
+                    let previous_head_oid = project
+                        .read(cx)
+                        .head_oid_at(worktree_path)
+                        .map(|o| o.to_string());
+                    let msg = message.clone();
+                    let is_amend = *amend;
+                    project.update(cx, |proj, cx| {
+                        proj.commit_at(&msg, is_amend, worktree_path, cx).detach();
+                    });
+                    if !is_amend {
+                        if let Some(oid_hex) = previous_head_oid {
+                            this.push_undo_for_paths(
+                                msg!("workspace.undo.label.commit"),
+                                UndoAction::SoftResetHead(oid_hex),
+                                repo_path,
+                                worktree_path.clone(),
+                                cx,
+                            );
+                        }
                     }
                 }
+                CommitPanelEvent::GenerateAiMessage => {
+                    start_ai_generation(this, &project, &ai, None, cx);
+                }
+                CommitPanelEvent::RegenerateAiMessage { style } => {
+                    start_ai_generation(this, &project, &ai, *style, cx);
+                }
+                CommitPanelEvent::CancelAiMessage => {
+                    ai.update(cx, |generator, cx| generator.cancel(cx));
+                }
+                CommitPanelEvent::OpenAiSettings => {
+                    this.open_ai_settings(cx);
+                }
+                CommitPanelEvent::CollapsedChanged => cx.notify(),
             }
-            CommitPanelEvent::GenerateAiMessage => {
-                start_ai_generation(this, &project, &ai, None, cx);
-            }
-            CommitPanelEvent::RegenerateAiMessage { style } => {
-                start_ai_generation(this, &project, &ai, *style, cx);
-            }
-            CommitPanelEvent::CancelAiMessage => {
-                ai.update(cx, |generator, cx| generator.cancel(cx));
-            }
-            CommitPanelEvent::OpenAiSettings => {
-                this.open_ai_settings(cx);
-            }
-            CommitPanelEvent::CollapsedChanged => cx.notify(),
         }
     })
-    .detach();
 }
 
 /// Start a generation for the active tab.
@@ -2978,6 +3217,8 @@ pub(super) fn start_ai_generation(
     let diff_repo_path = repo_path.clone();
 
     let target_panel = commit_panel.downgrade();
+    let checkout_generation = commit_panel.read(cx).checkout_generation();
+    let project_id = project.entity_id();
     cx.spawn(async move |workspace, cx: &mut gpui::AsyncApp| {
         let diff_text = cx
             .background_executor()
@@ -2986,6 +3227,21 @@ pub(super) fn start_ai_generation(
             })
             .await;
         cx.update(|cx| {
+            // Preparation can outlive a checkout switch or a closed/reopened tab.
+            let target_is_live = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.tabs.iter().any(|tab| {
+                        tab.project.entity_id() == project_id
+                            && target_panel.upgrade().is_some_and(|panel| {
+                                tab.commit_panel == panel
+                                    && panel.read(cx).checkout_generation() == checkout_generation
+                            })
+                    })
+                })
+                .unwrap_or(false);
+            if !target_is_live {
+                return;
+            }
             let started = ai_entity.update(cx, |generator, cx| {
                 // The generator owns the in-flight and cooldown guards and
                 // returns `None` when it refuses, emitting its own event; the
@@ -3004,7 +3260,13 @@ pub(super) fn start_ai_generation(
                 // Emitted events are queued and delivered when this update
                 // cycle ends, so the subscription still sees this target when
                 // `GenerationStarted` arrives.
-                register_ai_target(&workspace, id.sequence, target_panel, cx);
+                register_ai_target(
+                    &workspace,
+                    id.sequence,
+                    target_panel,
+                    checkout_generation,
+                    cx,
+                );
             }
         });
     })
@@ -3016,11 +3278,16 @@ fn register_ai_target(
     workspace: &gpui::WeakEntity<Workspace>,
     sequence: u64,
     panel: gpui::WeakEntity<CommitPanel>,
+    checkout_generation: u64,
     cx: &mut gpui::App,
 ) {
     workspace
         .update(cx, |workspace, _cx| {
-            workspace.operations.ai_target = Some(AiGenerationTarget { sequence, panel });
+            workspace.operations.ai_target = Some(AiGenerationTarget {
+                sequence,
+                panel,
+                checkout_generation,
+            });
         })
         .ok();
 }
@@ -3029,156 +3296,176 @@ pub(super) fn subscribe_toolbar(
     cx: &mut Context<Workspace>,
     project: &Entity<GitProject>,
     toolbar: &Entity<Toolbar>,
-) {
+) -> gpui::Subscription {
     let _project = project.clone();
 
     cx.subscribe(toolbar, {
-        move |this, _toolbar, event: &ToolbarEvent, cx| match event {
-            ToolbarEvent::Fetch => {
-                let worktree_path = this.effective_worktree_path(cx);
-                _project.update(cx, |proj, cx| {
-                    proj.fetch_default_at(&worktree_path, cx).detach();
-                });
+        move |this, _toolbar, event: &ToolbarEvent, cx| {
+            if !is_active_project(this, &_project) {
+                return;
             }
-            ToolbarEvent::Pull => {
-                let worktree_path = this.effective_worktree_path(cx);
-                _project.update(cx, |proj, cx| {
-                    proj.pull_default_at(&worktree_path, cx).detach();
-                });
-            }
-            ToolbarEvent::Push => {
-                let worktree_path = this.effective_worktree_path(cx);
-                _project.update(cx, |proj, cx| {
-                    proj.push_default_at(false, &worktree_path, cx).detach();
-                });
-            }
-            ToolbarEvent::StashSave => {
-                this.dialogs.stash_save_dialog.update(cx, |d, cx| {
-                    d.show_visible(cx);
-                });
-            }
-            ToolbarEvent::StashPop => {
-                let worktree_path = this.effective_worktree_path(cx);
-                _project.update(cx, |proj, cx| {
-                    proj.stash_pop_at(0, &worktree_path, cx).detach();
-                });
-            }
-            ToolbarEvent::Branch => {
-                this.dialogs.branch_dialog.update(cx, |bd, cx| {
-                    bd.show_visible(None, cx);
-                });
-            }
-            ToolbarEvent::Refresh => {
-                _project.update(cx, |proj, cx| {
-                    proj.refresh(cx).detach();
-                });
-            }
-            ToolbarEvent::Settings => {
-                this.open_or_focus_settings(cx);
-            }
-            ToolbarEvent::Search => {
-                if let Some(tab) = this.tabs.get(this.active_tab) {
-                    tab.graph.update(cx, |g, cx| {
-                        g.toggle_search(cx);
+            match event {
+                ToolbarEvent::Fetch => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    _project.update(cx, |proj, cx| {
+                        proj.fetch_default_at(&worktree_path, cx).detach();
                     });
                 }
-            }
-            ToolbarEvent::OpenFileExplorer => {
-                let repo_path = this.effective_worktree_path(cx);
-                super::layout::open_file_explorer(&repo_path);
-            }
-            ToolbarEvent::OpenTerminal => {
-                let repo_path = this.effective_worktree_path(cx);
-                let terminal_cmd = cx
-                    .global::<rgitui_settings::SettingsState>()
-                    .settings()
-                    .terminal_command
-                    .clone();
-                super::layout::open_terminal(&repo_path, &terminal_cmd);
-            }
-            ToolbarEvent::OpenEditor => {
-                let repo_path = this.effective_worktree_path(cx);
-                let editor_cmd = cx
-                    .global::<rgitui_settings::SettingsState>()
-                    .settings()
-                    .editor_command
-                    .clone();
-                super::layout::open_editor(&repo_path, &editor_cmd);
-            }
-            ToolbarEvent::CreatePr => {
-                this.open_create_pr_dialog(cx);
+                ToolbarEvent::Pull => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    _project.update(cx, |proj, cx| {
+                        proj.pull_default_at(&worktree_path, cx).detach();
+                    });
+                }
+                ToolbarEvent::Push => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    _project.update(cx, |proj, cx| {
+                        proj.push_default_at(false, &worktree_path, cx).detach();
+                    });
+                }
+                ToolbarEvent::StashSave => {
+                    this.dialogs.stash_save_dialog.update(cx, |d, cx| {
+                        d.show_visible(cx);
+                    });
+                }
+                ToolbarEvent::StashPop => {
+                    let worktree_path = this.effective_worktree_path(cx);
+                    _project.update(cx, |proj, cx| {
+                        proj.stash_pop_at(0, &worktree_path, cx).detach();
+                    });
+                }
+                ToolbarEvent::Branch => {
+                    this.dialogs.branch_dialog.update(cx, |bd, cx| {
+                        bd.show_visible(None, cx);
+                    });
+                }
+                ToolbarEvent::Refresh => {
+                    _project.update(cx, |proj, cx| {
+                        proj.refresh(cx).detach();
+                    });
+                }
+                ToolbarEvent::Settings => {
+                    this.open_or_focus_settings(cx);
+                }
+                ToolbarEvent::Search => {
+                    if let Some(tab) = this.tabs.get(this.active_tab) {
+                        tab.graph.update(cx, |g, cx| {
+                            g.toggle_search(cx);
+                        });
+                    }
+                }
+                ToolbarEvent::OpenFileExplorer => {
+                    let repo_path = this.effective_worktree_path(cx);
+                    super::layout::open_file_explorer(&repo_path);
+                }
+                ToolbarEvent::OpenTerminal => {
+                    let repo_path = this.effective_worktree_path(cx);
+                    let terminal_cmd = cx
+                        .global::<rgitui_settings::SettingsState>()
+                        .settings()
+                        .terminal_command
+                        .clone();
+                    super::layout::open_terminal(&repo_path, &terminal_cmd);
+                }
+                ToolbarEvent::OpenEditor => {
+                    let repo_path = this.effective_worktree_path(cx);
+                    let editor_cmd = cx
+                        .global::<rgitui_settings::SettingsState>()
+                        .settings()
+                        .editor_command
+                        .clone();
+                    super::layout::open_editor(&repo_path, &editor_cmd);
+                }
+                ToolbarEvent::CreatePr => {
+                    this.open_create_pr_dialog(cx);
+                }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_blame_view(
     cx: &mut Context<Workspace>,
     blame_view: &Entity<BlameView>,
     graph: &Entity<GraphView>,
-) {
+) -> gpui::Subscription {
     let graph = graph.clone();
 
     cx.subscribe(blame_view, {
-        move |this, _bv, event: &BlameViewEvent, cx| match event {
-            BlameViewEvent::CommitSelected(oid_str) => {
-                if let Ok(oid) = git2::Oid::from_str(oid_str) {
-                    graph.update(cx, |g, cx| {
-                        g.scroll_to_commit(oid, cx);
-                    });
-                }
+        move |this, _bv, event: &BlameViewEvent, cx| {
+            if !this
+                .tabs
+                .get(this.active_tab)
+                .is_some_and(|tab| tab.blame_view == _bv)
+            {
+                return;
             }
-            BlameViewEvent::Dismissed | BlameViewEvent::SwitchToDiff => {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.bottom_panel_mode = BottomPanelMode::Diff;
-                    cx.notify();
+            match event {
+                BlameViewEvent::CommitSelected(oid_str) => {
+                    if let Ok(oid) = git2::Oid::from_str(oid_str) {
+                        graph.update(cx, |g, cx| {
+                            g.scroll_to_commit(oid, cx);
+                        });
+                    }
                 }
-            }
-            BlameViewEvent::SwitchToHistory => {
-                if let Some(tab) = this.tabs.get(this.active_tab) {
-                    let tab = tab.clone();
-                    this.execute_command(crate::CommandId::FileHistory, cx);
-                    let _ = tab;
+                BlameViewEvent::Dismissed | BlameViewEvent::SwitchToDiff => {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        cx.notify();
+                    }
+                }
+                BlameViewEvent::SwitchToHistory => {
+                    if let Some(tab) = this.tabs.get(this.active_tab) {
+                        let tab = tab.clone();
+                        this.execute_command(crate::CommandId::FileHistory, cx);
+                        let _ = tab;
+                    }
                 }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_file_history_view(
     cx: &mut Context<Workspace>,
     file_history_view: &Entity<FileHistoryView>,
     graph: &Entity<GraphView>,
-) {
+) -> gpui::Subscription {
     let graph = graph.clone();
 
     cx.subscribe(file_history_view, {
-        move |this, _fv, event: &FileHistoryViewEvent, cx| match event {
-            FileHistoryViewEvent::CommitSelected(oid_str) => {
-                if let Ok(oid) = git2::Oid::from_str(oid_str) {
-                    graph.update(cx, |g, cx| {
-                        g.scroll_to_commit(oid, cx);
-                    });
-                }
+        move |this, _fv, event: &FileHistoryViewEvent, cx| {
+            if !this
+                .tabs
+                .get(this.active_tab)
+                .is_some_and(|tab| tab.file_history_view == _fv)
+            {
+                return;
             }
-            FileHistoryViewEvent::Dismissed | FileHistoryViewEvent::SwitchToDiff => {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.bottom_panel_mode = BottomPanelMode::Diff;
-                    cx.notify();
+            match event {
+                FileHistoryViewEvent::CommitSelected(oid_str) => {
+                    if let Ok(oid) = git2::Oid::from_str(oid_str) {
+                        graph.update(cx, |g, cx| {
+                            g.scroll_to_commit(oid, cx);
+                        });
+                    }
                 }
-            }
-            FileHistoryViewEvent::SwitchToBlame => {
-                if let Some(tab) = this.tabs.get(this.active_tab) {
-                    let tab = tab.clone();
-                    this.execute_command(crate::CommandId::Blame, cx);
-                    let _ = tab;
+                FileHistoryViewEvent::Dismissed | FileHistoryViewEvent::SwitchToDiff => {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        cx.notify();
+                    }
+                }
+                FileHistoryViewEvent::SwitchToBlame => {
+                    if let Some(tab) = this.tabs.get(this.active_tab) {
+                        let tab = tab.clone();
+                        this.execute_command(crate::CommandId::Blame, cx);
+                        let _ = tab;
+                    }
                 }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_reflog_view(
@@ -3186,98 +3473,102 @@ pub(super) fn subscribe_reflog_view(
     project: &Entity<GitProject>,
     reflog_view: &Entity<ReflogView>,
     graph: &Entity<GraphView>,
-) {
+) -> gpui::Subscription {
     let graph = graph.clone();
     let project = project.clone();
 
     cx.subscribe(reflog_view, {
-        move |this, _rv, event: &ReflogViewEvent, cx| match event {
-            ReflogViewEvent::CommitSelected(oid_str) => {
-                if let Ok(oid) = git2::Oid::from_str(oid_str) {
-                    graph.update(cx, |g, cx| {
-                        g.scroll_to_commit(oid, cx);
-                    });
+        move |this, _rv, event: &ReflogViewEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
+            }
+            match event {
+                ReflogViewEvent::CommitSelected(oid_str) => {
+                    if let Ok(oid) = git2::Oid::from_str(oid_str) {
+                        graph.update(cx, |g, cx| {
+                            g.scroll_to_commit(oid, cx);
+                        });
+                    }
                 }
-            }
-            ReflogViewEvent::Dismissed => {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.bottom_panel_mode = BottomPanelMode::Diff;
-                    cx.notify();
+                ReflogViewEvent::Dismissed => {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        cx.notify();
+                    }
                 }
-            }
-            ReflogViewEvent::CheckoutCommit(oid) => {
-                if let Ok(git_oid) = git2::Oid::from_str(oid) {
-                    project.update(cx, |proj, cx| {
-                        proj.checkout_commit(git_oid, cx).detach();
-                    });
+                ReflogViewEvent::CheckoutCommit(oid) => {
+                    if let Ok(git_oid) = git2::Oid::from_str(oid) {
+                        let worktree_path = this.effective_worktree_path(cx);
+                        project.update(cx, |proj, cx| {
+                            proj.checkout_commit_at(git_oid, &worktree_path, cx)
+                                .detach();
+                        });
+                    }
                 }
-            }
-            ReflogViewEvent::CopyOID(oid) => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(oid.clone()));
-                let short = &oid[..7.min(oid.len())];
-                this.show_toast(format!("Copied OID: {}", short), ToastKind::Success, cx);
-            }
-            ReflogViewEvent::ResetHard(oid) => {
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::ResetHard(oid.clone()), cx);
-                });
-            }
-            ReflogViewEvent::ResetSoft(oid) => {
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::ResetSoft(oid.clone()), cx);
-                });
-            }
-            ReflogViewEvent::ResetMixed(oid) => {
-                this.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::ResetMixed(oid.clone()), cx);
-                });
+                ReflogViewEvent::CopyOID(oid) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(oid.clone()));
+                    let short = &oid[..7.min(oid.len())];
+                    this.show_toast(format!("Copied OID: {}", short), ToastKind::Success, cx);
+                }
+                ReflogViewEvent::ResetHard(oid) => {
+                    this.show_confirmation(ConfirmAction::ResetHard(oid.clone()), cx);
+                }
+                ReflogViewEvent::ResetSoft(oid) => {
+                    this.show_confirmation(ConfirmAction::ResetSoft(oid.clone()), cx);
+                }
+                ReflogViewEvent::ResetMixed(oid) => {
+                    this.show_confirmation(ConfirmAction::ResetMixed(oid.clone()), cx);
+                }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_submodule_view(
     cx: &mut Context<Workspace>,
     submodule_view: &Entity<SubmoduleView>,
     project: &Entity<GitProject>,
-) {
+) -> gpui::Subscription {
     let project = project.clone();
     let submodule_view = submodule_view.clone();
 
     cx.subscribe(&submodule_view, {
-        move |this, _sv, event: &SubmoduleViewEvent, cx| match event {
-            SubmoduleViewEvent::InitSubmodule(name) => {
-                let name = name.clone();
-                project.update(cx, |proj, cx| {
-                    proj.submodule_init_async(name.clone(), cx).detach();
-                });
+        move |this, _sv, event: &SubmoduleViewEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
             }
-            SubmoduleViewEvent::UpdateSubmodule(name) => {
-                let name = name.clone();
-                project.update(cx, |proj, cx| {
-                    proj.submodule_update_async(name.clone(), true, cx).detach();
-                });
-            }
-            SubmoduleViewEvent::InitAll => {
-                project.update(cx, |proj, cx| {
-                    proj.submodule_init_all_async(cx).detach();
-                });
-            }
-            SubmoduleViewEvent::UpdateAll => {
-                project.update(cx, |proj, cx| {
-                    proj.submodule_update_all_async(true, cx).detach();
-                });
-            }
-            SubmoduleViewEvent::Dismissed => {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.bottom_panel_mode = BottomPanelMode::Diff;
-                    cx.notify();
+            match event {
+                SubmoduleViewEvent::InitSubmodule(name) => {
+                    let name = name.clone();
+                    project.update(cx, |proj, cx| {
+                        proj.submodule_init_async(name.clone(), cx).detach();
+                    });
+                }
+                SubmoduleViewEvent::UpdateSubmodule(name) => {
+                    let name = name.clone();
+                    project.update(cx, |proj, cx| {
+                        proj.submodule_update_async(name.clone(), true, cx).detach();
+                    });
+                }
+                SubmoduleViewEvent::InitAll => {
+                    project.update(cx, |proj, cx| {
+                        proj.submodule_init_all_async(cx).detach();
+                    });
+                }
+                SubmoduleViewEvent::UpdateAll => {
+                    project.update(cx, |proj, cx| {
+                        proj.submodule_update_all_async(true, cx).detach();
+                    });
+                }
+                SubmoduleViewEvent::Dismissed => {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        cx.notify();
+                    }
                 }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_bisect_view(
@@ -3285,69 +3576,82 @@ pub(super) fn subscribe_bisect_view(
     project: &Entity<GitProject>,
     bisect_view: &Entity<BisectView>,
     graph: &Entity<GraphView>,
-) {
+) -> gpui::Subscription {
     let graph = graph.clone();
     let project = project.clone();
 
     cx.subscribe(bisect_view, {
-        move |this, _bv, event: &BisectViewEvent, cx| match event {
-            BisectViewEvent::CommitSelected(oid_str) => {
-                if let Ok(oid) = git2::Oid::from_str(oid_str) {
-                    graph.update(cx, |g, cx| {
-                        g.scroll_to_commit(oid, cx);
-                    });
+        move |this, _bv, event: &BisectViewEvent, cx| {
+            if !is_active_project(this, &project) {
+                return;
+            }
+            match event {
+                BisectViewEvent::CommitSelected(oid_str) => {
+                    if let Ok(oid) = git2::Oid::from_str(oid_str) {
+                        graph.update(cx, |g, cx| {
+                            g.scroll_to_commit(oid, cx);
+                        });
+                    }
                 }
-            }
-            BisectViewEvent::Dismissed => {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.bottom_panel_mode = BottomPanelMode::Diff;
-                    cx.notify();
+                BisectViewEvent::Dismissed => {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.bottom_panel_mode = BottomPanelMode::Diff;
+                        cx.notify();
+                    }
                 }
-            }
-            BisectViewEvent::CopyOID(oid) => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(oid.clone()));
-                let short = &oid[..7.min(oid.len())];
-                this.show_toast(format!("Copied OID: {}", short), ToastKind::Success, cx);
-            }
-            BisectViewEvent::Good(oid) => {
-                if let Ok(git_oid) = git2::Oid::from_str(oid) {
-                    project.update(cx, |proj, cx| {
-                        proj.bisect_good(Some(git_oid), cx).detach();
-                    });
-                    this.show_toast(
-                        format!("Marked {} as good", &oid[..7.min(oid.len())]),
-                        ToastKind::Success,
-                        cx,
-                    );
+                BisectViewEvent::CopyOID(oid) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(oid.clone()));
+                    let short = &oid[..7.min(oid.len())];
+                    this.show_toast(format!("Copied OID: {}", short), ToastKind::Success, cx);
                 }
-            }
-            BisectViewEvent::Bad(oid) => {
-                if let Ok(git_oid) = git2::Oid::from_str(oid) {
-                    project.update(cx, |proj, cx| {
-                        proj.bisect_bad(Some(git_oid), cx).detach();
-                    });
-                    this.show_toast(
-                        format!("Marked {} as bad", &oid[..7.min(oid.len())]),
-                        ToastKind::Success,
-                        cx,
-                    );
+                BisectViewEvent::Good(oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
+                    if let Ok(git_oid) = git2::Oid::from_str(oid) {
+                        project.update(cx, |proj, cx| {
+                            proj.bisect_good(Some(git_oid), cx).detach();
+                        });
+                        this.show_toast(
+                            format!("Marked {} as good", &oid[..7.min(oid.len())]),
+                            ToastKind::Success,
+                            cx,
+                        );
+                    }
                 }
-            }
-            BisectViewEvent::Skip(oid) => {
-                if let Ok(git_oid) = git2::Oid::from_str(oid) {
-                    project.update(cx, |proj, cx| {
-                        proj.bisect_skip(Some(git_oid), cx).detach();
-                    });
-                    this.show_toast(
-                        format!("Skipped {}", &oid[..7.min(oid.len())]),
-                        ToastKind::Success,
-                        cx,
-                    );
+                BisectViewEvent::Bad(oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
+                    if let Ok(git_oid) = git2::Oid::from_str(oid) {
+                        project.update(cx, |proj, cx| {
+                            proj.bisect_bad(Some(git_oid), cx).detach();
+                        });
+                        this.show_toast(
+                            format!("Marked {} as bad", &oid[..7.min(oid.len())]),
+                            ToastKind::Success,
+                            cx,
+                        );
+                    }
+                }
+                BisectViewEvent::Skip(oid) => {
+                    if !this.require_main_checkout(cx) {
+                        return;
+                    }
+                    if let Ok(git_oid) = git2::Oid::from_str(oid) {
+                        project.update(cx, |proj, cx| {
+                            proj.bisect_skip(Some(git_oid), cx).detach();
+                        });
+                        this.show_toast(
+                            format!("Skipped {}", &oid[..7.min(oid.len())]),
+                            ToastKind::Success,
+                            cx,
+                        );
+                    }
                 }
             }
         }
     })
-    .detach();
 }
 
 pub(super) fn subscribe_repo_clone_dialog(

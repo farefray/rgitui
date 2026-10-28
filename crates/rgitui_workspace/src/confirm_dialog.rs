@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gpui::prelude::*;
 use gpui::{div, px, ClickEvent, Context, EventEmitter, FocusHandle, Render, SharedString, Window};
 use rgitui_git::RepoState;
@@ -27,10 +29,20 @@ pub enum ConfirmAction {
     WorktreeRemove(String),
 }
 
+/// The live project and checkout captured synchronously when a dialog opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmationTarget {
+    pub project_id: gpui::EntityId,
+    pub worktree_path: PathBuf,
+}
+
 /// Events emitted by the confirmation dialog.
 #[derive(Debug, Clone)]
 pub enum ConfirmDialogEvent {
-    Confirmed(ConfirmAction),
+    Confirmed {
+        action: ConfirmAction,
+        target: ConfirmationTarget,
+    },
     Cancelled,
 }
 
@@ -39,6 +51,7 @@ pub enum ConfirmDialogEvent {
 pub struct ConfirmDialog {
     visible: bool,
     action: Option<ConfirmAction>,
+    target: Option<ConfirmationTarget>,
     focus_handle: FocusHandle,
     pending_focus: bool,
 }
@@ -50,14 +63,21 @@ impl ConfirmDialog {
         Self {
             visible: false,
             action: None,
+            target: None,
             focus_handle: cx.focus_handle(),
             pending_focus: false,
         }
     }
 
     /// Ask to confirm `action`. Focus moves to the dialog on its next draw.
-    pub fn show_visible(&mut self, action: ConfirmAction, cx: &mut Context<Self>) {
+    pub fn show_visible(
+        &mut self,
+        action: ConfirmAction,
+        target: ConfirmationTarget,
+        cx: &mut Context<Self>,
+    ) {
         self.action = Some(action);
+        self.target = Some(target);
         self.visible = true;
         self.pending_focus = true;
         cx.notify();
@@ -68,9 +88,9 @@ impl ConfirmDialog {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some(action) = self.action.take() {
+        if let (Some(action), Some(target)) = (self.action.take(), self.target.take()) {
             self.visible = false;
-            cx.emit(ConfirmDialogEvent::Confirmed(action));
+            cx.emit(ConfirmDialogEvent::Confirmed { action, target });
             cx.notify();
         }
     }
@@ -78,6 +98,7 @@ impl ConfirmDialog {
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
         self.action = None;
+        self.target = None;
         cx.emit(ConfirmDialogEvent::Cancelled);
         cx.notify();
     }
@@ -411,19 +432,70 @@ mod tests {
 
     // ConfirmDialogEvent
 
-    #[test]
-    fn confirm_dialog_event_variants() {
-        let confirmed = ConfirmDialogEvent::Confirmed(ConfirmAction::StashDrop(0));
-        let cancelled = ConfirmDialogEvent::Cancelled;
-        assert_eq!(format!("{:?}", confirmed), "Confirmed(StashDrop(0))");
-        assert_eq!(format!("{:?}", cancelled), "Cancelled");
-    }
+    #[gpui::test]
+    fn queued_confirmation_retains_origin_when_a_new_dialog_opens(cx: &mut gpui::TestAppContext) {
+        let project_a = cx.new(|_| ());
+        let project_b = cx.new(|_| ());
+        let target_a = ConfirmationTarget {
+            project_id: project_a.entity_id(),
+            worktree_path: "repo/a".into(),
+        };
+        let target_b = ConfirmationTarget {
+            project_id: project_b.entity_id(),
+            worktree_path: "repo/b".into(),
+        };
+        let dialog = cx.new(ConfirmDialog::new);
+        let received = cx.new(|cx| {
+            cx.subscribe(
+                &dialog,
+                |events: &mut Vec<ConfirmDialogEvent>, _, event, _| events.push(event.clone()),
+            )
+            .detach();
+            Vec::<ConfirmDialogEvent>::new()
+        });
 
-    #[test]
-    fn confirm_dialog_event_clone() {
-        let evt = ConfirmDialogEvent::Confirmed(ConfirmAction::ForcePush);
-        let clone = evt.clone();
-        assert_eq!(format!("{:?}", evt), format!("{:?}", clone));
+        dialog.update(cx, |dialog, cx| {
+            let mut selected = target_a.clone();
+            dialog.show_visible(ConfirmAction::DiscardAll, selected.clone(), cx);
+            // Selection changes before confirmation. Then another dialog opens
+            // before the first Confirmed event is delivered to its subscriber.
+            selected = target_b.clone();
+            dialog.confirm(cx);
+            dialog.show_visible(ConfirmAction::ForcePush, selected, cx);
+        });
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0],
+                ConfirmDialogEvent::Confirmed { action: ConfirmAction::DiscardAll, target }
+                    if target == &target_a
+            ));
+        });
+        dialog.update(cx, |dialog, cx| dialog.confirm(cx));
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 2);
+            assert!(matches!(
+                &events[1],
+                ConfirmDialogEvent::Confirmed { action: ConfirmAction::ForcePush, target }
+                    if target == &target_b
+            ));
+            assert_eq!(
+                format!("{:?}", events[1]),
+                format!("{:?}", events[1].clone())
+            );
+        });
+
+        dialog.update(cx, |dialog, cx| {
+            dialog.show_visible(ConfirmAction::StashDrop(0), target_a, cx);
+            dialog.cancel(cx);
+            dialog.confirm(cx);
+            assert!(dialog.target.is_none());
+            assert!(!dialog.is_visible());
+        });
+        received.update(cx, |events, _| {
+            assert_eq!(events.len(), 3);
+            assert!(matches!(&events[2], ConfirmDialogEvent::Cancelled));
+        });
     }
 
     // is_destructive

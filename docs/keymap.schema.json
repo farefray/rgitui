@@ -201,6 +201,14 @@
           "description": "Open the repository picker. Command id: `open_repo`."
         },
         {
+          "const": "rgitui::SwitchRepository",
+          "description": "Switch among open and recent repositories. Command id: `switch_repository`."
+        },
+        {
+          "const": "rgitui::PreviousRepository",
+          "description": "Activate the previously used repository. Command id: `previous_repository`."
+        },
+        {
           "const": "rgitui::WorkspaceHome",
           "description": "Close every tab and return to the workspace home screen. Command id: `workspace_home`."
         },

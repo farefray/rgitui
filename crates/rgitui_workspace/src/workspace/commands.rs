@@ -33,6 +33,7 @@ impl Workspace {
                 });
             }
             CommandId::Settings => self.open_or_focus_settings(cx),
+            CommandId::SwitchRepository => self.toggle_repository_switcher(window, cx),
             CommandId::OpenRepo => {
                 self.overlays.repo_opener.update(cx, |opener, cx| {
                     opener.toggle(window, cx);
@@ -112,6 +113,9 @@ impl Workspace {
     /// and the graph's "Squash selected commits" context-menu item, which only
     /// checks that two rows are selected before emitting.
     pub(super) fn squash_selected_commits(&mut self, cx: &mut Context<Self>) {
+        if !self.require_main_checkout(cx) {
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -277,6 +281,9 @@ impl Workspace {
 
     /// Checks out the branch HEAD was on before, like `git switch -`.
     pub(super) fn switch_to_previous_branch(&mut self, cx: &mut Context<Self>) {
+        if !self.require_main_checkout(cx) {
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -338,6 +345,13 @@ impl Workspace {
                     ro.toggle_visible(cx);
                 });
             }
+            CommandId::SwitchRepository => {
+                // Palette dispatch has no Window. Open on the next render so
+                // the input receives focus in the workspace's own window.
+                self.switcher_requested = true;
+                cx.notify();
+            }
+            CommandId::PreviousRepository => self.previous_repository(cx),
             CommandId::Shortcuts => {
                 self.overlays.shortcuts_help.update(cx, |sh, cx| {
                     sh.toggle_visible(cx);
@@ -396,18 +410,17 @@ impl Workspace {
             }
             CommandId::NextTab => {
                 if !self.tabs.is_empty() {
-                    self.active_tab = (self.active_tab + 1) % self.tabs.len();
-                    cx.notify();
+                    self.activate_tab((self.active_tab + 1) % self.tabs.len(), cx);
                 }
             }
             CommandId::PrevTab => {
                 if !self.tabs.is_empty() {
-                    self.active_tab = if self.active_tab == 0 {
+                    let index = if self.active_tab == 0 {
                         self.tabs.len() - 1
                     } else {
                         self.active_tab - 1
                     };
-                    cx.notify();
+                    self.activate_tab(index, cx);
                 }
             }
             CommandId::CloseTab => {
@@ -446,6 +459,19 @@ impl Workspace {
         tab: &ProjectTab,
         cx: &mut Context<Self>,
     ) {
+        if matches!(
+            cmd,
+            CommandId::InteractiveRebase
+                | CommandId::Bisect
+                | CommandId::BisectStart
+                | CommandId::BisectGood
+                | CommandId::BisectBad
+                | CommandId::BisectSkip
+                | CommandId::BisectReset
+        ) && !self.require_main_checkout(cx)
+        {
+            return;
+        }
         match cmd {
             CommandId::Fetch => {
                 let worktree_path = tab.effective_repo_path(cx);
@@ -589,19 +615,13 @@ impl Workspace {
                 }
             }
             CommandId::ForcePush => {
-                self.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::ForcePush, cx);
-                });
+                self.show_confirmation(ConfirmAction::ForcePush, cx);
             }
             CommandId::DiscardAll => {
-                self.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::DiscardAll, cx);
-                });
+                self.show_confirmation(ConfirmAction::DiscardAll, cx);
             }
             CommandId::CleanUntracked => {
-                self.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::CleanUntracked, cx);
-                });
+                self.show_confirmation(ConfirmAction::CleanUntracked, cx);
             }
             CommandId::AbortOperation => {
                 let worktree_path = self.effective_worktree_path(cx);
@@ -609,9 +629,7 @@ impl Workspace {
                 if state.is_clean() {
                     self.show_toast("No operation in progress to abort", ToastKind::Warning, cx);
                 } else {
-                    self.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                        cd.show_visible(ConfirmAction::AbortOperation(state), cx);
-                    });
+                    self.show_confirmation(ConfirmAction::AbortOperation(state), cx);
                 }
             }
             CommandId::ContinueMerge => {
@@ -664,9 +682,7 @@ impl Workspace {
                 self.open_create_pr_dialog(cx);
             }
             CommandId::ResetHard => {
-                self.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                    cd.show_visible(ConfirmAction::ResetHard("HEAD".to_string()), cx);
-                });
+                self.show_confirmation(ConfirmAction::ResetHard("HEAD".to_string()), cx);
             }
             CommandId::RenameBranch => {
                 let proj = tab.project.read(cx);
@@ -855,6 +871,8 @@ impl Workspace {
             CommandId::Settings
             | CommandId::CreateBranch
             | CommandId::OpenRepo
+            | CommandId::SwitchRepository
+            | CommandId::PreviousRepository
             | CommandId::Shortcuts
             | CommandId::OpenKeymap
             | CommandId::WorkspaceHome
@@ -1082,8 +1100,8 @@ impl Workspace {
         }
 
         let project = tab.project.clone();
-        let reflog_view = tab.reflog_view.clone();
-        let active_tab_index = self.active_tab;
+        let project_id = project.entity_id();
+        let worktree_path = tab.effective_repo_path(cx);
 
         let task = project.update(cx, |proj, cx| proj.reflog_async("HEAD".to_string(), cx));
 
@@ -1091,13 +1109,17 @@ impl Workspace {
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
                 Ok(entries) => {
                     cx.update(|cx| {
-                        reflog_view.update(cx, |rv, cx| {
-                            rv.set_entries(entries, cx);
-                        });
                         let _ = this.update(cx, |workspace, cx| {
-                            if let Some(active_tab) = workspace.tabs.get_mut(active_tab_index) {
-                                active_tab.bottom_panel_mode = BottomPanelMode::Reflog;
+                            let Some(index) = workspace.project_tab_index(project_id) else {
+                                return;
+                            };
+                            let tab = &mut workspace.tabs[index];
+                            if tab.effective_repo_path(cx) != worktree_path {
+                                return;
                             }
+                            tab.reflog_view
+                                .update(cx, |rv, cx| rv.set_entries(entries, cx));
+                            tab.bottom_panel_mode = BottomPanelMode::Reflog;
                             cx.notify();
                         });
                     });
@@ -1128,8 +1150,8 @@ impl Workspace {
         }
 
         let project = tab.project.clone();
-        let submodule_view = tab.submodule_view.clone();
-        let active_tab_index = self.active_tab;
+        let project_id = project.entity_id();
+        let worktree_path = tab.effective_repo_path(cx);
 
         let task = project.update(cx, |proj, cx| proj.submodules_async(cx));
 
@@ -1137,13 +1159,17 @@ impl Workspace {
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
                 Ok(submodules) => {
                     cx.update(|cx| {
-                        submodule_view.update(cx, |sv, cx| {
-                            sv.set_submodules(submodules, cx);
-                        });
                         let _ = this.update(cx, |workspace, cx| {
-                            if let Some(active_tab) = workspace.tabs.get_mut(active_tab_index) {
-                                active_tab.bottom_panel_mode = BottomPanelMode::Submodules;
+                            let Some(index) = workspace.project_tab_index(project_id) else {
+                                return;
+                            };
+                            let tab = &mut workspace.tabs[index];
+                            if tab.effective_repo_path(cx) != worktree_path {
+                                return;
                             }
+                            tab.submodule_view
+                                .update(cx, |sv, cx| sv.set_submodules(submodules, cx));
+                            tab.bottom_panel_mode = BottomPanelMode::Submodules;
                             cx.notify();
                         });
                     });
@@ -1174,8 +1200,8 @@ impl Workspace {
         }
 
         let project = tab.project.clone();
-        let bisect_view = tab.bisect_view.clone();
-        let active_tab_index = self.active_tab;
+        let project_id = project.entity_id();
+        let worktree_path = tab.effective_repo_path(cx);
 
         let task = project.update(cx, |proj, cx| proj.bisect_log_async(cx));
 
@@ -1183,13 +1209,17 @@ impl Workspace {
             async move |this, cx: &mut gpui::AsyncApp| match task.await {
                 Ok(entries) => {
                     cx.update(|cx| {
-                        bisect_view.update(cx, |bv, cx| {
-                            bv.set_entries(entries, cx);
-                        });
                         let _ = this.update(cx, |workspace, cx| {
-                            if let Some(active_tab) = workspace.tabs.get_mut(active_tab_index) {
-                                active_tab.bottom_panel_mode = BottomPanelMode::Bisect;
+                            let Some(index) = workspace.project_tab_index(project_id) else {
+                                return;
+                            };
+                            let tab = &mut workspace.tabs[index];
+                            if tab.effective_repo_path(cx) != worktree_path {
+                                return;
                             }
+                            tab.bisect_view
+                                .update(cx, |bv, cx| bv.set_entries(entries, cx));
+                            tab.bottom_panel_mode = BottomPanelMode::Bisect;
                             cx.notify();
                         });
                     });

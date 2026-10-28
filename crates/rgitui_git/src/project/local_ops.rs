@@ -166,6 +166,149 @@ fn checkout_tree_safe(
     }
 }
 
+// Mutation-only helpers take the captured checkout path; callers separately refresh
+// the owning repository. Keeping these GPUI-free also lets tests exercise routing.
+fn checkout_branch_in_worktree(operation_path: &Path, name: &str) -> Result<Message> {
+    let repo = Repository::open(operation_path)?;
+    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
+    let current_branch = head_branch_name(&repo).ok();
+
+    // Prefer a local branch; otherwise create a local tracking branch.
+    let (obj, local_branch_name, is_tracking) =
+        match repo.revparse_single(&format!("refs/heads/{}", name)) {
+            Ok(o) => (o, name.to_string(), false),
+            Err(_) => {
+                let remote_ref = format!("refs/remotes/{}", name);
+                if let Ok(remote_obj) = repo.revparse_single(&remote_ref) {
+                    let Some((_remote, short)) = name.split_once('/') else {
+                        return Err(error(msg!(
+                            "git.error.invalid_remote_branch",
+                            branch = name
+                        )));
+                    };
+                    // Refuse to overwrite an existing local branch.
+                    if repo.find_branch(short, git2::BranchType::Local).is_ok() {
+                        return Err(error(msg!("git.error.local_branch_exists", branch = short)));
+                    }
+                    let commit = remote_obj.peel_to_commit()?;
+                    repo.branch(short, &commit, false)?;
+                    if let Ok(mut branch) = repo.find_branch(short, git2::BranchType::Local) {
+                        let _ = branch.set_upstream(Some(name));
+                    }
+                    (remote_obj, short.to_string(), true)
+                } else {
+                    return Err(error(msg!("git.error.branch_not_found", branch = name)));
+                }
+            }
+        };
+
+    if current_branch.as_deref() == Some(local_branch_name.as_str()) {
+        return Err(error(msg!(
+            "git.error.already_on_branch",
+            branch = &local_branch_name
+        )));
+    }
+    checkout_tree_safe(&repo, &obj, GitOperationKind::Checkout)?;
+    repo.set_head(&format!("refs/heads/{}", local_branch_name))?;
+    Ok(if is_tracking {
+        msg!(
+            "git.checkout_branch.done_tracking",
+            branch = &local_branch_name,
+            upstream = name
+        )
+    } else {
+        msg!("git.checkout_branch.done", branch = name)
+    })
+}
+
+fn checkout_commit_in_worktree(operation_path: &Path, oid: git2::Oid) -> Result<()> {
+    let repo = Repository::open(operation_path)?;
+    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
+    let commit = repo.find_commit(oid)?;
+    checkout_tree_safe(&repo, commit.as_object(), GitOperationKind::Checkout)?;
+    repo.set_head_detached(oid)?;
+    Ok(())
+}
+
+fn checkout_tag_in_worktree(operation_path: &Path, name: &str) -> Result<()> {
+    let repo = Repository::open(operation_path)?;
+    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
+    let obj = repo.revparse_single(&format!("refs/tags/{}", name))?;
+    let commit = obj.peel_to_commit()?;
+    checkout_tree_safe(&repo, commit.as_object(), GitOperationKind::Checkout)?;
+    repo.set_head_detached(commit.id())?;
+    Ok(())
+}
+
+fn merge_branch_in_worktree(operation_path: &Path, branch_name: &str) -> Result<(Message, bool)> {
+    let repo = Repository::open(operation_path)?;
+    ensure_clean_worktree(&repo, GitOperationKind::Merge.name())?;
+    let reference = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .or_else(|_| repo.find_branch(branch_name, git2::BranchType::Remote))?;
+    let annotated_commit = repo.reference_to_annotated_commit(reference.get())?;
+    let (analysis, _pref) = repo.merge_analysis(&[&annotated_commit])?;
+
+    Ok(if analysis.is_up_to_date() {
+        (msg!("git.merge.up_to_date"), false)
+    } else if analysis.is_fast_forward() {
+        let head = repo.head()?;
+        let head_branch_name = head.shorthand().unwrap_or("HEAD").to_string();
+        let refname = format!("refs/heads/{}", head_branch_name);
+        let target = repo.find_object(annotated_commit.id(), None)?;
+        // Check out before moving the ref, so a refused safe checkout leaves
+        // HEAD and the working tree in step without clobbering local files.
+        checkout_tree_safe(&repo, &target, GitOperationKind::Merge)?;
+        let mut reference = repo.find_reference(&refname)?;
+        reference.set_target(
+            annotated_commit.id(),
+            &format!("Fast-forward merge of '{}'", branch_name),
+        )?;
+        repo.set_head(&refname)?;
+        (
+            msg!("git.merge.done_fast_forward", branch = branch_name),
+            false,
+        )
+    } else if analysis.is_normal() {
+        repo.merge(&[&annotated_commit], None, None)?;
+        let has_conflicts = repo.index()?.has_conflicts();
+        if has_conflicts {
+            let conflict_count = repo.index()?.conflicts()?.count();
+            (
+                msgp!(
+                    "git.merge.conflicts_detail",
+                    conflict_count,
+                    branch = branch_name
+                ),
+                true,
+            )
+        } else {
+            let sig = repo.signature()?;
+            let mut index = repo.index()?;
+            let tree_oid = index.write_tree()?;
+            let tree = repo.find_tree(tree_oid)?;
+            let head_commit = repo.head()?.peel_to_commit()?;
+            let merge_commit = repo.find_commit(annotated_commit.id())?;
+            repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!(
+                    "Merge branch '{}' into {}",
+                    branch_name,
+                    repo.head()?.shorthand().unwrap_or("HEAD")
+                ),
+                &tree,
+                &[&head_commit, &merge_commit],
+            )?;
+            repo.cleanup_state()?;
+            (msg!("git.merge.done", branch = branch_name), false)
+        }
+    } else {
+        (msg!("git.merge.complete"), false)
+    })
+}
+
 impl GitProject {
     /// Stage specific files in the given worktree.
     pub fn stage_files_at(
@@ -743,6 +886,17 @@ impl GitProject {
     /// Handles both local branches and remote tracking branches (e.g. `origin/main`).
     /// For remote branches, creates a local tracking branch first.
     pub fn checkout_branch(&mut self, name: &str, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.checkout_branch_at(name, &self.repo_path.clone(), cx)
+    }
+
+    /// Checkout a branch in the explicitly captured checkout, refreshing the owner repository.
+    pub fn checkout_branch_at(
+        &mut self,
+        name: &str,
+        worktree_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let operation_path = worktree_path.to_path_buf();
         log::info!("checkout_branch: name={}", name);
         let name = name.to_string();
         let task_name = name.clone();
@@ -755,90 +909,13 @@ impl GitProject {
             Some(name.clone()),
             cx,
         );
+        self.note_operation_worktree(operation_id, worktree_path);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result: anyhow::Result<(Message, RefreshData)> = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = Repository::open(&repo_path)?;
-                    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
-                    let current_branch = head_branch_name(&repo).ok();
-
-                    // Determine whether this is a local or remote branch, and the
-                    // object + local branch name to use.
-                    let (obj, local_branch_name, is_tracking) =
-                        match repo.revparse_single(&format!("refs/heads/{}", task_name)) {
-                            Ok(o) => (o, task_name.clone(), false),
-                            Err(_) => {
-                                // Not a local branch — check if it's a remote tracking branch
-                                // (e.g. "origin/main" → refs/remotes/origin/main).
-                                let remote_ref = format!("refs/remotes/{}", task_name);
-                                if let Ok(remote_obj) = repo.revparse_single(&remote_ref) {
-                                    let Some((_remote, short)) = task_name.split_once('/') else {
-                                        return Err(error(msg!(
-                                            "git.error.invalid_remote_branch",
-                                            branch = &task_name
-                                        )));
-                                    };
-                                    let local_branch_name = short;
-
-                                    // Refuse to overwrite an existing local branch.
-                                    if repo
-                                        .find_branch(local_branch_name, git2::BranchType::Local)
-                                        .is_ok()
-                                    {
-                                        return Err(error(msg!(
-                                            "git.error.local_branch_exists",
-                                            branch = &local_branch_name
-                                        )));
-                                    }
-
-                                    // Create the local tracking branch at the remote's commit.
-                                    let commit = remote_obj.peel_to_commit()?;
-                                    repo.branch(local_branch_name, &commit, false)?;
-
-                                    // Set upstream to track the remote branch.
-                                    if let Ok(mut branch) =
-                                        repo.find_branch(local_branch_name, git2::BranchType::Local)
-                                    {
-                                        let _ = branch.set_upstream(Some(&task_name));
-                                    }
-
-                                    (remote_obj, local_branch_name.to_string(), true)
-                                } else {
-                                    return Err(error(msg!(
-                                        "git.error.branch_not_found",
-                                        branch = &task_name
-                                    )));
-                                }
-                            }
-                        };
-
-                    // Bail if already on the target branch (use local name for tracking).
-                    if current_branch.as_deref() == Some(local_branch_name.as_str()) {
-                        return Err(error(msg!(
-                            "git.error.already_on_branch",
-                            branch = &local_branch_name
-                        )));
-                    }
-
-                    let head_ref = if is_tracking {
-                        format!("refs/heads/{}", local_branch_name)
-                    } else {
-                        format!("refs/heads/{}", task_name)
-                    };
-
-                    checkout_tree_safe(&repo, &obj, GitOperationKind::Checkout)?;
-                    repo.set_head(&head_ref)?;
+                    let msg = checkout_branch_in_worktree(&operation_path, &task_name)?;
                     let data = gather_refresh_data(&repo_path, commit_limit)?;
-                    let msg = if is_tracking {
-                        msg!(
-                            "git.checkout_branch.done_tracking",
-                            branch = &local_branch_name,
-                            upstream = &task_name
-                        )
-                    } else {
-                        msg!("git.checkout_branch.done", branch = &task_name)
-                    };
                     Ok((msg, data))
                 })
                 .await;
@@ -881,6 +958,17 @@ impl GitProject {
 
     /// Checkout a specific commit (detached HEAD).
     pub fn checkout_commit(&mut self, oid: git2::Oid, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.checkout_commit_at(oid, &self.repo_path.clone(), cx)
+    }
+
+    /// Checkout a commit in the explicitly captured checkout (detached HEAD).
+    pub fn checkout_commit_at(
+        &mut self,
+        oid: git2::Oid,
+        worktree_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let operation_path = worktree_path.to_path_buf();
         log::info!("checkout_commit: oid={}", oid);
         let repo_path = self.repo_path.clone();
         let commit_limit = self.commit_limit;
@@ -892,16 +980,12 @@ impl GitProject {
             Some(short_id.clone()),
             cx,
         );
+        self.note_operation_worktree(operation_id, worktree_path);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result: anyhow::Result<RefreshData> = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = Repository::open(&repo_path)?;
-                    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
-                    let commit = repo.find_commit(oid)?;
-                    let obj = commit.into_object();
-                    checkout_tree_safe(&repo, &obj, GitOperationKind::Checkout)?;
-                    repo.set_head_detached(oid)?;
+                    checkout_commit_in_worktree(&operation_path, oid)?;
                     gather_refresh_data(&repo_path, commit_limit)
                 })
                 .await;
@@ -944,6 +1028,17 @@ impl GitProject {
 
     /// Checkout a tag, putting HEAD in detached state.
     pub fn checkout_tag(&mut self, name: &str, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.checkout_tag_at(name, &self.repo_path.clone(), cx)
+    }
+
+    /// Checkout a tag in the explicitly captured checkout (detached HEAD).
+    pub fn checkout_tag_at(
+        &mut self,
+        name: &str,
+        worktree_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let operation_path = worktree_path.to_path_buf();
         log::info!("checkout_tag: name={}", name);
         let name = name.to_string();
         let task_name = name.clone();
@@ -956,18 +1051,12 @@ impl GitProject {
             Some(name.clone()),
             cx,
         );
+        self.note_operation_worktree(operation_id, worktree_path);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result: anyhow::Result<RefreshData> = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = Repository::open(&repo_path)?;
-                    ensure_clean_worktree(&repo, GitOperationKind::Checkout.name())?;
-                    let obj = repo.revparse_single(&format!("refs/tags/{}", task_name))?;
-                    let commit = obj.peel_to_commit()?;
-                    let oid = commit.id();
-                    let obj = commit.into_object();
-                    checkout_tree_safe(&repo, &obj, GitOperationKind::Checkout)?;
-                    repo.set_head_detached(oid)?;
+                    checkout_tag_in_worktree(&operation_path, &task_name)?;
                     gather_refresh_data(&repo_path, commit_limit)
                 })
                 .await;
@@ -2569,12 +2658,23 @@ impl GitProject {
 
     /// Merge a branch into the current HEAD.
     pub fn merge_branch(&mut self, branch_name: &str, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.merge_branch_at(branch_name, &self.repo_path.clone(), cx)
+    }
+
+    /// Merge a branch into HEAD of the explicitly captured checkout.
+    pub fn merge_branch_at(
+        &mut self,
+        branch_name: &str,
+        worktree_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let operation_path = worktree_path.to_path_buf();
         log::info!("merge_branch: name={}", branch_name);
         let branch_name = branch_name.to_string();
         let task_branch_name = branch_name.clone();
         let repo_path = self.repo_path.clone();
         let commit_limit = self.commit_limit;
-        let current_branch = self.head_branch.clone();
+        let current_branch = self.head_branch_at(worktree_path);
         let operation_id = self.begin_operation(
             GitOperationKind::Merge,
             msg!("git.merge.running", branch = &branch_name),
@@ -2582,86 +2682,13 @@ impl GitProject {
             current_branch.clone(),
             cx,
         );
+        self.note_operation_worktree(operation_id, worktree_path);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result: anyhow::Result<(Message, bool, RefreshData)> = cx
                 .background_executor()
                 .spawn(async move {
-                    let (msg, is_conflict) = {
-                        let repo = Repository::open(&repo_path)?;
-                        ensure_clean_worktree(&repo, GitOperationKind::Merge.name())?;
-
-                        let reference = repo
-                            .find_branch(&task_branch_name, git2::BranchType::Local)
-                            .or_else(|_| {
-                                repo.find_branch(&task_branch_name, git2::BranchType::Remote)
-                            })?;
-                        let annotated_commit =
-                            repo.reference_to_annotated_commit(reference.get())?;
-
-                        let (analysis, _pref) = repo.merge_analysis(&[&annotated_commit])?;
-
-                        if analysis.is_up_to_date() {
-                            (msg!("git.merge.up_to_date"), false)
-                        } else if analysis.is_fast_forward() {
-                            let head = repo.head()?;
-                            let head_branch_name = head.shorthand().unwrap_or("HEAD").to_string();
-                            let refname = format!("refs/heads/{}", head_branch_name);
-                            let target = repo.find_object(annotated_commit.id(), None)?;
-                            // Check out before moving the ref. A safe checkout
-                            // refuses rather than clobbering an untracked file,
-                            // and leaving the ref alone until it succeeds keeps
-                            // HEAD and the working tree in step when it refuses.
-                            checkout_tree_safe(&repo, &target, GitOperationKind::Merge)?;
-                            let mut reference = repo.find_reference(&refname)?;
-                            reference.set_target(
-                                annotated_commit.id(),
-                                &format!("Fast-forward merge of '{}'", task_branch_name),
-                            )?;
-                            repo.set_head(&refname)?;
-                            (
-                                msg!("git.merge.done_fast_forward", branch = &task_branch_name),
-                                false,
-                            )
-                        } else if analysis.is_normal() {
-                            repo.merge(&[&annotated_commit], None, None)?;
-
-                            let has_conflicts = repo.index()?.has_conflicts();
-                            if has_conflicts {
-                                let conflict_count = repo.index()?.conflicts()?.count();
-                                (
-                                    msgp!(
-                                        "git.merge.conflicts_detail",
-                                        conflict_count,
-                                        branch = &task_branch_name
-                                    ),
-                                    true,
-                                )
-                            } else {
-                                let sig = repo.signature()?;
-                                let mut index = repo.index()?;
-                                let tree_oid = index.write_tree()?;
-                                let tree = repo.find_tree(tree_oid)?;
-                                let head_commit = repo.head()?.peel_to_commit()?;
-                                let merge_commit = repo.find_commit(annotated_commit.id())?;
-                                repo.commit(
-                                    Some("HEAD"),
-                                    &sig,
-                                    &sig,
-                                    &format!(
-                                        "Merge branch '{}' into {}",
-                                        task_branch_name,
-                                        repo.head()?.shorthand().unwrap_or("HEAD")
-                                    ),
-                                    &tree,
-                                    &[&head_commit, &merge_commit],
-                                )?;
-                                repo.cleanup_state()?;
-                                (msg!("git.merge.done", branch = &task_branch_name), false)
-                            }
-                        } else {
-                            (msg!("git.merge.complete"), false)
-                        }
-                    };
+                    let (msg, is_conflict) =
+                        merge_branch_in_worktree(&operation_path, &task_branch_name)?;
 
                     let data = gather_refresh_data(&repo_path, commit_limit)?;
                     Ok((msg, is_conflict, data))
@@ -7973,6 +8000,192 @@ mod tests {
     // -------------------------------------------------------------------------
     // Checkout tests
     // -------------------------------------------------------------------------
+
+    /// A nested linked checkout and a deliberately dirty owner checkout. All
+    /// mutations must use the former, including their clean-worktree checks.
+    fn nested_checkout_fixture() -> (TempRepo, std::path::PathBuf, git2::Oid, git2::Oid) {
+        let fixture = TempRepo::init();
+        let base = fixture.commit_file("file.txt", "base\n", "base");
+        let target = fixture.commit_file("file.txt", "incoming\n", "incoming");
+        fixture.branch("incoming");
+        assert!(
+            run_git(fixture.path(), &["reset", "--hard", &base.to_string()])
+                .status
+                .success()
+        );
+        fs::write(fixture.repo().path().join("info/exclude"), ".worktrees/\n").unwrap();
+        let checkout = fixture.path().join(".worktrees/inspected");
+        assert!(run_git(
+            fixture.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "inspected",
+                checkout.to_str().unwrap()
+            ]
+        )
+        .status
+        .success());
+        fixture.write_file("file.txt", "main staged\n");
+        fixture.stage("file.txt");
+        fixture.write_file("file.txt", "main unstaged\n");
+        fixture.write_file("untracked.txt", "main untracked\n");
+        (fixture, checkout, base, target)
+    }
+
+    fn assert_owner_checkout_untouched(fixture: &TempRepo, base: git2::Oid) {
+        let repo = git2::Repository::open(fixture.path()).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+        assert_eq!(repo.head().unwrap().target(), Some(base));
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(
+            fs::read(fixture.path().join("file.txt")).unwrap(),
+            b"main unstaged\n"
+        );
+        assert_eq!(
+            fs::read(fixture.path().join("untracked.txt")).unwrap(),
+            b"main untracked\n"
+        );
+        let index = repo.index().unwrap();
+        assert!(!index.has_conflicts());
+        let entry = index.get_path(std::path::Path::new("file.txt"), 0).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id).unwrap().content(),
+            b"main staged\n"
+        );
+    }
+
+    fn assert_nested_checkout_target(checkout: &std::path::Path, target: git2::Oid) {
+        let repo = git2::Repository::open(checkout).unwrap();
+        assert_eq!(repo.head().unwrap().target(), Some(target));
+        assert_eq!(fs::read(checkout.join("file.txt")).unwrap(), b"incoming\n");
+        let index = repo.index().unwrap();
+        let entry = index.get_path(std::path::Path::new("file.txt"), 0).unwrap();
+        assert_eq!(repo.find_blob(entry.id).unwrap().content(), b"incoming\n");
+    }
+
+    #[test]
+    fn checkout_branch_targets_nested_worktree_only() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        super::checkout_branch_in_worktree(&checkout, "incoming").unwrap();
+        let repo = git2::Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("incoming"));
+        assert_nested_checkout_target(&checkout, target);
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn checkout_remote_branch_targets_nested_worktree_only() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        fixture
+            .repo()
+            .remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        fixture
+            .repo()
+            .reference("refs/remotes/origin/remote-topic", target, false, "test")
+            .unwrap();
+        super::checkout_branch_in_worktree(&checkout, "origin/remote-topic").unwrap();
+        let repo = git2::Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("remote-topic"));
+        let branch = repo
+            .find_branch("remote-topic", git2::BranchType::Local)
+            .unwrap();
+        assert_eq!(
+            branch.upstream().unwrap().name().unwrap(),
+            Some("origin/remote-topic")
+        );
+        assert_nested_checkout_target(&checkout, target);
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn checkout_commit_targets_nested_worktree_only() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        super::checkout_commit_in_worktree(&checkout, target).unwrap();
+        assert!(git2::Repository::open(&checkout)
+            .unwrap()
+            .head_detached()
+            .unwrap());
+        assert_nested_checkout_target(&checkout, target);
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn checkout_tag_targets_nested_worktree_only() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        let obj = fixture.repo().find_object(target, None).unwrap();
+        fixture
+            .repo()
+            .tag(
+                "release",
+                &obj,
+                &fixture.signature(),
+                "annotated tag",
+                false,
+            )
+            .unwrap();
+        super::checkout_tag_in_worktree(&checkout, "release").unwrap();
+        assert!(git2::Repository::open(&checkout)
+            .unwrap()
+            .head_detached()
+            .unwrap());
+        assert_nested_checkout_target(&checkout, target);
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn merge_branch_fast_forward_targets_nested_worktree_only() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        let (_, conflict) = super::merge_branch_in_worktree(&checkout, "incoming").unwrap();
+        assert!(!conflict);
+        let repo = git2::Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("inspected"));
+        assert_nested_checkout_target(&checkout, target);
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn merge_branch_conflict_stays_in_nested_worktree() {
+        let (fixture, checkout, base, _) = nested_checkout_fixture();
+        fs::write(checkout.join("file.txt"), "inspected change\n").unwrap();
+        assert!(run_git(&checkout, &["commit", "-am", "inspected change"])
+            .status
+            .success());
+        let repo = git2::Repository::open(&checkout).unwrap();
+        let head = repo.head().unwrap().target();
+        let (_, conflict) = super::merge_branch_in_worktree(&checkout, "incoming").unwrap();
+        assert!(conflict);
+        assert_eq!(repo.head().unwrap().target(), head);
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        assert!(repo.index().unwrap().has_conflicts());
+        assert!(repo.path().join("MERGE_HEAD").exists());
+        assert_owner_checkout_untouched(&fixture, base);
+    }
+
+    #[test]
+    fn checkout_and_merge_refuse_dirty_nested_worktree() {
+        let (fixture, checkout, base, target) = nested_checkout_fixture();
+        let obj = fixture.repo().find_object(target, None).unwrap();
+        fixture
+            .repo()
+            .tag_lightweight("release", &obj, false)
+            .unwrap();
+        fs::write(checkout.join("file.txt"), "nested local work\n").unwrap();
+        assert!(super::checkout_branch_in_worktree(&checkout, "incoming").is_err());
+        assert!(super::checkout_commit_in_worktree(&checkout, target).is_err());
+        assert!(super::checkout_tag_in_worktree(&checkout, "release").is_err());
+        assert!(super::merge_branch_in_worktree(&checkout, "incoming").is_err());
+        let repo = git2::Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("inspected"));
+        assert_eq!(repo.head().unwrap().target(), Some(base));
+        assert_eq!(
+            fs::read(checkout.join("file.txt")).unwrap(),
+            b"nested local work\n"
+        );
+        assert_owner_checkout_untouched(&fixture, base);
+    }
 
     #[test]
     fn checkout_branch_switches_head() {

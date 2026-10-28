@@ -153,7 +153,7 @@ impl CreatePrDialog {
         self.visible
     }
 
-    fn cancel(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
         cx.emit(CreatePrDialogEvent::Dismissed);
         cx.notify();

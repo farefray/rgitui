@@ -120,13 +120,15 @@ impl StashesPanel {
     }
 
     fn drop_stash(&self, index: usize, cx: &mut Context<Self>) {
-        let Some(ws) = self.workspace.upgrade() else {
+        let (Some(ws), Some(project)) = (self.workspace.upgrade(), self.project.upgrade()) else {
             return;
         };
         ws.update(cx, |ws, cx| {
-            ws.dialogs.confirm_dialog.update(cx, |cd, cx| {
-                cd.show_visible(crate::ConfirmAction::StashDrop(index), cx);
-            });
+            // A callback from a panel hidden by a tab switch is not a request
+            // to delete the same stash index in the newly selected repository.
+            if ws.active_project() == Some(&project) {
+                ws.show_confirmation(crate::ConfirmAction::StashDrop(index), cx);
+            }
         });
     }
 

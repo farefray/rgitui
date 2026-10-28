@@ -10,6 +10,14 @@ use crate::{
 use super::focus::{DrawnPanels, OverlayFocus};
 use super::{ActiveOperation, OperationOutput};
 
+#[path = "safety.rs"]
+pub(crate) mod safety;
+
+/// Runtime identity plus the checkout captured when a request was issued.
+/// A reopened repository is a different target, even at the same path.
+pub(crate) type RepositoryTarget = safety::RepositoryTarget<EntityId>;
+pub(crate) type GitOperationTarget = safety::OperationTarget<EntityId>;
+
 /// Layout dimensions for resizable panels.
 pub(crate) struct LayoutState {
     pub sidebar_width: f32,
@@ -56,12 +64,16 @@ pub(crate) struct OverlayState {
 pub(crate) struct AiGenerationTarget {
     pub sequence: u64,
     pub panel: WeakEntity<CommitPanel>,
+    /// Changes even when a checkout is left and then revisited.
+    pub checkout_generation: u64,
 }
 
 /// Git operation tracking state.
 pub(crate) struct OperationState {
     pub active_git_operation: Option<GitOperationUpdate>,
+    pub active_git_operation_target: Option<GitOperationTarget>,
     pub last_failed_git_operation: Option<GitOperationUpdate>,
+    pub last_failed_git_operation_target: Option<GitOperationTarget>,
     pub active_operations: Vec<ActiveOperation>,
     pub last_operation_output: Option<OperationOutput>,
     /// The panel the in-flight AI generation writes to. The generator refuses

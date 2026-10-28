@@ -1,14 +1,16 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{
     div, px, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle, FontWeight, Render,
-    SharedString, Window,
+    ScrollHandle, SharedString, Window,
 };
 use rgitui_i18n::{key, t};
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
     Button, ButtonStyle, Icon, IconName, IconSize, Label, LabelSize, TextInput, TextInputEvent,
+    Tooltip,
 };
 
 use crate::keymap;
@@ -21,9 +23,78 @@ pub enum RepoOpenerEvent {
     ShowCloneDialog,
 }
 
+/// A repository already open in the workspace. Paths identify activation targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRepoEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub worktree: Option<String>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Open,
+    Switch,
+}
+
+fn recent_entry(path: &std::path::Path) -> OpenRepoEntry {
+    OpenRepoEntry {
+        path: path.to_path_buf(),
+        name: path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+        worktree: None,
+        active: false,
+    }
+}
+
+/// Preserve workspace order, then recent order; open entries own duplicate paths.
+/// No filesystem canonicalization here: workspace supplies normalized paths.
+fn switcher_entries(open: &[OpenRepoEntry], recent: &[PathBuf]) -> Vec<OpenRepoEntry> {
+    let mut seen = HashSet::new();
+    open.iter()
+        .cloned()
+        .chain(recent.iter().map(|path| recent_entry(path)))
+        .filter(|entry| seen.insert(entry.path.clone()))
+        .collect()
+}
+
+fn filter_entries(entries: &[OpenRepoEntry], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.name.to_lowercase().contains(&query)
+                || entry.path.to_string_lossy().to_lowercase().contains(&query)
+                || entry
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase().contains(&query))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn initial_selection(mode: Mode, result_count: usize) -> Option<usize> {
+    (mode == Mode::Switch && result_count > 0).then_some(0)
+}
+
+fn bounded_selection(row: usize, result_count: usize) -> Option<usize> {
+    (result_count > 0).then(|| row.min(result_count - 1))
+}
+
 pub struct RepoOpener {
     editor: Entity<TextInput>,
     recent_repos: Vec<PathBuf>,
+    open_repos: Vec<OpenRepoEntry>,
+    entries: Vec<OpenRepoEntry>,
+    mode: Mode,
+    scroll_handle: ScrollHandle,
+    focus_pending: bool,
     filtered_indices: Vec<usize>,
     selected_index: Option<usize>,
     visible: bool,
@@ -57,6 +128,11 @@ impl RepoOpener {
         Self {
             editor,
             recent_repos: Vec::new(),
+            open_repos: Vec::new(),
+            entries: Vec::new(),
+            mode: Mode::Open,
+            scroll_handle: ScrollHandle::new(),
+            focus_pending: false,
             filtered_indices: Vec::new(),
             selected_index: None,
             visible: false,
@@ -64,19 +140,69 @@ impl RepoOpener {
         }
     }
 
-    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.visible = !self.visible;
-        if self.visible {
-            self.editor.update(cx, |e, cx| e.clear(cx));
-            self.selected_index = None;
-            self.recent_repos = cx
-                .global::<rgitui_settings::SettingsState>()
-                .settings()
-                .recent_repos
-                .clone();
+    pub fn set_open_repos(&mut self, repos: Vec<OpenRepoEntry>, cx: &mut Context<Self>) {
+        self.open_repos = repos;
+        if self.visible && self.mode == Mode::Switch {
+            self.rebuild_entries();
             self.update_filter(cx);
-            self.editor.update(cx, |e, cx| e.focus(window, cx));
+            cx.notify();
         }
+    }
+
+    /// Switch among open repositories first, then recent repositories.
+    pub fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mode(Mode::Switch, cx);
+        self.focus_editor(window, cx);
+    }
+
+    /// The original raw-path opener (Ctrl+O), not the repository switcher.
+    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mode(Mode::Open, cx);
+        self.focus_editor(window, cx);
+    }
+
+    fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible && self.focus_pending {
+            self.focus_pending = false;
+            self.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        }
+    }
+
+    fn rebuild_entries(&mut self) {
+        self.entries = match self.mode {
+            Mode::Open => self
+                .recent_repos
+                .iter()
+                .map(|path| recent_entry(path))
+                .collect(),
+            Mode::Switch => switcher_entries(&self.open_repos, &self.recent_repos),
+        };
+    }
+
+    fn toggle_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.visible && self.mode == mode {
+            self.dismiss(cx);
+            return;
+        }
+        self.mode = mode;
+        self.visible = true;
+        self.focus_pending = true;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_placeholder_message(match mode {
+                Mode::Open => key!("repo_opener.enter_repo_path.placeholder"),
+                Mode::Switch => key!("repo_opener.search.placeholder"),
+            });
+            editor.clear(cx);
+        });
+        self.recent_repos = cx
+            .global::<rgitui_settings::SettingsState>()
+            .settings()
+            .recent_repos
+            .clone();
+        self.rebuild_entries();
+        self.update_filter(cx);
+        self.scroll_handle.scroll_to_item(0);
         cx.notify();
     }
 
@@ -85,63 +211,36 @@ impl RepoOpener {
     }
 
     pub fn toggle_visible(&mut self, cx: &mut Context<Self>) {
-        self.visible = !self.visible;
-        if self.visible {
-            self.editor.update(cx, |e, cx| e.clear(cx));
-            self.selected_index = None;
-            self.recent_repos = cx
-                .global::<rgitui_settings::SettingsState>()
-                .settings()
-                .recent_repos
-                .clone();
-            self.update_filter(cx);
-        }
-        cx.notify();
+        // Mouse callers without a Window get autofocus on the next render.
+        self.toggle_mode(Mode::Open, cx);
     }
 
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
+        self.focus_pending = false;
         self.editor.update(cx, |e, cx| e.clear(cx));
         cx.emit(RepoOpenerEvent::Dismissed);
         cx.notify();
     }
 
     fn update_filter(&mut self, cx: &mut Context<Self>) {
-        let query = self.editor.read(cx).text().to_lowercase();
-        if query.is_empty() {
-            self.filtered_indices = (0..self.recent_repos.len()).collect();
-        } else {
-            self.filtered_indices = self
-                .recent_repos
-                .iter()
-                .enumerate()
-                .filter(|(_, path)| {
-                    let path_str = path.to_string_lossy().to_lowercase();
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    path_str.contains(&query) || name.contains(&query)
-                })
-                .map(|(i, _)| i)
-                .collect();
-        }
-        match self.selected_index {
-            Some(_) if self.filtered_indices.is_empty() => self.selected_index = None,
-            Some(index) => {
-                self.selected_index = Some(index.min(self.filtered_indices.len() - 1));
-            }
-            None => {}
-        }
+        self.filtered_indices = filter_entries(&self.entries, self.editor.read(cx).text());
+        // A new query selects the first result only in switcher mode. In raw-path
+        // mode Enter must continue to open the typed path, not a recent match.
+        self.selected_index = initial_selection(self.mode, self.filtered_indices.len());
+        self.scroll_handle.scroll_to_item(0);
     }
 
     fn try_open(&mut self, cx: &mut Context<Self>) {
         let path = if let Some(selected_index) = self.selected_index {
             match self.filtered_indices.get(selected_index) {
-                Some(&idx) => self.recent_repos[idx].clone(),
+                Some(&idx) => self.entries[idx].path.clone(),
                 None => return,
             }
         } else {
+            if self.mode == Mode::Switch {
+                return;
+            }
             let query = self.editor.read(cx).text().to_string();
             if query.is_empty() {
                 return;
@@ -167,7 +266,7 @@ impl RepoOpener {
         cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
             let folder = async {
                 rfd::AsyncFileDialog::new()
-                    .set_title("Select Git Repository")
+                    .set_title(t!("repo_opener.select_folder").to_string())
                     .pick_folder()
                     .await
                     .map(|handle| handle.path().to_path_buf())
@@ -221,20 +320,22 @@ impl RepoOpener {
 
     /// Moves the highlight within the filtered list.
     fn select_row(&mut self, row: usize, cx: &mut Context<Self>) {
-        if self.filtered_indices.is_empty() {
-            return;
+        self.selected_index = bounded_selection(row, self.filtered_indices.len());
+        if let Some(row) = self.selected_index {
+            self.scroll_handle.scroll_to_item(row);
         }
-        self.selected_index = Some(row.min(self.filtered_indices.len() - 1));
         cx.notify();
     }
 }
 
 impl Render for RepoOpener {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.visible {
             return div().id("repo-opener").into_any_element();
         }
 
+        self.focus_editor(window, cx);
+        let switching = self.mode == Mode::Switch;
         let colors = cx.colors().clone();
 
         let mut modal = div()
@@ -244,7 +345,7 @@ impl Render for RepoOpener {
                 keymap::bind_actions(el, "RepoOpener List", &["Menu"], cx, Self::dispatch_command)
             })
             .v_flex()
-            .w(px(500.))
+            .w(px(640.))
             .max_h(px(480.))
             .elevation_3(cx)
             .rounded(px(10.))
@@ -277,9 +378,13 @@ impl Render for RepoOpener {
                                 .color(Color::Muted),
                         )
                         .child(
-                            Label::new(t!("common.open_repository"))
-                                .size(LabelSize::Large)
-                                .weight(FontWeight::SEMIBOLD),
+                            Label::new(if switching {
+                                t!("repo_opener.switch_repository")
+                            } else {
+                                t!("common.open_repository")
+                            })
+                            .size(LabelSize::Large)
+                            .weight(FontWeight::SEMIBOLD),
                         ),
                 )
                 .child(
@@ -311,10 +416,14 @@ impl Render for RepoOpener {
                 .v_flex()
                 .gap(px(8.))
                 .child(
-                    Label::new(t!("repo_opener.repo_path"))
-                        .size(LabelSize::Small)
-                        .weight(FontWeight::MEDIUM)
-                        .color(Color::Muted),
+                    Label::new(if switching {
+                        t!("repo_opener.search")
+                    } else {
+                        t!("repo_opener.repo_path")
+                    })
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::MEDIUM)
+                    .color(Color::Muted),
                 )
                 .child(
                     div()
@@ -333,29 +442,33 @@ impl Render for RepoOpener {
                                 )
                                 .child(div().flex_1().child(self.editor.clone())),
                         )
-                        .child(
-                            Button::new("browse-folder", t!("common.browse"))
-                                .style(ButtonStyle::Subtle)
-                                .icon(IconName::Folder)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.browse_folder(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("clone-repo", t!("common.clone"))
-                                .style(ButtonStyle::Subtle)
-                                .icon(IconName::Plus)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.visible = false;
-                                    this.editor.update(cx, |e, cx| e.clear(cx));
-                                    cx.emit(RepoOpenerEvent::ShowCloneDialog);
-                                    cx.notify();
-                                })),
-                        ),
+                        .when(!switching, |el| {
+                            el.child(
+                                Button::new("browse-folder", t!("common.browse"))
+                                    .style(ButtonStyle::Subtle)
+                                    .icon(IconName::Folder)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.browse_folder(cx);
+                                    })),
+                            )
+                        })
+                        .when(!switching, |el| {
+                            el.child(
+                                Button::new("clone-repo", t!("common.clone"))
+                                    .style(ButtonStyle::Subtle)
+                                    .icon(IconName::Plus)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.visible = false;
+                                        this.editor.update(cx, |e, cx| e.clear(cx));
+                                        cx.emit(RepoOpenerEvent::ShowCloneDialog);
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 ),
         );
 
-        if !self.recent_repos.is_empty() {
+        if !self.entries.is_empty() || switching {
             modal = modal.child(
                 div()
                     .h_flex()
@@ -367,10 +480,14 @@ impl Render for RepoOpener {
                     .border_color(colors.border_variant)
                     .items_center()
                     .child(
-                        Label::new(t!("common.recent_repositories"))
-                            .size(LabelSize::XSmall)
-                            .weight(FontWeight::SEMIBOLD)
-                            .color(Color::Muted),
+                        Label::new(if switching {
+                            t!("repo_opener.open_then_recent")
+                        } else {
+                            t!("common.recent_repositories")
+                        })
+                        .size(LabelSize::XSmall)
+                        .weight(FontWeight::SEMIBOLD)
+                        .color(Color::Muted),
                     ),
             );
 
@@ -380,15 +497,14 @@ impl Render for RepoOpener {
                 .w_full()
                 .px(px(8.))
                 .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+                .min_h_0()
                 .max_h(px(260.));
 
             for (display_idx, &repo_idx) in self.filtered_indices.iter().enumerate() {
-                let repo_path = &self.recent_repos[repo_idx];
-                let repo_name: SharedString = repo_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| repo_path.to_string_lossy().to_string())
-                    .into();
+                let entry = &self.entries[repo_idx];
+                let repo_path = &entry.path;
+                let repo_name: SharedString = entry.name.clone().into();
                 let repo_path_display: SharedString =
                     repo_path.to_string_lossy().to_string().into();
                 let is_selected = self.selected_index == Some(display_idx);
@@ -404,11 +520,13 @@ impl Render for RepoOpener {
                     ))
                     .h_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .px(px(16.))
                     .py(px(12.))
                     .gap(px(12.))
                     .rounded(px(6.))
                     .cursor_pointer()
+                    .tooltip(Tooltip::text(repo_path_display.clone()))
                     .when(is_selected, move |el| el.bg(selected_bg))
                     .hover(move |s| s.bg(hover_bg))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -429,17 +547,42 @@ impl Render for RepoOpener {
                         div()
                             .v_flex()
                             .flex_1()
+                            .min_w_0()
                             .gap(px(2.))
                             .child(
-                                Label::new(repo_name)
-                                    .size(LabelSize::Small)
-                                    .weight(FontWeight::MEDIUM)
-                                    .color(Color::Default),
+                                div()
+                                    .h_flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        Label::new(repo_name)
+                                            .size(LabelSize::Small)
+                                            .weight(FontWeight::MEDIUM)
+                                            .color(Color::Default),
+                                    )
+                                    .when(switching && entry.active, |el| {
+                                        el.child(
+                                            Label::new(t!("repo_opener.active"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        )
+                                    }),
                             )
-                            .child(
-                                Label::new(repo_path_display)
+                            .when_some(entry.worktree.as_ref(), |el, worktree| {
+                                el.child(
+                                    Label::new(t!(
+                                        "repo_opener.worktree",
+                                        name = worktree.as_str()
+                                    ))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
+                                )
+                            })
+                            .child(
+                                div().w_full().whitespace_normal().overflow_hidden().child(
+                                    Label::new(repo_path_display)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
                             ),
                     );
 
@@ -513,11 +656,18 @@ impl Render for RepoOpener {
                         })),
                 )
                 .child(
-                    Button::new("open-repo", t!("repo_opener.open")).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.try_open(cx);
+                    Button::new(
+                        "open-repo",
+                        if switching {
+                            t!("repo_opener.switch")
+                        } else {
+                            t!("repo_opener.open")
                         },
-                    )),
+                    )
+                    .disabled(switching && self.selected_index.is_none())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.try_open(cx);
+                    })),
                 ),
         );
 
@@ -548,6 +698,99 @@ impl Render for RepoOpener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_entry(path: &str, name: &str, worktree: Option<&str>, active: bool) -> OpenRepoEntry {
+        OpenRepoEntry {
+            path: PathBuf::from(path),
+            name: name.to_owned(),
+            worktree: worktree.map(str::to_owned),
+            active,
+        }
+    }
+
+    #[test]
+    fn open_repositories_precede_deduplicated_recents() {
+        let open = vec![
+            open_entry("/work/app", "App", Some("feature"), true),
+            open_entry("/work/lib", "Library", None, false),
+        ];
+        let recent = [
+            "/old/repo",
+            "/work/app",
+            "/old/repo",
+            "/work/lib",
+            "/last/repo",
+        ]
+        .map(PathBuf::from);
+        let entries = switcher_entries(&open, &recent);
+        assert_eq!(&entries[..2], open.as_slice());
+        assert_eq!(entries[2].path, PathBuf::from("/old/repo"));
+        assert_eq!(entries[3].path, PathBuf::from("/last/repo"));
+        assert_eq!(entries.len(), 4);
+        assert!(!entries[2].active);
+    }
+
+    #[test]
+    fn duplicate_open_paths_keep_first_metadata_but_not_distinct_worktrees() {
+        let open = vec![
+            open_entry("/work/app", "App", Some("main"), true),
+            open_entry("/work/app", "Duplicate", None, false),
+            open_entry("/trees/app", "App", Some("feature"), false),
+        ];
+        assert_eq!(
+            switcher_entries(&open, &[]),
+            vec![open[0].clone(), open[2].clone()]
+        );
+    }
+
+    #[test]
+    fn search_matches_name_full_path_and_worktree_case_insensitively() {
+        let entries = vec![
+            open_entry("/work/app", "Frontend", Some("Release-42"), true),
+            open_entry("/archive/service", "Backend", None, false),
+            open_entry("/trees/app", "Frontend", Some("feature"), false),
+        ];
+        assert_eq!(filter_entries(&entries, " FRONTEND "), vec![0, 2]);
+        assert_eq!(filter_entries(&entries, "/ARCHIVE/"), vec![1]);
+        assert_eq!(filter_entries(&entries, "release-42"), vec![0]);
+        assert_eq!(filter_entries(&entries, ""), vec![0, 1, 2]);
+        assert!(filter_entries(&entries, "missing").is_empty());
+    }
+
+    #[test]
+    fn switcher_selects_first_filtered_result_but_raw_path_mode_does_not() {
+        let entries = vec![
+            open_entry("/work/app", "App", None, true),
+            open_entry("/work/lib", "Library", None, false),
+        ];
+        let matches = filter_entries(&entries, "library");
+        let selected = initial_selection(Mode::Switch, matches.len()).unwrap();
+        assert_eq!(entries[matches[selected]].path, PathBuf::from("/work/lib"));
+        assert_eq!(initial_selection(Mode::Switch, 0), None);
+        assert_eq!(initial_selection(Mode::Open, 2), None);
+        assert_eq!(initial_selection(Mode::Open, 0), None);
+    }
+
+    #[test]
+    fn selection_is_bounded_for_empty_single_and_fifteen_repo_lists() {
+        assert_eq!(bounded_selection(0, 0), None);
+        assert_eq!(bounded_selection(usize::MAX, 0), None);
+        assert_eq!(bounded_selection(12, 1), Some(0));
+        assert_eq!(bounded_selection(0, 15), Some(0));
+        assert_eq!(bounded_selection(7, 15), Some(7));
+        assert_eq!(bounded_selection(15, 15), Some(14));
+        assert_eq!(initial_selection(Mode::Switch, 15), Some(0));
+    }
+
+    #[test]
+    fn recent_only_and_empty_switchers_are_supported() {
+        assert!(switcher_entries(&[], &[]).is_empty());
+        let entries = switcher_entries(&[], &[PathBuf::from("/recent/repo")]);
+        assert_eq!(
+            entries,
+            vec![open_entry("/recent/repo", "repo", None, false)]
+        );
+    }
 
     #[test]
     fn test_repo_opener_event_debug() {

@@ -194,6 +194,9 @@ impl Render for Workspace {
             crate::perf::note_first_content(cx);
         }
 
+        if std::mem::take(&mut self.switcher_requested) {
+            self.toggle_repository_switcher(window, cx);
+        }
         self.track_focus(window, cx);
 
         // Nothing holds focus on a fresh launch. gpui dispatches an action
@@ -294,8 +297,7 @@ impl Render for Workspace {
         }
 
         let Some(active_tab) = self.tabs.get(self.active_tab) else {
-            self.active_tab = 0;
-            cx.notify();
+            self.activate_tab(0, cx);
             return div().into_any_element();
         };
         let project = active_tab.project.read(cx);
@@ -308,7 +310,7 @@ impl Render for Workspace {
             .as_ref()
             .and_then(|inspecting| project.worktree_at(&inspecting.path));
         let repo_name: SharedString = match inspected {
-            Some(worktree) => worktree.name.clone().into(),
+            Some(worktree) => format!("{} › {}", project.repo_name(), worktree.name).into(),
             None => project.repo_name().to_string().into(),
         };
         let head_detached = match inspected {
@@ -424,32 +426,52 @@ impl Render for Workspace {
         let (ahead, behind) = super::events::active_branch_ahead_behind(active_tab, project);
 
         // Build tab bar
-        let mut tab_bar = TabBar::new();
+        let mut tab_bar = TabBar::new().track_scroll(&self.repo_tab_scroll);
         let workspace_handle = cx.entity().downgrade();
+        let tab_labels = self.repo_tab_labels(cx);
         for (i, tab) in self.tabs.iter().enumerate() {
-            let tab_name: SharedString = tab.name.clone().into();
+            let tab_name: SharedString = tab_labels[i].clone().into();
+            let project_id = tab.project.entity_id();
+            let repo_path = tab.project.read(cx).repo_path();
+            let effective_path = tab.effective_repo_path(cx);
+            let tooltip = if effective_path == repo_path {
+                repo_path.display().to_string()
+            } else {
+                format!("{}\n{}", repo_path.display(), effective_path.display())
+            };
+            let project = tab.project.read(cx);
+            let status = if tab.inspecting_worktree.is_some() {
+                project
+                    .worktree_at(&effective_path)
+                    .and_then(|wt| wt.status.as_ref())
+            } else {
+                Some(project.status())
+            };
+            let dirty = status
+                .is_some_and(|status| !status.staged.is_empty() || !status.unstaged.is_empty());
             let ws = workspace_handle.clone();
             let ws_close = workspace_handle.clone();
             tab_bar = tab_bar.tab(
                 Tab::new(
-                    ElementId::NamedInteger("project-tab".into(), i as u64),
+                    ElementId::NamedInteger("project-tab".into(), project_id.as_u64()),
                     tab_name,
                 )
                 .active(i == self.active_tab)
+                .dirty(dirty)
+                .tooltip(tooltip)
                 .closeable(true)
                 .on_click(move |_event, _window, cx| {
                     ws.update(cx, |ws, cx| {
-                        if i < ws.tabs.len() {
-                            ws.active_tab = i;
-                            cx.notify();
-                        }
+                        ws.activate_project(project_id, cx);
                     })
                     .ok();
                 })
                 .on_close(move |_event, _window, cx| {
                     ws_close
                         .update(cx, |ws, cx| {
-                            ws.close_tab(i, cx);
+                            if let Some(index) = ws.project_tab_index(project_id) {
+                                ws.close_tab(index, cx);
+                            }
                         })
                         .ok();
                 }),
@@ -459,10 +481,21 @@ impl Render for Workspace {
         // Add workspace and repo actions to tab bar
         let ws_home = workspace_handle.clone();
         let ws_open = workspace_handle.clone();
+        let ws_switch = workspace_handle.clone();
         tab_bar = tab_bar.end_slot(
             div()
                 .h_flex()
                 .gap_1()
+                .child(
+                    Button::new("tab-bar-repositories", t!("workspace.repositories"))
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Subtle)
+                        .icon(IconName::Folder)
+                        .on_click(move |_, window, cx| {
+                            let _ = ws_switch
+                                .update(cx, |ws, cx| ws.toggle_repository_switcher(window, cx));
+                        }),
+                )
                 .child(
                     IconButton::new("tab-bar-home", IconName::Folder)
                         .size(ButtonSize::Compact)
@@ -479,11 +512,11 @@ impl Render for Workspace {
                     IconButton::new("tab-bar-add", IconName::Plus)
                         .size(ButtonSize::Compact)
                         .color(Color::Muted)
-                        .on_click(move |_: &gpui::ClickEvent, _, cx| {
+                        .on_click(move |_: &gpui::ClickEvent, window, cx| {
                             ws_open
                                 .update(cx, |ws, cx| {
                                     ws.overlays.repo_opener.update(cx, |ro, cx| {
-                                        ro.toggle_visible(cx);
+                                        ro.toggle(window, cx);
                                     });
                                 })
                                 .ok();
@@ -570,17 +603,29 @@ impl Render for Workspace {
                                 )
                             }),
                     )
-                    .when(is_failure && update.retryable, |el| {
-                        let retry_update = update.clone();
-                        el.child(
-                            Button::new("operation-retry", t!("common.retry"))
-                                .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Filled)
-                                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                                    this.retry_git_operation(&retry_update, cx);
-                                })),
-                        )
-                    })
+                    .when_some(
+                        self.operations
+                            .last_failed_git_operation_target
+                            .clone()
+                            .filter(|_| is_failure && update.retryable),
+                        |el, retry_target| {
+                            let retry_update = update.clone();
+                            el.child(
+                                Button::new("operation-retry", t!("common.retry"))
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(
+                                        move |this, _: &gpui::ClickEvent, _, cx| {
+                                            this.retry_git_operation(
+                                                &retry_update,
+                                                &retry_target,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                            )
+                        },
+                    )
                     .when(is_failure, |el| {
                         el.child(
                             IconButton::new("operation-dismiss", IconName::X)
@@ -588,6 +633,7 @@ impl Render for Workspace {
                                 .color(Color::Muted)
                                 .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                                     this.operations.last_failed_git_operation = None;
+                                    this.operations.last_failed_git_operation_target = None;
                                     cx.notify();
                                 })),
                         )
@@ -629,6 +675,9 @@ impl Render for Workspace {
                 }
                 title
             })
+            // Repository navigation sits above the controls it scopes, rather
+            // than looking like another panel selector below the toolbar.
+            .child(tab_bar)
             // Toolbar
             .child(active_tab.toolbar.clone())
             .when_some(update_banner, |el, banner| el.child(banner))
@@ -761,8 +810,6 @@ impl Render for Workspace {
                 )
             })
             .when_some(detached_head_banner, |el, banner| el.child(banner))
-            // Tab bar
-            .child(tab_bar)
             // Main content area — drag_move listeners live here so they fire globally
             .child({
                 let entity = cx.entity();
@@ -1814,12 +1861,20 @@ impl Workspace {
                     .gap_2()
                     .mt(px(4.))
                     .child(
+                        Button::new("workspace-home-repositories", t!("workspace.repositories"))
+                            .style(ButtonStyle::Subtle)
+                            .icon(IconName::Folder)
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                                this.toggle_repository_switcher(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("workspace-home-open-repo", t!("common.open_repository"))
                             .style(ButtonStyle::Filled)
                             .icon(IconName::Folder)
-                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
                                 this.overlays.repo_opener.update(cx, |opener, cx| {
-                                    opener.toggle_visible(cx);
+                                    opener.toggle(window, cx);
                                 });
                             })),
                     )
@@ -1827,10 +1882,10 @@ impl Workspace {
                         Button::new("workspace-home-new", t!("workspace.home.new_workspace"))
                             .style(ButtonStyle::Outlined)
                             .icon(IconName::Plus)
-                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
                                 this.go_home(cx);
                                 this.overlays.repo_opener.update(cx, |opener, cx| {
-                                    opener.toggle_visible(cx);
+                                    opener.toggle(window, cx);
                                 });
                             })),
                     )

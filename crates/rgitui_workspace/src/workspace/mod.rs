@@ -167,8 +167,9 @@ impl ViewCaches {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct ProjectTab {
+    /// Shared by the main checkout and all linked worktrees.
+    pub common_git_dir: PathBuf,
     pub name: String,
     pub project: Entity<GitProject>,
     pub graph: Entity<rgitui_graph::GraphView>,
@@ -191,6 +192,41 @@ pub(super) struct ProjectTab {
     pub bottom_panel_mode: BottomPanelMode,
     pub caches: ViewCaches,
     pub inspecting_worktree: Option<InspectingWorktree>,
+    pub _subscriptions: Vec<gpui::Subscription>,
+}
+
+// Commands clone view handles to avoid borrowing the workspace across updates.
+// The live tab alone owns subscriptions: a delayed command must not keep a
+// closed tab's event routing alive.
+impl Clone for ProjectTab {
+    fn clone(&self) -> Self {
+        Self {
+            common_git_dir: self.common_git_dir.clone(),
+            name: self.name.clone(),
+            project: self.project.clone(),
+            graph: self.graph.clone(),
+            diff_viewer: self.diff_viewer.clone(),
+            blame_view: self.blame_view.clone(),
+            file_history_view: self.file_history_view.clone(),
+            reflog_view: self.reflog_view.clone(),
+            bisect_view: self.bisect_view.clone(),
+            submodule_view: self.submodule_view.clone(),
+            detail_panel: self.detail_panel.clone(),
+            sidebar: self.sidebar.clone(),
+            commit_panel: self.commit_panel.clone(),
+            toolbar: self.toolbar.clone(),
+            issues_panel: self.issues_panel.clone(),
+            prs_panel: self.prs_panel.clone(),
+            branch_health_panel: self.branch_health_panel.clone(),
+            stashes_panel: self.stashes_panel.clone(),
+            global_search_view: self.global_search_view.clone(),
+            right_panel_mode: self.right_panel_mode,
+            bottom_panel_mode: self.bottom_panel_mode,
+            caches: self.caches.clone(),
+            inspecting_worktree: self.inspecting_worktree.clone(),
+            _subscriptions: Vec::new(),
+        }
+    }
 }
 
 impl ProjectTab {
@@ -303,6 +339,7 @@ impl FocusedPanel {
 
 /// Tracks a long-running git operation in progress.
 pub(super) struct ActiveOperation {
+    pub project_id: gpui::EntityId,
     pub id: u64,
     pub label: Message,
     pub started_at: Instant,
@@ -331,6 +368,18 @@ pub(super) struct UpdateNotification {
 pub struct Workspace {
     pub(super) tabs: Vec<ProjectTab>,
     pub(super) active_tab: usize,
+    pub(super) previous_project: Option<gpui::EntityId>,
+    pub(super) repo_tab_scroll: gpui::ScrollHandle,
+    pub(super) switcher_requested: bool,
+    /// Suppress partial snapshots while rebuilding a saved session.
+    pub(super) restoring_workspace: bool,
+    /// Worktree selection is applied only after each project's first refresh.
+    pub(super) pending_worktrees: std::collections::HashMap<gpui::EntityId, PathBuf>,
+    /// Unavailable session entries remain saved, including their checkout choice.
+    pub(super) unavailable_repos: Vec<(PathBuf, Option<PathBuf>)>,
+    /// Saved order includes unavailable slots until explicitly removed.
+    pub(super) session_repo_order: Vec<PathBuf>,
+    pub(super) saved_active_repo_path: Option<PathBuf>,
     pub(super) ai: Entity<AiGenerator>,
     pub(super) github_data: Entity<crate::github_data_service::GithubDataService>,
     pub(super) layout: LayoutState,
@@ -441,6 +490,14 @@ impl Workspace {
         Self {
             tabs: Vec::new(),
             active_tab: 0,
+            previous_project: None,
+            repo_tab_scroll: gpui::ScrollHandle::new(),
+            switcher_requested: false,
+            restoring_workspace: false,
+            pending_worktrees: std::collections::HashMap::new(),
+            unavailable_repos: Vec::new(),
+            session_repo_order: Vec::new(),
+            saved_active_repo_path: None,
             ai,
             github_data,
             layout: LayoutState {
@@ -472,7 +529,9 @@ impl Workspace {
             },
             operations: OperationState {
                 active_git_operation: None,
+                active_git_operation_target: None,
                 last_failed_git_operation: None,
+                last_failed_git_operation_target: None,
                 active_operations: Vec::new(),
                 last_operation_output: None,
                 ai_target: None,

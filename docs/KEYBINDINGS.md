@@ -75,6 +75,8 @@ The file is reloaded when you save it. Bindings you add win over the defaults. T
 | `f5` | `Workspace && !modal` | `rgitui::Refresh` | Reload the repository state from disk. |
 | `secondary-,` | `Workspace` | `rgitui::Settings` | Open the settings window. |
 | `secondary-o` | `Workspace` | `rgitui::OpenRepo` | Open the repository picker. |
+| `secondary-shift-o` | `Workspace && !modal` | `rgitui::SwitchRepository` | Switch among open and recent repositories. |
+| `secondary-`` | `Workspace && !modal` | `rgitui::PreviousRepository` | Activate the previously used repository. |
 | `ctrl-h` | `Workspace && !modal` | `rgitui::WorkspaceHome` | Close every tab and return to the workspace home screen. |
 | _unbound_ | — | `rgitui::RestoreLastWorkspace` | Reopen the most recently saved workspace. |
 | `?` | `Workspace && !TextInput` | `rgitui::Shortcuts` | Show the keyboard shortcut reference. |

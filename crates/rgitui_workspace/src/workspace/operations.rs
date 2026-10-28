@@ -8,9 +8,117 @@ use rgitui_ui::{ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, L
 
 use crate::ToastKind;
 
-use super::{Workspace, OPERATION_OUTPUT_AUTO_HIDE_SECS};
+use super::{GitOperationTarget, RepositoryTarget, Workspace, OPERATION_OUTPUT_AUTO_HIDE_SECS};
 
 impl Workspace {
+    /// Legacy rebase/bisect/previous-branch APIs still assume the owning checkout.
+    /// Refuse them in inspection instead of silently changing another checkout.
+    pub(super) fn require_main_checkout(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.inspecting_worktree.is_some())
+        {
+            self.show_toast(
+                rgitui_i18n::t!("workspace.worktree.main_only"),
+                ToastKind::Warning,
+                cx,
+            );
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Capture the origin before showing the dialog: GPUI events are delivered
+    /// later, when another repository or checkout may already be selected.
+    pub(crate) fn show_confirmation(
+        &mut self,
+        action: crate::ConfirmAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let target = crate::confirm_dialog::ConfirmationTarget {
+            project_id: tab.project.entity_id(),
+            worktree_path: tab.effective_repo_path(cx),
+        };
+        self.dialogs.confirm_dialog.update(cx, |dialog, cx| {
+            dialog.show_visible(action, target, cx);
+        });
+    }
+
+    /// Unbound editors must not survive a context change and submit into another
+    /// checkout. Destructive confirmations retain an explicit origin instead.
+    pub(super) fn dismiss_checkout_dialogs(&mut self, cx: &mut Context<Self>) {
+        self.dialogs.branch_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.tag_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.rename_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.stash_save_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.stash_branch_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.worktree_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.overlays.interactive_rebase.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.dismiss(cx);
+            }
+        });
+        self.dialogs.create_pr_dialog.update(cx, |dialog, cx| {
+            if dialog.is_visible() {
+                dialog.cancel(cx);
+            }
+        });
+    }
+
+    /// Navigation must refuse to close a project while a mutation is running.
+    pub(super) fn project_has_active_operations(&self, project_id: gpui::EntityId) -> bool {
+        self.operations
+            .active_operations
+            .iter()
+            .any(|op| op.project_id == project_id)
+    }
+
+    /// Resolve only a live original project and a checkout still in its snapshot.
+    /// Never fall back to the active tab or a newly opened copy of the same path.
+    pub(super) fn resolve_repository_target(
+        &self,
+        target: &RepositoryTarget,
+        cx: &gpui::App,
+    ) -> Option<usize> {
+        self.tabs.iter().position(|tab| {
+            if tab.project.entity_id() != target.project_id {
+                return false;
+            }
+            let project = tab.project.read(cx);
+            project.repo_path() == target.worktree_path
+                || project.worktree_at(&target.worktree_path).is_some()
+        })
+    }
+
     pub(super) fn schedule_operation_output_auto_hide(
         &mut self,
         timestamp: Instant,
@@ -163,23 +271,30 @@ impl Workspace {
     pub(super) fn retry_git_operation(
         &mut self,
         update: &GitOperationUpdate,
+        target: &GitOperationTarget,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.active_project().cloned() else {
-            self.show_toast("No active repository to retry.", ToastKind::Warning, cx);
+        if update.id != target.operation_id {
+            return;
+        }
+        let Some(tab_index) = self.resolve_repository_target(&target.repository, cx) else {
+            self.show_toast(
+                rgitui_i18n::t!("workspace.safety.target_closed").to_string(),
+                ToastKind::Warning,
+                cx,
+            );
             return;
         };
-
-        // The checkout the operation actually ran in, carried on the update
-        // itself. Resolving it here from what is being inspected *now* is
-        // wrong whenever the failure arrives after the user has moved on —
-        // and for a network operation, whose failure is a timeout or a
-        // rejected push, arriving late is the normal case. Falling back to the
-        // effective path covers operations that record no worktree.
-        let worktree_path = update
-            .worktree_path
-            .clone()
-            .unwrap_or_else(|| self.effective_worktree_path(cx));
+        let project = self.tabs[tab_index].project.clone();
+        let worktree_path = target.repository.worktree_path.clone();
+        // These legacy methods operate only on the main checkout.
+        if matches!(
+            update.kind,
+            GitOperationKind::Checkout | GitOperationKind::Merge
+        ) && project.read(cx).repo_path() != worktree_path
+        {
+            return;
+        }
 
         let handled = project.update(cx, |proj, cx| match update.kind {
             GitOperationKind::Fetch => {
@@ -213,7 +328,8 @@ impl Workspace {
             }
             GitOperationKind::Checkout => {
                 if let Some(branch_name) = update.branch_name.as_deref() {
-                    proj.checkout_branch(branch_name, cx).detach();
+                    proj.checkout_branch_at(branch_name, &worktree_path, cx)
+                        .detach();
                     true
                 } else {
                     false
@@ -221,7 +337,8 @@ impl Workspace {
             }
             GitOperationKind::Merge => {
                 if let Some(branch_name) = update.branch_name.as_deref() {
-                    proj.merge_branch(branch_name, cx).detach();
+                    proj.merge_branch_at(branch_name, &worktree_path, cx)
+                        .detach();
                     true
                 } else {
                     false
@@ -244,8 +361,9 @@ impl Workspace {
                 ToastKind::Info,
                 cx,
             );
-        } else {
+        } else if self.operations.last_failed_git_operation_target.as_ref() == Some(target) {
             self.operations.last_failed_git_operation = None;
+            self.operations.last_failed_git_operation_target = None;
         }
     }
 }

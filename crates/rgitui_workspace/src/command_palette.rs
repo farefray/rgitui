@@ -243,6 +243,14 @@ impl PaletteCommand {
         }
     }
 
+    fn translated_label(&self) -> SharedString {
+        match self.id {
+            CommandId::SwitchRepository => rgitui_i18n::t!("repo_opener.switch_repository"),
+            CommandId::PreviousRepository => rgitui_i18n::t!("repo_opener.previous_repository"),
+            _ => self.label.into(),
+        }
+    }
+
     fn with_predicate(mut self, pred: fn(CommandContext) -> bool) -> Self {
         self.predicate = pred;
         self
@@ -535,6 +543,18 @@ pub(crate) fn palette_commands() -> Vec<PaletteCommand> {
             "File",
         ),
         PaletteCommand::new(
+            CommandId::SwitchRepository,
+            "Switch Repository",
+            None,
+            "Workspace",
+        ),
+        PaletteCommand::new(
+            CommandId::PreviousRepository,
+            "Previous Repository",
+            None,
+            "Workspace",
+        ),
+        PaletteCommand::new(
             CommandId::WorkspaceHome,
             "Workspace: Home",
             Some("Return to the workspace home screen"),
@@ -767,7 +787,7 @@ impl CommandPalette {
                 .filter_map(|&i| {
                     let cmd = &self.commands[i];
                     // Best score across label, id, and category
-                    let label_lc = cmd.label.to_lowercase();
+                    let label_lc = cmd.translated_label().to_lowercase();
                     let id_lc = cmd.id.as_str().to_lowercase();
                     let cat_lc = cmd.category.to_lowercase();
                     let score = [label_lc.as_str(), id_lc.as_str(), cat_lc.as_str()]
@@ -931,7 +951,7 @@ impl Render for CommandPalette {
                             let cmd = &commands[cmd_idx];
                             let is_selected = display_idx == selected_index;
 
-                            let label: SharedString = cmd.label.into();
+                            let label = cmd.translated_label();
                             let cmd_id = cmd.id;
                             let icon = CommandPalette::category_icon(cmd.category);
                             let shortcut = summary.display(cmd_id);

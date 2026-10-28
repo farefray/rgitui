@@ -140,6 +140,10 @@ commands! {
         Settings "secondary-," in "Workspace";
         /// Open the repository picker.
         OpenRepo "secondary-o" in "Workspace";
+        /// Switch among open and recent repositories.
+        SwitchRepository "secondary-shift-o";
+        /// Activate the previously used repository.
+        PreviousRepository "secondary-`";
         // Control rather than the primary modifier: macOS reserves Cmd+H for
         // Hide Application, so a `secondary-` binding would never fire there.
         /// Close every tab and return to the workspace home screen.
@@ -767,6 +771,24 @@ mod tests {
     fn command_id_strings_are_stable() {
         for (id, expected) in LEGACY_IDS {
             assert_eq!(id.as_str(), *expected, "as_str drifted for {id:?}");
+        }
+    }
+
+    #[test]
+    fn repository_navigation_bindings_are_stable() {
+        assert_eq!(
+            CommandId::SwitchRepository.default_bindings(),
+            &[("secondary-shift-o", "Workspace && !modal")]
+        );
+        assert_eq!(
+            CommandId::PreviousRepository.default_bindings(),
+            &[("secondary-`", "Workspace && !modal")]
+        );
+        for id in [CommandId::SwitchRepository, CommandId::PreviousRepository] {
+            for (keys, _) in id.default_bindings() {
+                assert!(gpui::Keystroke::parse(keys).is_ok());
+            }
+            assert!(id.in_palette());
         }
     }
 
