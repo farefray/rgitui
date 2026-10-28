@@ -54,6 +54,34 @@ pub fn normalize_repo_path(path: PathBuf) -> PathBuf {
     path
 }
 
+/// A checkout path written the way the platform writes it, for display only.
+///
+/// libgit2 reports a working directory as `F:/repo/`, while Explorer and every
+/// other Windows tool show `F:\repo`. Trailing separators are dropped, except
+/// on a root such as `/` or `C:\`.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text.into_owned()
+    };
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        text
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The short name a checkout goes by: its folder name, or the whole path when
+/// it has none.
+pub fn checkout_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| display_path(path))
+}
+
 /// Create a `git` [`Command`] with `CREATE_NO_WINDOW` set on Windows so that
 /// spawning it from a GUI application never flashes a visible console window.
 ///
@@ -1976,6 +2004,36 @@ mod tests {
     fn normalize_relative_path_unchanged() {
         let path = PathBuf::from("./my-repo");
         assert_eq!(normalize_repo_path(path.clone()), path);
+    }
+
+    #[test]
+    fn display_path_drops_trailing_separators_but_keeps_roots() {
+        use super::display_path;
+        let expected = if cfg!(windows) {
+            r"F:\thegame"
+        } else {
+            "F:/thegame"
+        };
+        assert_eq!(display_path(std::path::Path::new("F:/thegame/")), expected);
+        assert_eq!(
+            display_path(std::path::Path::new("/")),
+            "/".replace('/', std::path::MAIN_SEPARATOR_STR)
+        );
+        let root = if cfg!(windows) { r"C:\" } else { "C:/" };
+        assert_eq!(display_path(std::path::Path::new("C:/")), root);
+    }
+
+    #[test]
+    fn checkout_names_ignore_a_trailing_separator() {
+        use super::checkout_display_name;
+        assert_eq!(
+            checkout_display_name(std::path::Path::new("F:/thegame/")),
+            "thegame"
+        );
+        assert_eq!(
+            checkout_display_name(std::path::Path::new("/work/thegame-worktrees/W-138")),
+            "W-138"
+        );
     }
 
     #[test]

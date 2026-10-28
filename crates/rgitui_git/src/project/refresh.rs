@@ -184,7 +184,7 @@ fn parse_git_log_records(
 /// `/` vs `\` on Windows, differing case), so raw `PathBuf` equality would let
 /// the same worktree appear twice. Falls back to the path as given when it
 /// cannot be resolved — e.g. a registry entry whose directory was deleted.
-fn worktree_identity(path: &Path) -> PathBuf {
+pub(super) fn worktree_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

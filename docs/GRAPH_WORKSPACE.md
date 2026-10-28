@@ -25,19 +25,34 @@ repository tab.
 
 ## Worktrees and safe navigation
 
-- Graph rows now include clean and not-yet-scanned checkouts, not only dirty ones.
-  Folder icons and **Checkout: …** / **Worktree: …** labels distinguish them from
-  branch refs and commits. Unknown status is not presented as "clean". Missing
-  HEAD metadata is not called a "new branch": unborn HEAD is confirmed by Git,
-  separately from unavailable checkouts.
+- A checkout gets its own graph row only when the row says something a badge
+  cannot: it has uncommitted changes, its HEAD is a confirmed unborn branch, or
+  it is the linked worktree being viewed. A clean worktree is shown instead by a
+  folder icon on its branch badge; **Display Settings → Show clean worktrees**
+  gives every checkout a row again. Unknown status is not presented as "clean".
+  Missing HEAD metadata is not called a "new branch": unborn HEAD is confirmed
+  by Git, separately from unavailable checkouts.
+- Worktree rows are labelled with a dashed chip naming the checkout, matching the
+  dashed pending-changes node.
+- A ref badge folds an attached HEAD and same-named remote branches into their
+  local branch, so `+N` counts only the other refs. Its tooltip and click-open
+  list name each ref with what else is true of it (HEAD, its remotes, the
+  worktree that has it checked out); a worktree entry in that list opens it.
 - Click or double-click a worktree row to view that existing checkout. This does
   not run Git checkout, move HEAD, or discard any checkout's changes. Subsequent
   Git actions target the viewed checkout.
+- Removing a worktree uses `core.longpaths` on Windows. If Git unregisters a
+  worktree but cannot delete all its files, rgitui finishes deleting the folder
+  rather than leaving an unlisted one behind, and refreshes the list either way.
+  A folder that is not a registered worktree is never deleted.
+- A failed operation is reported once, in the failure banner, which can expand to
+  show Git's full output.
 - Ordinary commit double-click now only inspects the commit. Checking out a commit
   remains an explicit context-menu action, not a navigation gesture.
 - The sidebar reveals its Worktrees section when linked checkouts first appear,
-  shows branch names with full-path/safe-entry tooltips, and marks the checkout
-  actually being viewed rather than always marking the originally opened one.
+  shows branch names with full-path/safe-entry tooltips, marks checkouts with
+  uncommitted changes, and marks the checkout actually being viewed rather than
+  always marking the originally opened one.
 - A blue informational worktree banner identifies the active context. **Back to
   repository** returns to the original checkout without removing the worktree or
   changing its files. Per-checkout commit drafts remain intact.

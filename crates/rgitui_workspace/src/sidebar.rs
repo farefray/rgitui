@@ -3764,11 +3764,13 @@ impl Render for Sidebar {
                                     } else {
                                         "—".into()
                                     });
-                                let tooltip = t!("sidebar.worktree.open.tooltip",
+                                let tooltip = t!("sidebar.worktree.tooltip",
                                     name = name, branch = branch,
-                                    path = worktree.path.display().to_string());
+                                    path = rgitui_git::display_path(&worktree.path));
+                                let has_changes = worktree.status.as_ref().is_some_and(|status| {
+                                    !status.staged.is_empty() || !status.unstaged.is_empty()
+                                });
                                 let w_sel = w.clone();
-                                let w_open = w.clone();
                                 let w_rm = w.clone();
 
                                 div()
@@ -3777,7 +3779,7 @@ impl Render for Sidebar {
                                         i as u64,
                                     ))
                                     .cursor_pointer()
-                                    .tooltip(Tooltip::text(tooltip.clone()))
+                                    .tooltip(Tooltip::text(tooltip))
                                     .h_flex()
                                     .w_full()
                                     .h(px(item_h))
@@ -3814,8 +3816,21 @@ impl Render for Sidebar {
                                             Label::new(name).size(LabelSize::Small).truncate()
                                         ),
                                     )
+                                    .when(has_changes, |el| {
+                                        el.child(
+                                            div()
+                                                .id(ElementId::NamedInteger("worktree-dirty".into(), i as u64))
+                                                .flex_shrink_0()
+                                                .tooltip(Tooltip::text(t!("sidebar.worktree.dirty")))
+                                                .child(
+                                                    rgitui_ui::Icon::new(IconName::Dot)
+                                                        .size(rgitui_ui::IconSize::XSmall)
+                                                        .color(Color::Warning),
+                                                ),
+                                        )
+                                    })
                                     .child(
-                                        div().max_w(px(88.)).min_w_0().overflow_hidden().child(
+                                        div().max_w(px(120.)).min_w_0().overflow_hidden().child(
                                             Label::new(branch).size(LabelSize::XSmall)
                                                 .color(Color::Muted).truncate()
                                         ),
@@ -3834,24 +3849,6 @@ impl Render for Sidebar {
                                             rgitui_ui::Icon::new(IconName::Lock)
                                                 .size(rgitui_ui::IconSize::XSmall)
                                                 .color(Color::Warning),
-                                        )
-                                    })
-                                    .when(!is_selected, |el| {
-                                        el.child(
-                                            IconButton::new(
-                                                ElementId::NamedInteger("open-worktree".into(), i as u64),
-                                                IconName::ChevronRight,
-                                            )
-                                            .size(ButtonSize::Compact)
-                                            .color(Color::Info)
-                                            .tooltip(tooltip)
-                                            .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                                cx.stop_propagation();
-                                                let _ = w_open.clone().update(cx, |this: &mut Sidebar, cx| {
-                                                    this.selected_worktree = Some(worktree_index);
-                                                    cx.emit(SidebarEvent::WorktreeSelected(worktree_index));
-                                                });
-                                            }),
                                         )
                                     })
                                     .when(!worktree.is_current, |el| {

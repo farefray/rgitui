@@ -124,6 +124,7 @@ mod tests {
             head_unborn: false,
             staged_count: 1,
             unstaged_count: 2,
+            status_known: true,
             combined_breakdown,
             worktree_path: PathBuf::from("/repos/rgitui"),
             branch: Some("main".to_string()),

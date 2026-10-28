@@ -148,6 +148,7 @@ pub(super) fn build_worktree_graph_infos(
                 head_unborn: worktree.head_unborn,
                 staged_count: status.map_or(0, |status| status.staged.len()),
                 unstaged_count: status.map_or(0, |status| status.unstaged.len()),
+                status_known: status.is_some(),
                 combined_breakdown,
                 worktree_path: worktree.path.clone(),
                 branch: worktree.branch.clone(),
@@ -381,6 +382,7 @@ pub(super) fn set_inspecting_worktree_for_tab(
     if tab_index == workspace.active_tab {
         workspace.dismiss_checkout_dialogs(cx);
     }
+    graph.update(cx, |g, cx| g.set_viewed_checkout(watch_path.clone(), cx));
     project.update(cx, |proj, _| proj.set_inspected_worktree(watch_path));
     update_sidebar_for_tab(workspace, tab_index, cx);
     let _ = detail_panel; // refreshed with the new checkout's status above
@@ -1567,13 +1569,15 @@ pub(super) fn subscribe_project(
                 };
                 let repo_path = project.read(cx).repo_path().to_path_buf();
                 let origin_label = |summary: &Message| {
+                    let repository = rgitui_git::checkout_display_name(&repo_path);
                     if target.repository.worktree_path == repo_path {
-                        msg!("workspace.operation.origin",
-                            repository = repo_path.display().to_string(), summary = summary)
+                        msg!("workspace.operation.origin", repository = repository, summary = summary)
                     } else {
                         msg!("workspace.operation.origin_worktree",
-                            repository = repo_path.display().to_string(),
-                            worktree = target.repository.worktree_path.display().to_string(),
+                            repository = repository,
+                            worktree = rgitui_git::checkout_display_name(
+                                &target.repository.worktree_path
+                            ),
                             summary = summary)
                     }
                 };
@@ -1635,7 +1639,7 @@ pub(super) fn subscribe_project(
                         {
                             let now = Instant::now();
                             this.operations.last_operation_output = Some(OperationOutput {
-                                operation: output_label.clone(),
+                                operation: output_label,
                                 output: details.clone(),
                                 is_error: false,
                                 timestamp: now,
@@ -1655,19 +1659,18 @@ pub(super) fn subscribe_project(
                             this.operations.active_git_operation = None;
                             this.operations.active_git_operation_target = None;
                         }
+                        // The failure banner reports a failure, details
+                        // included; an output bar would only repeat it. A toast
+                        // is needed only while the banner is busy showing
+                        // another operation that is still running.
                         this.operations.last_failed_git_operation = Some(update.clone());
                         this.operations.last_failed_git_operation_target = Some(target.clone());
-                        this.set_status_message(failure.clone(), cx);
-                        let error_output =
-                            update.details.clone().unwrap_or_else(|| failure.clone());
-                        this.operations.last_operation_output = Some(OperationOutput {
-                            operation: output_label,
-                            output: error_output,
-                            is_error: true,
-                            timestamp: Instant::now(),
-                            expanded: true,
-                        });
-                        this.show_toast(failure.translated(), ToastKind::Error, cx);
+                        this.operations.failure_details_expanded = false;
+                        this.operations.last_operation_output = None;
+                        if this.operations.active_git_operation.is_some() {
+                            this.show_toast(failure.translated(), ToastKind::Error, cx);
+                        }
+                        this.set_status_message(failure, cx);
                     }
                 }
 

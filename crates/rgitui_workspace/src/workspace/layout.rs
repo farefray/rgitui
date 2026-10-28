@@ -501,10 +501,10 @@ impl Render for Workspace {
                 .map(|branch| branch.to_owned().into()),
         });
         let stash_count = project.stashes().len();
-        let repo_path_display: SharedString = match inspected {
-            Some(worktree) => worktree.path.display().to_string(),
-            None => project.repo_path().display().to_string(),
-        }
+        let repo_path_display: SharedString = rgitui_git::display_path(match inspected {
+            Some(worktree) => &worktree.path,
+            None => project.repo_path(),
+        })
         .into();
         let overlays_active = self.any_overlay_visible(cx);
 
@@ -550,9 +550,13 @@ impl Render for Workspace {
             let repo_path = tab.project.read(cx).repo_path();
             let effective_path = tab.effective_repo_path(cx);
             let tooltip = if effective_path == repo_path {
-                repo_path.display().to_string()
+                rgitui_git::display_path(repo_path)
             } else {
-                format!("{}\n{}", repo_path.display(), effective_path.display())
+                format!(
+                    "{}\n{}",
+                    rgitui_git::display_path(repo_path),
+                    rgitui_git::display_path(&effective_path)
+                )
             };
             let project = tab.project.read(cx);
             let status = if tab.inspecting_worktree.is_some() {
@@ -681,78 +685,125 @@ impl Render for Workspace {
             } else {
                 IconName::Refresh
             };
-            let details = update.details.clone();
+            let details = update.details.as_ref().map(|details| details.translated());
+            // Raw git output is often several lines; the banner shows its first
+            // and can open to show all of it.
+            let expandable = is_failure
+                && details
+                    .as_ref()
+                    .is_some_and(|details| details.lines().nth(1).is_some() || details.len() > 160);
+            let expanded = expandable && self.operations.failure_details_expanded;
+            let full_details = details.clone().filter(|_| expanded);
+            let details = details.filter(|_| !expanded);
+
+            let header = div()
+                .h_flex()
+                .w_full()
+                .min_h(px(30.))
+                .px(px(10.))
+                .py(px(4.))
+                .gap(px(6.))
+                .items_center()
+                .child(Icon::new(icon).size(IconSize::Small).color(if is_failure {
+                    Color::Error
+                } else {
+                    Color::Info
+                }))
+                .child(
+                    div()
+                        .v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            Label::new(update.summary.translated())
+                                .size(LabelSize::Small)
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .truncate(),
+                        )
+                        .when_some(details, |el, details| {
+                            el.child(
+                                Label::new(details)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        }),
+                )
+                .when_some(
+                    self.operations
+                        .last_failed_git_operation_target
+                        .clone()
+                        .filter(|_| is_failure && update.retryable),
+                    |el, retry_target| {
+                        let retry_update = update.clone();
+                        el.child(
+                            Button::new("operation-retry", t!("common.retry"))
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                                    this.retry_git_operation(&retry_update, &retry_target, cx);
+                                })),
+                        )
+                    },
+                )
+                .when(expandable, |el| {
+                    el.child(
+                        IconButton::new(
+                            "operation-details",
+                            if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            },
+                        )
+                        .size(ButtonSize::Compact)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(
+                            |this, _: &gpui::ClickEvent, _, cx| {
+                                this.operations.failure_details_expanded =
+                                    !this.operations.failure_details_expanded;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                })
+                .when(is_failure, |el| {
+                    el.child(
+                        IconButton::new("operation-dismiss", IconName::X)
+                            .size(ButtonSize::Compact)
+                            .color(Color::Muted)
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                                this.operations.last_failed_git_operation = None;
+                                this.operations.last_failed_git_operation_target = None;
+                                cx.notify();
+                            })),
+                    )
+                });
 
             Some(
                 div()
-                    .h_flex()
+                    .v_flex()
                     .w_full()
-                    .min_h(px(30.))
-                    .px(px(10.))
-                    .py(px(4.))
-                    .gap(px(6.))
-                    .items_center()
                     .bg(bg)
                     .border_b_1()
                     .border_color(accent)
-                    .child(Icon::new(icon).size(IconSize::Small).color(if is_failure {
-                        Color::Error
-                    } else {
-                        Color::Info
-                    }))
-                    .child(
-                        div()
-                            .v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                Label::new(update.summary.translated())
-                                    .size(LabelSize::Small)
-                                    .weight(gpui::FontWeight::SEMIBOLD)
-                                    .truncate(),
-                            )
-                            .when_some(details, |el, details| {
-                                el.child(
-                                    Label::new(details.translated())
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                )
-                            }),
-                    )
-                    .when_some(
-                        self.operations
-                            .last_failed_git_operation_target
-                            .clone()
-                            .filter(|_| is_failure && update.retryable),
-                        |el, retry_target| {
-                            let retry_update = update.clone();
-                            el.child(
-                                Button::new("operation-retry", t!("common.retry"))
-                                    .size(ButtonSize::Compact)
-                                    .style(ButtonStyle::Filled)
-                                    .on_click(cx.listener(
-                                        move |this, _: &gpui::ClickEvent, _, cx| {
-                                            this.retry_git_operation(
-                                                &retry_update,
-                                                &retry_target,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                            )
-                        },
-                    )
-                    .when(is_failure, |el| {
+                    .child(header)
+                    .when_some(full_details, |el, full_details| {
                         el.child(
-                            IconButton::new("operation-dismiss", IconName::X)
-                                .size(ButtonSize::Compact)
-                                .color(Color::Muted)
-                                .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                                    this.operations.last_failed_git_operation = None;
-                                    this.operations.last_failed_git_operation_target = None;
-                                    cx.notify();
-                                })),
+                            div()
+                                .id("operation-details-content")
+                                .w_full()
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
+                                .px(px(32.))
+                                .pb(px(8.))
+                                .child(
+                                    div()
+                                        .font_family("Lilex")
+                                        .text_xs()
+                                        .text_color(colors.text_muted)
+                                        .child(full_details),
+                                ),
                         )
                     }),
             )

@@ -566,6 +566,7 @@ impl Workspace {
                 active_git_operation_target: None,
                 last_failed_git_operation: None,
                 last_failed_git_operation_target: None,
+                failure_details_expanded: false,
                 active_operations: Vec::new(),
                 last_operation_output: None,
                 ai_target: None,
