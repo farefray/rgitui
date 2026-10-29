@@ -26,6 +26,8 @@ use crate::keymap;
 use crate::markdown_view::render_markdown;
 use crate::CommandId;
 
+mod working_tree;
+
 /// Rows the changed-files list keeps when the header and commit message leave it
 /// little room. Once it is this short the panel scrolls as one region instead.
 const FILE_LIST_MIN_VISIBLE_ROWS: f32 = 4.0;
@@ -154,10 +156,19 @@ enum WorkingRow {
         staged: bool,
         count: usize,
     },
+    Directory {
+        path: String,
+        name: String,
+        depth: usize,
+        count: usize,
+        staged: bool,
+        collapsed: bool,
+    },
     File {
         index: usize,
         file: rgitui_git::FileStatus,
         staged: bool,
+        depth: usize,
     },
 }
 
@@ -208,6 +219,7 @@ fn working_rows(status: &rgitui_git::WorkingTreeStatus) -> Vec<WorkingRow> {
                 index,
                 file: file.clone(),
                 staged,
+                depth: 0,
             });
             index += 1;
         }
@@ -224,7 +236,7 @@ fn working_display_order(rows: &[WorkingRow], query: Option<&str>) -> Option<Vec
             .enumerate()
             .filter_map(|(index, row)| {
                 let visible = match row {
-                    WorkingRow::Section { .. } => true,
+                    WorkingRow::Section { .. } | WorkingRow::Directory { .. } => true,
                     WorkingRow::File { file, .. } => {
                         file.path.to_string_lossy().to_lowercase().contains(&query)
                     }
@@ -233,6 +245,65 @@ fn working_display_order(rows: &[WorkingRow], query: Option<&str>) -> Option<Vec
             })
             .collect()
     })
+}
+
+/// Build the displayed snapshot only when status, filtering, or expansion changes.
+/// File indices always address the original status, not the sorted tree.
+fn working_tree_rows(
+    status: &rgitui_git::WorkingTreeStatus,
+    trees: &[Vec<working_tree::TreeRow>; 2],
+    collapsed: &[HashSet<String>; 2],
+    query: Option<&str>,
+) -> Vec<WorkingRow> {
+    let mut rows = Vec::new();
+    let query = query.map(str::to_lowercase);
+    for (section, files) in [&status.staged, &status.unstaged].into_iter().enumerate() {
+        let staged = section == 0;
+        let offset = if staged { 0 } else { status.staged.len() };
+        rows.push(WorkingRow::Section {
+            staged,
+            count: files.len(),
+        });
+        let matches = query.as_ref().map(|query| {
+            files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, file)| {
+                    file.path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(query)
+                        .then_some(index)
+                })
+                .collect::<HashSet<_>>()
+        });
+        for index in
+            working_tree::visible_rows(&trees[section], &collapsed[section], matches.as_ref())
+        {
+            rows.push(match &trees[section][index] {
+                working_tree::TreeRow::Directory {
+                    path,
+                    name,
+                    depth,
+                    count,
+                } => WorkingRow::Directory {
+                    path: path.clone(),
+                    name: name.clone(),
+                    depth: *depth,
+                    count: *count,
+                    staged,
+                    collapsed: matches.is_none() && collapsed[section].contains(path),
+                },
+                working_tree::TreeRow::File { index, depth } => WorkingRow::File {
+                    index: offset + index,
+                    file: files[*index].clone(),
+                    staged,
+                    depth: *depth,
+                },
+            });
+        }
+    }
+    rows
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -257,7 +328,7 @@ fn working_navigation(
             let actual_row = display_order.map_or(displayed_row, |order| order[displayed_row]);
             match &rows[actual_row] {
                 WorkingRow::File { index, .. } => Some((*index, displayed_row)),
-                WorkingRow::Section { .. } => None,
+                WorkingRow::Section { .. } | WorkingRow::Directory { .. } => None,
             }
         })
         .collect();
@@ -588,6 +659,8 @@ pub struct DetailPanel {
     commit: Option<CommitInfo>,
     working_changes: Option<rgitui_git::WorkingTreeStatus>,
     cached_working_rows: Arc<Vec<WorkingRow>>,
+    working_trees: [Vec<working_tree::TreeRow>; 2],
+    working_collapsed_dirs: [HashSet<String>; 2],
     working_checkout: std::path::PathBuf,
     commit_diff: Option<Arc<CommitDiff>>,
     /// Provenance of `commit_diff`'s files — a commit or a stash. Set alongside
@@ -631,6 +704,10 @@ impl DetailPanel {
             |this: &mut Self, _, event: &TextInputEvent, cx| {
                 if let TextInputEvent::Changed(text) = event {
                     this.file_search_query = (!text.is_empty()).then(|| text.clone());
+                    this.rebuild_working_rows();
+                    if this.working_changes.is_some() {
+                        this.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    }
                     cx.notify();
                 }
             },
@@ -641,6 +718,8 @@ impl DetailPanel {
             commit: None,
             working_changes: None,
             cached_working_rows: Arc::default(),
+            working_trees: Default::default(),
+            working_collapsed_dirs: Default::default(),
             working_checkout: std::path::PathBuf::new(),
             commit_diff: None,
             diff_source: None,
@@ -729,11 +808,9 @@ impl DetailPanel {
                     | CommandId::Confirm
             )
         {
-            let order =
-                working_display_order(&self.cached_working_rows, self.file_search_query.as_deref());
             if let Some(target) = working_navigation(
                 &self.cached_working_rows,
-                order.as_deref(),
+                None,
                 self.selected_file_index,
                 cmd,
             ) {
@@ -817,15 +894,13 @@ impl DetailPanel {
         self.file_search_active = false;
         self.file_search_editor
             .update(cx, |editor, cx| editor.clear(cx));
+        self.rebuild_working_rows();
         cx.notify();
     }
 
     fn request_file_view_mode_toggle(&mut self, cx: &mut Context<Self>) {
-        // Working changes uses grouped source lists, not the historical tree.
-        if self.working_changes.is_some() {
-            return;
-        }
-        let is_searching = is_file_searching(self.file_search_active, &self.file_search_query);
+        let is_searching = self.working_changes.is_none()
+            && is_file_searching(self.file_search_active, &self.file_search_query);
         let next_mode = file_view_mode_after_toggle_request(
             self.file_view_mode,
             self.file_count(),
@@ -833,8 +908,63 @@ impl DetailPanel {
         );
         if next_mode != self.file_view_mode {
             self.file_view_mode = next_mode;
+            self.rebuild_working_rows();
+            self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
         }
+    }
+
+    fn rebuild_working_rows(&mut self) {
+        let Some(status) = &self.working_changes else {
+            return;
+        };
+        self.cached_working_rows = Arc::new(match self.file_view_mode {
+            FileViewMode::Flat => {
+                let rows = working_rows(status);
+                match working_display_order(&rows, self.file_search_query.as_deref()) {
+                    Some(order) => order.into_iter().map(|index| rows[index].clone()).collect(),
+                    None => rows,
+                }
+            }
+            FileViewMode::Tree => working_tree_rows(
+                status,
+                &self.working_trees,
+                &self.working_collapsed_dirs,
+                self.file_search_query.as_deref(),
+            ),
+        });
+    }
+
+    fn toggle_working_directory(&mut self, staged: bool, path: String, cx: &mut Context<Self>) {
+        // Search temporarily reveals ancestors without changing saved expansion.
+        if self.file_search_query.is_some() {
+            return;
+        }
+        let collapsed = &mut self.working_collapsed_dirs[usize::from(!staged)];
+        if !collapsed.remove(&path) {
+            collapsed.insert(path);
+        }
+        self.rebuild_working_rows();
+        cx.notify();
+    }
+
+    fn set_working_directories_collapsed(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        for (tree, collapsed) in self
+            .working_trees
+            .iter()
+            .zip(&mut self.working_collapsed_dirs)
+        {
+            collapsed.clear();
+            if collapse {
+                collapsed.extend(tree.iter().filter_map(|row| match row {
+                    working_tree::TreeRow::Directory { path, .. } => Some(path.clone()),
+                    _ => None,
+                }));
+            }
+        }
+        self.rebuild_working_rows();
+        self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
     }
 
     /// Toggle a directory node's collapsed state in the tree view.
@@ -955,6 +1085,8 @@ impl DetailPanel {
         self.commit = None;
         self.working_changes = None;
         self.cached_working_rows = Arc::default();
+        self.working_trees = Default::default();
+        self.working_collapsed_dirs = Default::default();
         self.commit_diff = None;
         self.diff_source = None;
         self.cached_file_tree = None;
@@ -995,8 +1127,23 @@ impl DetailPanel {
                 .update(cx, |editor, cx| editor.clear(cx));
             self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
-        self.cached_working_rows = Arc::new(working_rows(&status));
+        self.working_trees = [&status.staged, &status.unstaged].map(|files| {
+            working_tree::build_tree(
+                &files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        for (tree, collapsed) in self
+            .working_trees
+            .iter()
+            .zip(&mut self.working_collapsed_dirs)
+        {
+            *collapsed = working_tree::reconcile_collapsed(tree, collapsed);
+        }
         self.working_changes = Some(status);
+        self.rebuild_working_rows();
         self.working_checkout = checkout;
         cx.notify();
     }
@@ -1482,8 +1629,9 @@ impl Render for DetailPanel {
             // Cache rows on status changes; an ordinary frame clones only the
             // shared handle and the visible window, not hundreds of file paths.
             let rows = self.cached_working_rows.clone();
-            let display_order = working_display_order(&rows, self.file_search_query.as_deref());
-            let row_count = display_order.as_ref().map_or(rows.len(), Vec::len);
+            let row_count = rows.len();
+            let tree_mode = self.file_view_mode == FileViewMode::Tree;
+            let searching = self.file_search_query.is_some();
             let clean = status.staged.is_empty() && status.unstaged.is_empty();
             let selected = self.selected_file_index;
             let checkout = self.working_checkout.clone();
@@ -1499,14 +1647,31 @@ impl Render for DetailPanel {
                 .child(div().h_flex().px(px(10.)).py(px(8.)).gap(px(6.))
                     .child(Label::new(t!("sidebar.working_changes")).size(LabelSize::Small))
                     .child(div().flex_1())
+                    .child(Button::new("working-path-view", t!("detail.path_view"))
+                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).selected(!tree_mode).disabled(clean)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.file_view_mode != FileViewMode::Flat { this.request_file_view_mode_toggle(cx); }
+                        })))
+                    .child(Button::new("working-tree-view", t!("detail.tree_view"))
+                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).selected(tree_mode).disabled(clean)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.file_view_mode != FileViewMode::Tree { this.request_file_view_mode_toggle(cx); }
+                        })))
                     .child(IconButton::new("working-file-search", IconName::Search).size(ButtonSize::Compact)
                         .tooltip(t!("detail.search_files_hint"))
                         .on_click(cx.listener(|this, _, window, cx| this.dispatch_command(CommandId::FileSearch, window, cx)))))
                 .when(self.file_search_active || self.file_search_query.is_some(), |el| el.child(self.file_search_editor.clone()))
+                .when(tree_mode && !clean, |el| el.child(div().h_flex().px(px(10.)).gap(px(6.))
+                    .child(Button::new("working-expand-all", t!("detail.expand_all"))
+                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(searching)
+                        .on_click(cx.listener(|this, _, _, cx| this.set_working_directories_collapsed(false, cx))))
+                    .child(Button::new("working-collapse-all", t!("detail.collapse_all"))
+                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(searching)
+                        .on_click(cx.listener(|this, _, _, cx| this.set_working_directories_collapsed(true, cx))))))
                 .when(clean, |el| el.child(div().p(px(10.)).child(Label::new(t!("sidebar.working_clean")).size(LabelSize::Small).color(Color::Muted))))
                 .child(uniform_list("working-inspector-files", row_count, move |range: std::ops::Range<usize>, _window: &mut Window, _cx: &mut App| {
                     range.map(|row| {
-                        let actual_row = display_order.as_ref().map_or(row, |order| order[row]);
+                        let actual_row = row;
                         let checkout = checkout.clone();
                         let weak = weak.clone();
                         match rows[actual_row].clone() {
@@ -1525,12 +1690,30 @@ impl Render for DetailPanel {
                                         }))
                                     .into_any_element()
                             }
-                            WorkingRow::File { index, file, staged } => {
+                            WorkingRow::Directory { path, name, depth, count, staged, collapsed } => {
+                                div().id(row).h_flex().w_full().h(px(32.))
+                                    .pl(px(10. + depth as f32 * 16.)).pr(px(10.)).gap(px(6.))
+                                    .hover(move |style| style.bg(hover_bg)).cursor_pointer()
+                                    .tooltip(Tooltip::text(path.clone()))
+                                    .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                                        .size(IconSize::Small).color(Color::Muted))
+                                    .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
+                                    .child(div().flex_1().min_w_0().child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate()))
+                                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                                    .on_click(move |_: &ClickEvent, window, cx| {
+                                        weak.update(cx, |this, cx| {
+                                            this.focus_handle.focus(window, cx);
+                                            this.toggle_working_directory(staged, path.clone(), cx);
+                                        }).ok();
+                                    }).into_any_element()
+                            }
+                            WorkingRow::File { index, file, staged, depth } => {
                                 let path = file.path.to_string_lossy().into_owned();
                                 let file_name = file.path.file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| path.clone());
                                 let directory = file.path.parent()
+                                    .filter(|_| !tree_mode)
                                     .filter(|parent| !parent.as_os_str().is_empty())
                                     .map(|parent| parent.to_string_lossy().into_owned());
                                 let action_path = path.clone();
@@ -1540,14 +1723,17 @@ impl Render for DetailPanel {
                                 let discard_path = path.clone();
                                 let discard_checkout = checkout.clone();
                                 let conflicted = file.kind == FileChangeKind::Conflicted;
-                                div().id(row).group("working-file-row").h_flex().w_full().h(px(32.)).px(px(10.)).gap(px(6.))
+                                div().id(row).group("working-file-row").h_flex().w_full().h(px(32.))
+                                    .pl(px(10. + if tree_mode { depth as f32 * 16. + 22. } else { 0. })).pr(px(10.)).gap(px(6.))
                                     .cursor_pointer()
                                     .when(selected == Some(index), |el| el.bg(selected_bg))
                                     .when(selected != Some(index), |el| el.hover(move |s| s.bg(hover_bg)))
                                     .child(Icon::new(file_change_icon(file.kind)).size(IconSize::Small).color(file_change_color(file.kind)))
                                     .tooltip(Tooltip::text(path.clone()))
                                     .child(div().h_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden()
-                                        .child(div().min_w_0().max_w(gpui::rems(12.)).flex_shrink_0()
+                                        .child(div().min_w_0()
+                                            .when(!tree_mode, |el| el.max_w(gpui::rems(12.)).flex_shrink_0())
+                                            .when(tree_mode, |el| el.flex_1())
                                             .child(Label::new(file_name).size(LabelSize::Small).truncate()))
                                         .when_some(directory, |el, directory| el.child(div().flex_1().min_w_0()
                                             .child(Label::new(directory).size(LabelSize::XSmall).color(Color::Muted).truncate()))))
@@ -2422,6 +2608,78 @@ mod tests {
             staged: files(staged),
             unstaged: files(unstaged),
         })
+    }
+
+    #[test]
+    fn working_tree_preserves_sources_and_navigates_only_visible_leaves() {
+        let file = |path: &str| rgitui_git::FileStatus {
+            path: path.into(),
+            kind: FileChangeKind::Modified,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+        };
+        let status = rgitui_git::WorkingTreeStatus {
+            staged: vec![file("src/z.rs"), file("src/a.rs")],
+            unstaged: vec![file("src/a.rs"), file("README.md")],
+        };
+        let trees = [&status.staged, &status.unstaged].map(|files| {
+            working_tree::build_tree(
+                &files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let collapsed = [HashSet::from(["src".to_string()]), HashSet::new()];
+        let rows = working_tree_rows(&status, &trees, &collapsed, None);
+        assert!(matches!(
+            rows[1],
+            WorkingRow::Directory {
+                staged: true,
+                collapsed: true,
+                count: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rows[3],
+            WorkingRow::Directory {
+                staged: false,
+                collapsed: false,
+                ..
+            }
+        ));
+        let first = working_navigation(&rows, None, Some(1), CommandId::SelectFirst).unwrap();
+        assert_eq!((first.file_index, first.displayed_row), (2, 4));
+        assert_eq!(
+            working_selection(&status, first.file_index),
+            Some(("src/a.rs".into(), false))
+        );
+        assert!(working_navigation(&rows, None, Some(1), CommandId::Confirm).is_none());
+
+        // Search reveals both sources and hides nonmatching files, without
+        // mutating saved expansion or rebinding sorted indices to another file.
+        let found = working_tree_rows(&status, &trees, &collapsed, Some("A.RS"));
+        assert!(matches!(
+            found[1],
+            WorkingRow::Directory {
+                collapsed: false,
+                ..
+            }
+        ));
+        let first = working_navigation(&found, None, None, CommandId::SelectFirst).unwrap();
+        let next = working_navigation(&found, None, Some(first.file_index), CommandId::SelectNext)
+            .unwrap();
+        assert_eq!((first.file_index, next.file_index), (1, 2));
+        assert_eq!(
+            working_selection(&status, first.file_index),
+            Some(("src/a.rs".into(), true))
+        );
+        assert!(collapsed[0].contains("src"));
+        let missing = working_tree_rows(&status, &trees, &collapsed, Some("missing"));
+        assert_eq!(missing.len(), 2);
+        assert!(working_navigation(&missing, None, Some(2), CommandId::SelectFirst).is_none());
     }
 
     #[test]
