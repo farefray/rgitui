@@ -361,6 +361,7 @@ impl HeapSize for DisplayCache {
 /// matches nodes by path — so one that changes silently turns a comparison
 /// into two unrelated reports.
 struct DiffViewerCensus<'a> {
+    image_preview: &'a Option<crate::image_preview::ImagePreview>,
     diff: &'a Option<Arc<FileDiff>>,
     display_rows: &'a Arc<Vec<DisplayRow>>,
     sbs_rows: &'a Arc<Vec<SideBySideRow>>,
@@ -372,6 +373,7 @@ impl<'a> From<&'a DiffViewer> for DiffViewerCensus<'a> {
     fn from(viewer: &'a DiffViewer) -> Self {
         Self {
             diff: &viewer.diff,
+            image_preview: &viewer.image_preview,
             display_rows: &viewer.display_rows,
             sbs_rows: &viewer.sbs_rows,
             three_way_rows: &viewer.three_way_rows,
@@ -384,6 +386,7 @@ impl HeapSize for DiffViewerCensus<'_> {
     fn heap_size(&self, census: &mut Census) -> usize {
         census.enter("display_cache", self.display_cache)
             + census.enter("diff", self.diff)
+            + census.enter("image_preview", self.image_preview)
             + census.enter("unified_rows", &RowPopulation(vec![self.display_rows]))
             + census.enter("side_by_side_rows", &RowPopulation(vec![self.sbs_rows]))
             + census.enter("three_way_rows", &RowPopulation(vec![self.three_way_rows]))
@@ -467,6 +470,7 @@ mod tests {
 
     fn file_diff() -> FileDiff {
         FileDiff {
+            image: None,
             path: std::path::PathBuf::from("src/main.rs"),
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -606,6 +610,7 @@ mod tests {
             sbs_rows: &sbs_rows,
             three_way_rows: &Arc::new(Vec::new()),
             display_cache: &cache,
+            image_preview: &None,
         };
 
         let mut census = Census::new();
@@ -647,6 +652,7 @@ mod tests {
             sbs_rows: &Arc::new(Vec::new()),
             three_way_rows: &three_way_rows,
             display_cache: &DisplayCache::default(),
+            image_preview: &None,
         };
 
         let mut census = Census::new();
@@ -671,6 +677,7 @@ mod tests {
             sbs_rows: &Arc::new(Vec::new()),
             three_way_rows: &Arc::new(Vec::new()),
             display_cache: &DisplayCache::default(),
+            image_preview: &None,
         };
 
         let mut census = Census::new();
@@ -697,6 +704,7 @@ mod tests {
                 "diff_viewer/display_cache/unified_rows",
                 "diff_viewer/display_cache/unified_rows/highlights",
                 "diff_viewer/display_cache/unified_rows/text",
+                "diff_viewer/image_preview",
                 "diff_viewer/side_by_side_rows",
                 "diff_viewer/side_by_side_rows/highlights",
                 "diff_viewer/side_by_side_rows/text",

@@ -1500,7 +1500,7 @@ pub(super) fn subscribe_project(
                                     || dv.read(cx).generation() != viewer_generation {
                                     return;
                                 }
-                                if diff.hunks.is_empty() {
+                                if diff.hunks.is_empty() && diff.image.is_none() {
                                     // The displayed file no longer has working-tree
                                     // changes (e.g. it was discarded or fully
                                     // staged). Clear rather than render an empty

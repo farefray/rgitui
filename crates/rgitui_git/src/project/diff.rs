@@ -9,6 +9,10 @@ use crate::types::*;
 use super::refresh::gather_refresh_data_lightweight_cached;
 use super::RefreshData;
 
+mod image;
+#[cfg(test)]
+mod image_tests;
+
 /// Compute line-level diff stats (additions/deletions) for a single file.
 /// For staged files, diffs HEAD vs index. For unstaged files, diffs index vs workdir.
 pub(crate) fn batch_diff_stats(
@@ -407,13 +411,28 @@ pub(crate) fn generate_line_patch_for_repo(
 /// Parse a git2::Diff into a CommitDiff using structured Patch iteration.
 /// Cross-commit parallelism is handled by the caller; this function processes
 /// a single diff sequentially to avoid serialize/re-parse overhead.
-pub(crate) fn parse_multi_file_diff(diff: &git2::Diff) -> Result<CommitDiff> {
+/// Both sides must be object-backed (tree→tree or tree→index), never workdir.
+pub(crate) fn parse_multi_file_diff(repo: &Repository, diff: &git2::Diff) -> Result<CommitDiff> {
     let num_patches = diff.deltas().len();
     let mut files = Vec::with_capacity(num_patches);
+    let mut image_budget = image::Budget::default();
     for i in 0..num_patches {
-        if let Some(mut patch) = git2::Patch::from_diff(diff, i)? {
-            files.push(parse_single_patch(&mut patch)?);
-        }
+        let delta = diff.get_delta(i).expect("delta index is in bounds");
+        let image = image::load(repo, &delta, false, &mut image_budget);
+        // Do not ask libgit2 to load PNGs again for textual patches: doing so
+        // would bypass the preview budget and could rethrow a preview failure.
+        let patch = if image.is_none() {
+            git2::Patch::from_diff(diff, i)?
+        } else {
+            None
+        };
+        let mut file = if let Some(mut patch) = patch {
+            parse_single_patch(&mut patch)?
+        } else {
+            file_diff_from_delta(&delta)
+        };
+        file.image = image;
+        files.push(file);
     }
 
     let total_additions = files.iter().map(|f| f.additions).sum();
@@ -424,6 +443,23 @@ pub(crate) fn parse_multi_file_diff(diff: &git2::Diff) -> Result<CommitDiff> {
         total_deletions,
         files,
     })
+}
+
+/// Preserve metadata even when a binary delta has no textual patch.
+fn file_diff_from_delta(delta: &git2::DiffDelta<'_>) -> FileDiff {
+    FileDiff {
+        path: delta
+            .new_file()
+            .path()
+            .or(delta.old_file().path())
+            .unwrap_or(Path::new(""))
+            .to_path_buf(),
+        image: None,
+        hunks: Vec::new(),
+        additions: 0,
+        deletions: 0,
+        kind: delta_to_file_change_kind(delta.status()),
+    }
 }
 
 /// Parse a single git2::Patch into a FileDiff.
@@ -485,6 +521,7 @@ fn parse_single_patch(patch: &mut git2::Patch) -> Result<FileDiff> {
 
     Ok(FileDiff {
         path,
+        image: None,
         hunks,
         additions,
         deletions,
@@ -507,6 +544,7 @@ pub(crate) fn delta_to_file_change_kind(delta: git2::Delta) -> FileChangeKind {
 pub(crate) fn parse_file_diff(path: &Path, diff: &git2::Diff) -> Result<FileDiff> {
     let mut file_diff = FileDiff {
         path: path.to_path_buf(),
+        image: None,
         hunks: Vec::new(),
         additions: 0,
         deletions: 0,
@@ -564,6 +602,10 @@ pub(crate) fn parse_file_diff(path: &Path, diff: &git2::Diff) -> Result<FileDiff
 
 pub fn compute_file_diff(repo_path: &Path, file_path: &Path, staged: bool) -> Result<FileDiff> {
     let repo = Repository::open(repo_path)?;
+    file_diff_for_repo(&repo, file_path, staged)
+}
+
+fn file_diff_for_repo(repo: &Repository, file_path: &Path, staged: bool) -> Result<FileDiff> {
     let mut diff_opts = DiffOptions::new();
     diff_opts.pathspec(file_path);
     // Without this libgit2 fnmatches the pathspec, so a file literally named
@@ -573,11 +615,22 @@ pub fn compute_file_diff(repo_path: &Path, file_path: &Path, staged: bool) -> Re
     diff_opts.show_untracked_content(true);
     diff_opts.recurse_untracked_dirs(true);
     let diff = if staged {
-        let head_tree = repo.head()?.peel_to_tree().ok();
+        let head_tree = match repo.head() {
+            Ok(head) => Some(head.peel_to_tree()?),
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => None,
+            Err(error) => return Err(error.into()),
+        };
         repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))?
     } else {
         repo.diff_index_to_workdir(None, Some(&mut diff_opts))?
     };
+    if let Some(delta) = diff.get_delta(0) {
+        if let Some(image) = image::load(repo, &delta, !staged, &mut image::Budget::default()) {
+            let mut file = file_diff_from_delta(&delta);
+            file.image = Some(image);
+            return Ok(file);
+        }
+    }
     parse_file_diff(file_path, &diff)
 }
 
@@ -597,7 +650,7 @@ pub fn compute_commit_diff(repo_path: &Path, oid: git2::Oid) -> Result<CommitDif
         None
     };
     let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-    let result = parse_multi_file_diff(&diff);
+    let result = parse_multi_file_diff(&repo, &diff);
     if let Ok(ref d) = result {
         log::debug!(
             "compute_commit_diff complete in {:?}: {} files",
@@ -652,23 +705,7 @@ impl GitProject {
     /// Get diff for a specific file (staged or unstaged).
     pub fn diff_file(&self, path: &Path, staged: bool) -> Result<FileDiff> {
         let repo = self.open_repo()?;
-        let mut diff_opts = DiffOptions::new();
-        diff_opts.pathspec(path);
-        // Without this libgit2 fnmatches the pathspec, so a file literally named
-        // `data[1].json` would not match itself and could match a different file.
-        diff_opts.disable_pathspec_match(true);
-        diff_opts.include_untracked(true);
-        diff_opts.show_untracked_content(true);
-        diff_opts.recurse_untracked_dirs(true);
-
-        let diff = if staged {
-            let head_tree = repo.head()?.peel_to_tree().ok();
-            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))?
-        } else {
-            repo.diff_index_to_workdir(None, Some(&mut diff_opts))?
-        };
-
-        parse_file_diff(path, &diff)
+        file_diff_for_repo(&repo, path, staged)
     }
 
     /// Get diff for a specific commit.
@@ -684,7 +721,7 @@ impl GitProject {
         };
 
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-        parse_multi_file_diff(&diff)
+        parse_multi_file_diff(&repo, &diff)
     }
 
     /// Get the diff for a stash entry at the given index.
@@ -711,7 +748,7 @@ impl GitProject {
         };
 
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-        parse_multi_file_diff(&diff)
+        parse_multi_file_diff(&repo, &diff)
     }
 
     /// Stage a specific hunk in the given worktree.
@@ -2111,7 +2148,7 @@ mod diff_integration_tests {
         let diff = repo
             .diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
             .unwrap();
-        let result = parse_multi_file_diff(&diff).unwrap();
+        let result = parse_multi_file_diff(repo, &diff).unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.total_additions, 1);
         assert_eq!(result.total_deletions, 1);

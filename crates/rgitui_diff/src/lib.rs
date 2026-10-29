@@ -1,5 +1,6 @@
 #[cfg(feature = "perf")]
 mod heap_size;
+mod image_preview;
 mod readability;
 
 use readability::{composite, tint, CodeTypography, DiffSurfaces, InkCache, WORD_ALPHA};
@@ -808,6 +809,7 @@ impl DisplayCache {
 /// A diff viewer panel that displays file diffs with syntax coloring.
 pub struct DiffViewer {
     diff: Option<Arc<FileDiff>>,
+    image_preview: Option<image_preview::ImagePreview>,
     display_mode: DiffDisplayMode,
     file_path: Option<String>,
     /// Provenance of the displayed content. Gates every staging affordance.
@@ -865,6 +867,7 @@ fn file_diffs_render_equal(a: &FileDiff, b: &FileDiff) -> bool {
         && a.additions == b.additions
         && a.deletions == b.deletions
         && a.hunks == b.hunks
+        && a.image == b.image
 }
 
 fn should_apply_prepared(current_generation: u64, prepared_generation: u64) -> bool {
@@ -886,6 +889,8 @@ impl EventEmitter<DiffViewerEvent> for DiffViewer {}
 
 impl DiffViewer {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| this.clear_image_preview(cx))
+            .detach();
         cx.observe_global::<ThemeState>(|this: &mut Self, cx| {
             this.rehighlight(cx);
         })
@@ -895,6 +900,7 @@ impl DiffViewer {
 
         Self {
             diff: None,
+            image_preview: None,
             display_mode: DiffDisplayMode::Unified,
             file_path: None,
             source: DiffSource::Worktree,
@@ -934,7 +940,7 @@ impl DiffViewer {
         // Three-way rows are plain text and theme-independent. In particular,
         // do not invalidate an in-flight three-way preparation, which would
         // otherwise leave its loading state waiting for a discarded result.
-        if self.three_way_diff.is_some() {
+        if self.three_way_diff.is_some() || self.is_image_diff() {
             cx.notify();
             return;
         }
@@ -1065,6 +1071,7 @@ impl DiffViewer {
         let cache_key = DisplayCacheKey::new(path.clone(), is_dark, source.clone(), &diff);
 
         self.diff = Some(Arc::clone(&diff));
+        self.clear_image_preview(cx);
         self.file_path = Some(path.clone());
         self.source = source;
         self.highlighted_row = None;
@@ -1079,6 +1086,37 @@ impl DiffViewer {
             commit_id: self.source.commit_id().map(str::to_string),
             generation: self.generation,
         });
+
+        if diff.image.is_some() {
+            self.loading = true;
+            self.display_rows = Arc::new(Vec::new());
+            self.sbs_rows = Arc::new(Vec::new());
+            self.display_longest_row_ix = 0;
+            self.sync_wrap_list_state();
+            let generation = self.preparation_generation;
+            cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+                let preview = cx
+                    .background_executor()
+                    .spawn(async move {
+                        diff.image
+                            .as_ref()
+                            .map(image_preview::ImagePreview::prepare)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if !should_apply_prepared(this.preparation_generation, generation) {
+                        return;
+                    }
+                    this.image_preview = preview;
+                    this.loading = false;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
 
         // Check display rows cache
         if let Some(cached) = self.display_cache.get(&cache_key, &diff) {
@@ -1111,6 +1149,16 @@ impl DiffViewer {
         );
     }
 
+    fn clear_image_preview(&mut self, cx: &mut App) {
+        if let Some(preview) = self.image_preview.take() {
+            preview.release(cx);
+        }
+    }
+
+    fn is_image_diff(&self) -> bool {
+        self.diff.as_ref().is_some_and(|diff| diff.image.is_some())
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         log::debug!("DiffViewer::clear");
         self.generation = self.generation.wrapping_add(1);
@@ -1118,6 +1166,7 @@ impl DiffViewer {
         self.loading = false;
         self.error = None;
         self.diff = None;
+        self.clear_image_preview(cx);
         self.file_path = None;
         self.source = DiffSource::Worktree;
         self.display_mode = DiffDisplayMode::Unified;
@@ -1143,6 +1192,7 @@ impl DiffViewer {
         self.loading = true;
         self.error = None;
         self.diff = None; // No standard FileDiff when showing 3-way
+        self.clear_image_preview(cx);
         self.file_path = Some(diff.path.display().to_string());
         // A conflicted file lives in the working tree; the three-way renderer
         // has no per-hunk staging of its own, but the source must not claim
@@ -1209,6 +1259,7 @@ impl DiffViewer {
         self.error = None;
         self.diff = None;
         self.file_path = Some(path.clone());
+        self.clear_image_preview(cx);
         self.source = DiffSource::Worktree;
         self.display_mode = DiffDisplayMode::ThreeWay;
         self.three_way_diff = None;
@@ -1245,6 +1296,7 @@ impl DiffViewer {
         self.error = None;
         self.diff = None;
         self.file_path = Some(path.clone());
+        self.clear_image_preview(cx);
         self.source = source;
         self.display_mode = DiffDisplayMode::Unified;
         self.three_way_diff = None;
@@ -1277,6 +1329,7 @@ impl DiffViewer {
         self.loading = true;
         self.error = None;
         self.diff = None;
+        self.clear_image_preview(cx);
         self.file_path = None;
         self.source = DiffSource::Worktree;
         self.display_mode = DiffDisplayMode::Unified;
@@ -1701,7 +1754,7 @@ impl DiffViewer {
         // staging for the working tree, apply/revert for anything else. The
         // three-way conflict view has no line-level operation, so there is
         // nothing for a line selection to act on.
-        if self.display_mode == DiffDisplayMode::ThreeWay {
+        if self.display_mode == DiffDisplayMode::ThreeWay || self.is_image_diff() {
             return;
         }
         self.partial_mode = !self.partial_mode;
@@ -2140,7 +2193,7 @@ impl DiffViewer {
         // A three-way conflict has no unified/side-by-side representation, so the
         // toggle is inert while one is shown — flipping to Unified would render an
         // empty diff.
-        if self.three_way_diff.is_some() {
+        if self.three_way_diff.is_some() || self.is_image_diff() {
             return;
         }
 
@@ -3716,6 +3769,7 @@ impl Render for DiffViewer {
                 .into_any_element();
         }
 
+        let is_image = self.is_image_diff();
         let display_rows = self.display_rows.clone();
         let sbs_rows = self.sbs_rows.clone();
         let three_way_rows = self.three_way_rows.clone();
@@ -5144,7 +5198,12 @@ impl Render for DiffViewer {
                         Badge::new(badge_label).color(badge_color)
                     })
                     .child(div().flex_1())
-                    .child(if self.display_mode == DiffDisplayMode::ThreeWay {
+                    .child(if is_image {
+                        Label::new(t!("diff.image.preview"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    } else if self.display_mode == DiffDisplayMode::ThreeWay {
                         Label::new(SharedString::from(conflict_progress_label(
                             unresolved,
                             total_conflicts,
@@ -5210,7 +5269,7 @@ impl Render for DiffViewer {
                         } else {
                             ("Partial (p)", text_placeholder_color)
                         };
-                        if self.display_mode == DiffDisplayMode::ThreeWay {
+                        if self.display_mode == DiffDisplayMode::ThreeWay || is_image {
                             div().into_any_element()
                         } else {
                             div()
@@ -5289,7 +5348,7 @@ impl Render for DiffViewer {
                             )
                     })
                     .child(self.render_file_menu_button(cx))
-                    .child({
+                    .when(!is_image, |header| header.child({
                         let toggle_tooltip = match self.display_mode {
                             DiffDisplayMode::Unified => "Switch to side-by-side view (d)",
                             DiffDisplayMode::SideBySide => "Switch to unified view (d)",
@@ -5303,7 +5362,7 @@ impl Render for DiffViewer {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.toggle_display_mode(cx);
                             }))
-                    }),
+                    })),
             );
         }
 
@@ -5342,6 +5401,17 @@ impl Render for DiffViewer {
                     .child(column("Result", "staged on save", true))
                     .child(column("Incoming", "Git theirs", false)),
             );
+        }
+
+        if let Some(preview) = self.image_preview.as_ref().filter(|_| is_image) {
+            container = container.child(preview.render());
+            if let Some(backdrop) = self.render_file_menu_backdrop(cx) {
+                container = container.child(backdrop);
+            }
+            if let Some(menu) = self.render_file_menu(cx) {
+                container = container.child(menu);
+            }
+            return container.into_any_element();
         }
 
         // Wrap the list in a row container that holds a vertical scrollbar on
@@ -5626,6 +5696,7 @@ mod tests {
 
     fn test_file_diff(hunks: Vec<DiffHunk>, additions: usize, deletions: usize) -> FileDiff {
         FileDiff {
+            image: None,
             path: std::path::PathBuf::from("foo.txt"),
             hunks,
             additions,
@@ -5657,6 +5728,20 @@ mod tests {
         let a = test_file_diff(vec![test_hunk(DiffLine::Addition("hello".into()))], 1, 0);
         let b = a.clone();
         assert!(file_diffs_render_equal(&a, &b));
+    }
+
+    #[test]
+    fn image_refresh_detects_changed_bytes_without_text_hunks() {
+        let mut before = test_file_diff(Vec::new(), 0, 0);
+        before.image = Some(rgitui_git::ImageDiff {
+            error: None,
+            before: None,
+            after: Some(Arc::from(&b"first PNG"[..])),
+        });
+        let mut after = before.clone();
+        after.image.as_mut().unwrap().after = Some(Arc::from(&b"second PNG"[..]));
+        assert!(!file_diffs_render_equal(&before, &after));
+        assert!(file_diffs_render_equal(&before, &before.clone()));
     }
 
     #[test]
@@ -6786,6 +6871,7 @@ mod view_tests {
 
     fn one_hunk_diff() -> FileDiff {
         FileDiff {
+            image: None,
             path: std::path::PathBuf::from(PATH),
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -6803,6 +6889,64 @@ mod view_tests {
             deletions: 0,
             kind: FileChangeKind::Modified,
         }
+    }
+
+    fn png_diff() -> FileDiff {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 0, 0, 128]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        FileDiff {
+            path: "image.png".into(),
+            image: Some(rgitui_git::ImageDiff {
+                error: None,
+                before: None,
+                after: Some(bytes.into_inner().into()),
+            }),
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            kind: FileChangeKind::Added,
+        }
+    }
+
+    #[test]
+    fn png_preview_renders_without_text_controls_and_clears_for_text() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, png_diff(), DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                assert!(viewer.image_preview.is_some());
+                assert!(!viewer.loading);
+                assert!(viewer.display_rows.is_empty());
+                let mode = viewer.display_mode;
+                viewer.toggle_display_mode(cx);
+                viewer.toggle_partial_mode(cx);
+                assert_eq!(viewer.display_mode, mode);
+                assert!(!viewer.partial_mode);
+            });
+        });
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        probe.read(|probe, cx| assert!(probe.viewer.read(cx).image_preview.is_none()));
+    }
+
+    #[test]
+    fn switching_files_rejects_in_flight_image_preparation() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.set_diff(png_diff(), "image.png".into(), DiffSource::Worktree, cx);
+                viewer.set_diff(one_hunk_diff(), PATH.into(), DiffSource::Worktree, cx);
+            });
+        });
+        probe.draw();
+        probe.read(|probe, cx| {
+            let viewer = probe.viewer.read(cx);
+            assert!(!viewer.loading);
+            assert!(viewer.image_preview.is_none());
+            assert!(!viewer.display_rows.is_empty());
+        });
     }
 
     #[test]
@@ -7569,6 +7713,7 @@ mod view_tests {
     /// One hunk of `lines` context rows, long enough to scroll in the test window.
     fn tall_diff(lines: usize) -> FileDiff {
         FileDiff {
+            image: None,
             path: std::path::PathBuf::from(PATH),
             hunks: vec![DiffHunk {
                 old_start: 1,

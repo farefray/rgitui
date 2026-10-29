@@ -148,7 +148,7 @@ impl ViewCaches {
         Self {
             blame: std::sync::Arc::new(std::sync::Mutex::new(crate::cache::LruCache::new(24))),
             history: std::sync::Arc::new(std::sync::Mutex::new(crate::cache::LruCache::new(24))),
-            diff: std::sync::Arc::new(std::sync::Mutex::new(crate::cache::LruCache::new(200))),
+            diff: std::sync::Arc::new(std::sync::Mutex::new(crate::cache::commit_diff_cache())),
         }
     }
 

@@ -2876,6 +2876,7 @@ mod tests {
 
     fn make_file_diff(path: &str, kind: FileChangeKind) -> FileDiff {
         FileDiff {
+            image: None,
             path: std::path::PathBuf::from(path),
             hunks: vec![],
             additions: 10,

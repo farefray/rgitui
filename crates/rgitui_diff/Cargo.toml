@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 similar.workspace = true
 gpui.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 rgitui_theme.workspace = true
 rgitui_ui.workspace = true
 rgitui_git.workspace = true

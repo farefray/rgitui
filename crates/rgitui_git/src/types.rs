@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rgitui_i18n::{msg, Message};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A single line from a global content search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,10 +325,23 @@ pub enum DiffLine {
     Deletion(String),
 }
 
+/// Encoded PNG snapshots. Without an error, a missing side means addition/deletion.
+/// Each side is limited to 20 MiB; multi-file diffs share a 64 MiB budget.
+/// Decoding is left to the consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageDiff {
+    pub before: Option<Arc<[u8]>>,
+    pub after: Option<Arc<[u8]>>,
+    /// Preview failure, translated when loaded. Both sides are absent on error.
+    pub error: Option<String>,
+}
+
 /// A complete file diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: PathBuf,
+    /// Present for PNG paths (case insensitive), independently of text hunks.
+    pub image: Option<ImageDiff>,
     pub hunks: Vec<DiffHunk>,
     pub additions: usize,
     pub deletions: usize,

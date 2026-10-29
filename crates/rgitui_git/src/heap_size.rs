@@ -15,8 +15,8 @@ use crate::project::{
 };
 use crate::types::{
     BranchInfo, CommitDiff, CommitInfo, DiffHunk, DiffLine, FileChangeKind, FileDiff, FileStatus,
-    RefLabel, RemoteInfo, SearchResult, Signature, StashEntry, TagInfo, WorkingTreeStatus,
-    WorktreeInfo,
+    ImageDiff, RefLabel, RemoteInfo, SearchResult, Signature, StashEntry, TagInfo,
+    WorkingTreeStatus, WorktreeInfo,
 };
 
 /// The change kind is a fieldless enum.
@@ -131,9 +131,15 @@ impl HeapSize for DiffHunk {
     }
 }
 
+impl HeapSize for ImageDiff {
+    fn heap_size(&self, census: &mut Census) -> usize {
+        self.before.heap_size(census) + self.after.heap_size(census) + self.error.heap_size(census)
+    }
+}
+
 impl HeapSize for FileDiff {
     fn heap_size(&self, census: &mut Census) -> usize {
-        self.path.heap_size(census) + self.hunks.heap_size(census)
+        self.path.heap_size(census) + self.hunks.heap_size(census) + self.image.heap_size(census)
     }
 
     /// Lines rather than hunks: a diff's cost tracks its line count, and a
@@ -296,10 +302,24 @@ mod tests {
     }
 
     #[test]
+    fn image_snapshots_count_encoded_bytes_once_when_shared() {
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"encoded PNG"[..]);
+        let image = ImageDiff {
+            before: Some(bytes.clone()),
+            after: Some(bytes.clone()),
+            error: None,
+        };
+        let mut census = Census::new();
+        assert_eq!(image.heap_size(&mut census), bytes.len());
+        assert_eq!(image.clone().heap_size(&mut census), 0);
+    }
+
+    #[test]
     fn a_file_diff_counts_lines_rather_than_hunks() {
         let mut census = Census::new();
         let diff = FileDiff {
             path: std::path::PathBuf::from("src/main.rs"),
+            image: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 old_lines: 2,
