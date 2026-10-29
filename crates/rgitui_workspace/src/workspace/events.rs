@@ -1581,7 +1581,6 @@ pub(super) fn subscribe_project(
                             summary = summary)
                     }
                 };
-                let output_label = origin_label(&update.kind.name());
                 let mut update = update.clone();
                 update.summary = origin_label(&update.summary);
                 // Everything kept past this event holds the `Message` and
@@ -1601,9 +1600,11 @@ pub(super) fn subscribe_project(
                         this.set_status_message(update.summary.clone(), cx);
                         this.operations.active_git_operation = Some(update.clone());
                         this.operations.active_git_operation_target = Some(target.clone());
-                        if !this.operations.active_operations.iter().any(|op| {
+                        if let Some(op) = this.operations.active_operations.iter_mut().find(|op| {
                             target.matches(&op.project_id, op.id)
                         }) {
+                            op.label = update.summary.clone();
+                        } else {
                             this.operations.active_operations.push(ActiveOperation {
                                 project_id,
                                 id: operation_id,
@@ -1611,7 +1612,8 @@ pub(super) fn subscribe_project(
                                 started_at: Instant::now(),
                             });
                         }
-                        this.show_toast(update.summary.translated(), ToastKind::Info, cx);
+                        // Progress lives in the fixed footer and toolbar, not
+                        // a duplicate, short-lived toast on every update.
                     }
                     GitOperationState::Succeeded => {
                         this.operations
@@ -1639,15 +1641,19 @@ pub(super) fn subscribe_project(
                         {
                             let now = Instant::now();
                             this.operations.last_operation_output = Some(OperationOutput {
-                                operation: output_label,
+                                operation: update.summary.clone(),
                                 output: details.clone(),
                                 is_error: false,
                                 timestamp: now,
                                 expanded: false,
                             });
                             this.schedule_operation_output_auto_hide(now, cx);
+                        } else {
+                            // One completion surface: an output card when there
+                            // are details, otherwise an ordinary success toast.
+                            this.operations.last_operation_output = None;
+                            this.show_toast(update.summary.translated(), ToastKind::Success, cx);
                         }
-                        this.show_toast(update.summary.translated(), ToastKind::Success, cx);
                     }
                     GitOperationState::Failed => {
                         this.operations
@@ -1659,17 +1665,12 @@ pub(super) fn subscribe_project(
                             this.operations.active_git_operation = None;
                             this.operations.active_git_operation_target = None;
                         }
-                        // The failure banner reports a failure, details
-                        // included; an output bar would only repeat it. A toast
-                        // is needed only while the banner is busy showing
-                        // another operation that is still running.
+                        // The sticky failure card remains visible even while
+                        // another operation runs. Do not duplicate it in toasts.
                         this.operations.last_failed_git_operation = Some(update.clone());
                         this.operations.last_failed_git_operation_target = Some(target.clone());
                         this.operations.failure_details_expanded = false;
                         this.operations.last_operation_output = None;
-                        if this.operations.active_git_operation.is_some() {
-                            this.show_toast(failure.translated(), ToastKind::Error, cx);
-                        }
                         this.set_status_message(failure, cx);
                     }
                 }

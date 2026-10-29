@@ -22,6 +22,44 @@ fn selection_after_close(active: usize, closed: usize, len: usize) -> usize {
     }
 }
 
+/// Move a tab without changing the selected repository or rebuilding its panels.
+fn reorder_tab<T>(tabs: &mut Vec<T>, active: usize, from: usize, to: usize) -> Option<usize> {
+    if from >= tabs.len() || to >= tabs.len() || active >= tabs.len() || from == to {
+        return None;
+    }
+    let tab = tabs.remove(from);
+    tabs.insert(to, tab);
+    Some(if active == from {
+        to
+    } else if from < active && active <= to {
+        active - 1
+    } else if to <= active && active < from {
+        active + 1
+    } else {
+        active
+    })
+}
+
+/// Reorder available repositories while leaving unavailable restore slots in place.
+fn session_order_after_reorder(
+    saved: &[std::path::PathBuf],
+    open: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut remaining = open.iter();
+    let mut result = Vec::new();
+    for path in saved {
+        if open.contains(path) {
+            if let Some(next) = remaining.next() {
+                result.push(next.clone());
+            }
+        } else {
+            result.push(path.clone());
+        }
+    }
+    result.extend(remaining.cloned());
+    result
+}
+
 fn previous_after_activation<T: Copy + PartialEq>(
     current: Option<T>,
     target: T,
@@ -131,6 +169,34 @@ impl Workspace {
         if let Some(index) = self.project_tab_index(project) {
             self.activate_tab(index, cx);
         }
+    }
+
+    pub(super) fn reorder_project(
+        &mut self,
+        source: gpui::EntityId,
+        target: gpui::EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve identities at drop time: tabs may have closed during the drag.
+        let (Some(from), Some(to)) = (
+            self.project_tab_index(source),
+            self.project_tab_index(target),
+        ) else {
+            return;
+        };
+        let Some(active) = reorder_tab(&mut self.tabs, self.active_tab, from, to) else {
+            return;
+        };
+        self.active_tab = active;
+        let open: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.project.read(cx).repo_path().to_path_buf())
+            .collect();
+        self.session_repo_order = session_order_after_reorder(&self.session_repo_order, &open);
+        self.repo_tab_scroll.scroll_to_item(active);
+        self.persist_workspace_snapshot(cx);
+        cx.notify();
     }
 
     pub(super) fn previous_repository(&mut self, cx: &mut Context<Self>) {
@@ -1050,6 +1116,55 @@ mod tests {
             merge_session_order(&merged, &live[1..]),
             ["/b", "/c", "/d"].map(std::path::PathBuf::from)
         );
+    }
+
+    #[test]
+    fn reordering_any_tab_preserves_active_identity_and_other_tabs_order() {
+        for active in 0..15 {
+            for from in 0..15 {
+                for to in 0..15 {
+                    let mut tabs: Vec<_> = (0..15).collect();
+                    let selected = reorder_tab(&mut tabs, active, from, to).unwrap_or(active);
+                    assert_eq!(tabs[selected], active);
+                    assert_eq!(tabs[to], from);
+                    assert_eq!(
+                        tabs.into_iter()
+                            .filter(|id| *id != from)
+                            .collect::<Vec<_>>(),
+                        (0..15).filter(|id| *id != from).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_and_noop_reorders_leave_tabs_unchanged() {
+        for (active, from, to) in [(0, 3, 0), (0, 0, 3), (3, 0, 1), (1, 1, 1)] {
+            let mut tabs = vec![0, 1, 2];
+            assert_eq!(reorder_tab(&mut tabs, active, from, to), None);
+            assert_eq!(tabs, [0, 1, 2]);
+        }
+        assert_eq!(reorder_tab::<usize>(&mut Vec::new(), 0, 0, 0), None);
+    }
+
+    #[test]
+    fn reordered_session_persists_live_order_and_unavailable_slots() {
+        let saved = ["/a", "/missing", "/b", "/c"].map(std::path::PathBuf::from);
+        let open = ["/c", "/a", "/b", "/new"].map(std::path::PathBuf::from);
+        let reordered = session_order_after_reorder(&saved, &open);
+        assert_eq!(
+            reordered,
+            ["/c", "/missing", "/a", "/b", "/new"].map(std::path::PathBuf::from)
+        );
+        let mut live = open.to_vec();
+        live.push("/missing".into());
+        assert_eq!(merge_session_order(&reordered, &live), reordered);
+        assert_eq!(
+            session_active_index(&reordered, Some(std::path::Path::new("/a"))),
+            2
+        );
+        assert_eq!(session_order_after_reorder(&[], &open), open);
     }
 
     #[test]

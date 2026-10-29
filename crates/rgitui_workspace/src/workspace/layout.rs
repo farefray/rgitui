@@ -3,7 +3,6 @@ use gpui::{
     canvas, div, px, App, ClickEvent, Context, CursorStyle, DragMoveEvent, ElementId, MouseButton,
     MouseDownEvent, Render, SharedString, Window,
 };
-use rgitui_git::GitOperationState;
 use rgitui_i18n::{t, tp};
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
@@ -238,6 +237,7 @@ impl Workspace {
     ) -> gpui::Stateful<gpui::Div> {
         let mut root = div()
             .id("workspace-root")
+            .relative()
             .key_context(self.workspace_key_context(cx))
             .size_full()
             .font(ui_font)
@@ -387,7 +387,7 @@ impl Render for Workspace {
             let root = self.workspace_root(cx, ui_font.clone(), colors.background);
             return root
                 .child(self.render_welcome_interactive(cx))
-                .child(self.toast_layer.clone())
+                .child(crate::toast::notification_stack().child(self.toast_layer.clone()))
                 .child(self.overlays.command_palette.clone())
                 .child(self.overlays.interactive_rebase.clone())
                 .child(self.overlays.theme_editor.clone())
@@ -553,6 +553,7 @@ impl Render for Workspace {
                 .is_some_and(|status| !status.staged.is_empty() || !status.unstaged.is_empty());
             let ws = workspace_handle.clone();
             let ws_close = workspace_handle.clone();
+            let ws_reorder = workspace_handle.clone();
             tab_bar = tab_bar.tab(
                 Tab::new(
                     ElementId::NamedInteger("project-tab".into(), project_id.as_u64()),
@@ -562,6 +563,11 @@ impl Render for Workspace {
                 .dirty(dirty)
                 .tooltip(tooltip)
                 .closeable(true)
+                .on_reorder(cx.entity_id(), project_id, move |source, _window, cx| {
+                    ws_reorder
+                        .update(cx, |ws, cx| ws.reorder_project(source, project_id, cx))
+                        .ok();
+                })
                 .on_click(move |_event, _window, cx| {
                     ws.update(cx, |ws, cx| {
                         ws.activate_project(project_id, cx);
@@ -636,45 +642,36 @@ impl Render for Workspace {
             .stash_count(stash_count)
             .repo_path(repo_path_display.clone())
             .loading(!self.operations.active_operations.is_empty())
-            .error(self.operations.last_failed_git_operation.is_some())
+            .error(
+                self.operations.active_operations.is_empty()
+                    && self.operations.last_failed_git_operation.is_some(),
+            )
             .head_detached(head_detached);
         if !repo_state.is_clean() {
             status_bar = status_bar.repo_state_label(repo_state.label().translated());
         }
 
-        if let Some(msg) = &self.status_message {
+        // Running work stays in the fixed-height footer, even after the normal
+        // status-message timeout or while another repository completes an op.
+        if let Some(msg) = self
+            .operations
+            .active_operations
+            .last()
+            .map(|op| &op.label)
+            .or(self.status_message.as_ref())
+        {
             status_bar = status_bar.operation_message(msg.translated().to_string());
         }
 
-        let operation_banner = if let Some(update) = self
-            .operations
-            .active_git_operation
-            .clone()
-            .or_else(|| self.operations.last_failed_git_operation.clone())
+        // Failures remain visible independently of any newer running operation.
+        // This card is an overlay, never a row in the workspace's flex layout.
+        let operation_failure = if let Some(update) =
+            self.operations.last_failed_git_operation.clone()
         {
-            let is_failure = update.state == GitOperationState::Failed;
-            let accent = if is_failure {
-                cx.status().error
-            } else {
-                cx.status().info
-            };
-            let bg = if is_failure {
-                cx.status().error_background
-            } else {
-                cx.status().info_background
-            };
-            let icon = if is_failure {
-                IconName::FileConflict
-            } else {
-                IconName::Refresh
-            };
+            let accent = cx.status().error;
             let details = update.details.as_ref().map(|details| details.translated());
-            // Raw git output is often several lines; the banner shows its first
-            // and can open to show all of it.
-            let expandable = is_failure
-                && details
-                    .as_ref()
-                    .is_some_and(|details| details.lines().nth(1).is_some() || details.len() > 160);
+            // Even a single long line must be expandable in a narrow card.
+            let expandable = details.as_ref().is_some_and(|details| !details.is_empty());
             let expanded = expandable && self.operations.failure_details_expanded;
             let full_details = details.clone().filter(|_| expanded);
             let details = details.filter(|_| !expanded);
@@ -687,25 +684,31 @@ impl Render for Workspace {
                 .py(px(4.))
                 .gap(px(6.))
                 .items_center()
-                .child(Icon::new(icon).size(IconSize::Small).color(if is_failure {
-                    Color::Error
-                } else {
-                    Color::Info
-                }))
+                .child(
+                    Icon::new(IconName::FileConflict)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
                 .child(
                     div()
                         .v_flex()
                         .min_w_0()
                         .flex_1()
                         .child(
-                            Label::new(update.summary.translated())
-                                .size(LabelSize::Small)
-                                .weight(gpui::FontWeight::SEMIBOLD)
-                                .truncate(),
+                            div()
+                                .id("operation-failure-summary")
+                                .min_w_0()
+                                .tooltip(Tooltip::text(update.summary.translated()))
+                                .child(
+                                    Label::new(update.summary.translated())
+                                        .size(LabelSize::Small)
+                                        .weight(gpui::FontWeight::SEMIBOLD)
+                                        .truncate(),
+                                ),
                         )
                         .when_some(details, |el, details| {
                             el.child(
-                                Label::new(details)
+                                Label::new(details.lines().next().unwrap_or("").to_owned())
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
                                     .truncate(),
@@ -716,7 +719,7 @@ impl Render for Workspace {
                     self.operations
                         .last_failed_git_operation_target
                         .clone()
-                        .filter(|_| is_failure && update.retryable),
+                        .filter(|_| update.retryable),
                     |el, retry_target| {
                         let retry_update = update.clone();
                         el.child(
@@ -741,6 +744,11 @@ impl Render for Workspace {
                         )
                         .size(ButtonSize::Compact)
                         .color(Color::Muted)
+                        .tooltip(if expanded {
+                            t!("workspace.operation.hide_details")
+                        } else {
+                            t!("workspace.operation.show_details")
+                        })
                         .on_click(cx.listener(
                             |this, _: &gpui::ClickEvent, _, cx| {
                                 this.operations.failure_details_expanded =
@@ -750,26 +758,31 @@ impl Render for Workspace {
                         )),
                     )
                 })
-                .when(is_failure, |el| {
-                    el.child(
-                        IconButton::new("operation-dismiss", IconName::X)
-                            .size(ButtonSize::Compact)
-                            .color(Color::Muted)
-                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                                this.operations.last_failed_git_operation = None;
-                                this.operations.last_failed_git_operation_target = None;
-                                cx.notify();
-                            })),
-                    )
-                });
+                .child(
+                    IconButton::new("operation-dismiss", IconName::X)
+                        .size(ButtonSize::Compact)
+                        .color(Color::Muted)
+                        .tooltip(t!("workspace.operation.dismiss"))
+                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                            this.operations.last_failed_git_operation = None;
+                            this.operations.last_failed_git_operation_target = None;
+                            this.operations.failure_details_expanded = false;
+                            cx.notify();
+                        })),
+                );
 
             Some(
                 div()
+                    .id("operation-failure-notification")
                     .v_flex()
                     .w_full()
-                    .bg(bg)
-                    .border_b_1()
+                    .flex_shrink_0()
+                    .occlude()
+                    .bg(colors.elevated_surface_background)
+                    .border_1()
+                    .rounded(px(8.))
                     .border_color(accent)
+                    .elevation_3(cx)
                     .child(header)
                     .when_some(full_details, |el, full_details| {
                         el.child(
@@ -777,8 +790,8 @@ impl Render for Workspace {
                                 .id("operation-details-content")
                                 .w_full()
                                 .max_h(px(160.))
-                                .overflow_y_scroll()
-                                .px(px(32.))
+                                .overflow_scroll()
+                                .px(px(12.))
                                 .pb(px(8.))
                                 .child(
                                     div()
@@ -794,7 +807,7 @@ impl Render for Workspace {
             None
         };
 
-        let operation_output_bar = self.render_operation_output_bar(cx);
+        let operation_output = self.render_operation_output_notification(cx);
         let update_banner = self.render_update_banner(cx);
         let detached_head_banner =
             detached_head.map(|head| self.render_detached_head_banner(head, cx));
@@ -842,8 +855,6 @@ impl Render for Workspace {
             // Toolbar
             .child(active_tab.toolbar.clone())
             .when_some(update_banner, |el, banner| el.child(banner))
-            .when_some(operation_banner, |el, banner| el.child(banner))
-            .when_some(operation_output_bar, |el, bar| el.child(bar))
             // Conflict state banner (merge/rebase/cherry-pick/revert in progress)
             .when(!repo_state.is_clean(), |el| {
                 let has_conflicts = conflict_count > 0;
@@ -1818,7 +1829,14 @@ impl Render for Workspace {
             })
             // Status bar
             .child(status_bar)
-            .child(self.toast_layer.clone())
+            // One anchored stack for all transient feedback. Appearing,
+            // expanding, and dismissing cards cannot change panel geometry.
+            .child(
+                crate::toast::notification_stack()
+                    .when_some(operation_failure, |el, card| el.child(card))
+                    .when_some(operation_output, |el, card| el.child(card))
+                    .child(self.toast_layer.clone()),
+            )
             // Command palette overlay (rendered last to be on top)
             .child(self.overlays.command_palette.clone())
             // Interactive rebase dialog overlay

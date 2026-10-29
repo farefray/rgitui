@@ -1,8 +1,8 @@
 use gpui::prelude::*;
-use gpui::{div, px, App, SharedString, Window};
+use gpui::{div, px, relative, App, SharedString, Window};
 use rgitui_i18n::t;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
-use rgitui_ui::{Icon, IconName, IconSize, Label, LabelSize};
+use rgitui_ui::{Icon, IconName, IconSize, Label, LabelSize, Tooltip};
 
 /// The bottom status bar.
 #[derive(IntoElement)]
@@ -105,11 +105,21 @@ impl StatusBar {
             Color::Accent
         };
 
-        let mut left = div().h_flex().items_center().gap(px(10.));
+        // Every flexible ancestor must allow shrinking for message ellipsis to work.
+        let mut left = div()
+            .h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .items_center()
+            .gap(px(10.));
 
         if has_branch {
             let mut branch_row = div()
                 .h_flex()
+                .min_w_0()
+                .overflow_hidden()
                 .gap(px(4.))
                 .items_center()
                 .child(
@@ -121,7 +131,8 @@ impl StatusBar {
                     Label::new(self.branch_name.clone())
                         .size(LabelSize::XSmall)
                         .color(branch_color)
-                        .weight(gpui::FontWeight::SEMIBOLD),
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .truncate(),
                 );
             if self.head_detached {
                 branch_row = branch_row.child(
@@ -212,14 +223,22 @@ impl StatusBar {
                 (Color::Muted, None)
             };
 
-            let mut msg_row = div().h_flex().gap(px(4.)).items_center();
+            let mut msg_row = div()
+                .id("status-bar-operation")
+                .h_flex()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .gap(px(4.))
+                .items_center()
+                .tooltip(Tooltip::text(msg.clone()));
 
             if let Some(icon) = msg_icon {
                 msg_row = msg_row.child(Icon::new(icon).size(IconSize::XSmall).color(msg_color));
             }
 
             msg_row = msg_row.child(
-                Label::new(SharedString::from(msg.replace('\n', " ")))
+                Label::new(SharedString::from(msg.replace(['\r', '\n'], " ")))
                     .size(LabelSize::XSmall)
                     .color(msg_color)
                     .truncate(),
@@ -254,13 +273,22 @@ impl StatusBar {
     fn render_right_section(&self, colors: &rgitui_theme::ThemeColors) -> gpui::Div {
         let has_branch = !self.branch_name.is_empty();
 
-        let mut right = div().h_flex().items_center().gap(px(10.));
+        // Reserve space independently of operation text; the path can yield to stats.
+        let mut right = div()
+            .h_flex()
+            .flex_shrink_0()
+            .min_w_0()
+            .max_w(relative(0.5))
+            .overflow_hidden()
+            .items_center()
+            .gap(px(10.));
 
         if self.staged_count > 0 {
             let staged_text = t!("status_bar.staged", count = self.staged_count);
             right = right.child(
                 div()
                     .h_flex()
+                    .flex_shrink_0()
                     .h(px(18.))
                     .px(px(6.))
                     .gap(px(3.))
@@ -285,6 +313,7 @@ impl StatusBar {
             right = right.child(
                 div()
                     .h_flex()
+                    .flex_shrink_0()
                     .h(px(18.))
                     .px(px(6.))
                     .gap(px(3.))
@@ -308,6 +337,7 @@ impl StatusBar {
             right = right.child(
                 div()
                     .h_flex()
+                    .flex_shrink_0()
                     .gap(px(3.))
                     .items_center()
                     .child(
@@ -331,6 +361,7 @@ impl StatusBar {
                         .h_flex()
                         .gap(px(4.))
                         .items_center()
+                        .min_w_0()
                         .overflow_hidden()
                         .child(
                             Icon::new(IconName::Folder)
@@ -361,6 +392,11 @@ impl RenderOnce for StatusBar {
             .h_flex()
             .w_full()
             .h(px(28.))
+            .flex_shrink_0()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .gap(px(10.))
             .bg(colors.status_bar_background)
             .border_t_1()
             .border_color(colors.border_variant)

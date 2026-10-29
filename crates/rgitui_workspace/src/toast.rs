@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{div, px, Context, ElementId, Render, WeakEntity, Window};
-use rgitui_theme::{ActiveTheme, Color, StyledExt};
-use rgitui_ui::{Icon, IconName, IconSize, Toast};
+use rgitui_theme::StyledExt;
+use rgitui_ui::Toast;
 
 pub use rgitui_ui::ToastLevel as ToastKind;
 
@@ -16,7 +16,26 @@ struct ToastEntry {
     action: Option<(String, Rc<rgitui_ui::ClickHandler>)>,
 }
 
-/// Manages a stack of transient toast notifications.
+/// The only placement container for operation cards and general toasts.
+/// Absolute positioning keeps feedback out of workspace layout; a bounded,
+/// scrollable stack keeps large output/errors from covering the whole window.
+/// Only the cards occlude input, not a full-window transparent backdrop.
+pub(crate) fn notification_stack() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("workspace-notifications")
+        .absolute()
+        .bottom(gpui::rems(2.5))
+        .right(px(12.))
+        .v_flex()
+        .gap(px(6.))
+        .w(px(440.))
+        .max_w(gpui::relative(0.9))
+        .max_h(gpui::relative(0.6))
+        .overflow_y_scroll()
+        .p(px(4.))
+}
+
+/// Manages transient toasts rendered in the workspace's shared notification stack.
 pub struct ToastLayer {
     toasts: Vec<ToastEntry>,
     next_id: usize,
@@ -109,15 +128,7 @@ impl Render for ToastLayer {
             return div().into_any_element();
         }
 
-        let colors = cx.colors();
-
-        let mut stack = div()
-            .absolute()
-            .bottom(px(36.))
-            .right(px(12.))
-            .v_flex()
-            .gap(px(6.))
-            .w(px(320.));
+        let mut stack = div().v_flex().w_full().flex_shrink_0().gap(px(6.));
 
         for entry in &self.toasts {
             let toast_id = entry.id;
@@ -143,38 +154,14 @@ impl Render for ToastLayer {
 
             stack = stack.child(
                 div()
-                    .id(ElementId::NamedInteger("toast-row".into(), toast_id as u64))
-                    .h_flex()
-                    .items_center()
-                    .gap(px(0.))
-                    .child(div().flex_1().min_w_0().child(toast))
-                    .child(
-                        div()
-                            .id(ElementId::NamedInteger(
-                                "toast-close".into(),
-                                toast_id as u64,
-                            ))
-                            .absolute()
-                            .top(px(4.))
-                            .right(px(4.))
-                            .flex_shrink_0()
-                            .cursor_pointer()
-                            .rounded_md()
-                            .p(px(2.))
-                            .hover(|s| s.bg(colors.ghost_element_hover))
-                            .on_click(move |_event, _window, cx| {
-                                entity
-                                    .update(cx, |this, cx| {
-                                        this.dismiss_toast(toast_id, cx);
-                                    })
-                                    .ok();
-                            })
-                            .child(
-                                Icon::new(IconName::X)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    ),
+                    .w_full()
+                    .flex_shrink_0()
+                    .occlude()
+                    .child(toast.on_dismiss(move |_, _, cx| {
+                        entity
+                            .update(cx, |this, cx| this.dismiss_toast(toast_id, cx))
+                            .ok();
+                    })),
             );
         }
 
@@ -185,6 +172,8 @@ impl Render for ToastLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgitui_theme::Color;
+    use rgitui_ui::IconName;
 
     fn entry(id: usize, message: &str, kind: ToastKind) -> ToastEntry {
         ToastEntry {
@@ -193,6 +182,14 @@ mod tests {
             kind,
             action: None,
         }
+    }
+
+    #[test]
+    fn notification_stack_never_participates_in_workspace_flow() {
+        let mut stack = notification_stack();
+        assert_eq!(stack.style().position, Some(gpui::Position::Absolute));
+        assert!(stack.style().max_size.height.is_some());
+        assert!(stack.style().max_size.width.is_some());
     }
 
     #[test]

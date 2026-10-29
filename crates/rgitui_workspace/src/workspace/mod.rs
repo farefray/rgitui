@@ -378,7 +378,7 @@ pub(super) struct ActiveOperation {
     pub started_at: Instant,
 }
 
-/// Stores the result of a completed git operation for display in the output bar.
+/// Stores a completed git operation's expandable floating notification.
 pub(super) struct OperationOutput {
     pub operation: Message,
     pub output: Message,

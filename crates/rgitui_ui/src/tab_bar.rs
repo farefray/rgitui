@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    div, px, rems, AnyElement, App, ClickEvent, CursorStyle, ElementId, FontWeight, Hsla,
-    ScrollHandle, SharedString, Window,
+    div, px, rems, AnyElement, App, ClickEvent, Context, CursorStyle, ElementId, EntityId,
+    FontWeight, Hsla, MouseButton, ScrollHandle, SharedString, Window,
 };
 use rgitui_theme::{ActiveTheme, Color, StyledExt, ThemeColors};
 use smallvec::SmallVec;
@@ -42,6 +42,37 @@ fn tab_colors(colors: &ThemeColors, active: bool) -> TabColors {
     }
 }
 
+type ReorderHandler = Box<dyn Fn(EntityId, &mut Window, &mut App)>;
+
+struct TabReorder {
+    scope: EntityId,
+    item: EntityId,
+    handler: ReorderHandler,
+}
+
+#[derive(Clone)]
+struct DraggedTab {
+    scope: EntityId,
+    item: EntityId,
+    label: SharedString,
+    dirty: bool,
+}
+
+impl DraggedTab {
+    fn can_drop_on(&self, scope: EntityId, item: EntityId) -> bool {
+        self.scope == scope && self.item != item
+    }
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Tab::new("tab-drag-preview", self.label.clone())
+            .active(true)
+            .dirty(self.dirty)
+            .closeable(false)
+    }
+}
+
 /// A single tab in a tab bar.
 #[derive(IntoElement)]
 pub struct Tab {
@@ -53,6 +84,7 @@ pub struct Tab {
     tooltip: Option<SharedString>,
     on_click: Option<crate::ClickHandler>,
     on_close: Option<crate::ClickHandler>,
+    reorder: Option<TabReorder>,
 }
 
 impl Tab {
@@ -66,6 +98,7 @@ impl Tab {
             tooltip: None,
             on_click: None,
             on_close: None,
+            reorder: None,
         }
     }
 
@@ -95,6 +128,23 @@ impl Tab {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_click = Some(Box::new(handler));
+        self
+    }
+
+    /// Opt into dragging and receiving drops from other tabs in the same scope.
+    /// The target's handler receives the dragged item's identity; the owner moves
+    /// that item to this tab's index. Self-drops and other scopes are ignored.
+    pub fn on_reorder(
+        mut self,
+        scope: EntityId,
+        item: EntityId,
+        handler: impl Fn(EntityId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.reorder = Some(TabReorder {
+            scope,
+            item,
+            handler: Box::new(handler),
+        });
         self
     }
 
@@ -151,6 +201,40 @@ impl RenderOnce for Tab {
             tab = tab.on_click(on_click);
         }
 
+        let reorderable = self.reorder.is_some();
+        if let Some(TabReorder {
+            scope,
+            item,
+            handler,
+        }) = self.reorder
+        {
+            let accent = colors.text_accent;
+            let drop_background = resolved.background.blend(accent.opacity(0.15));
+            tab = tab
+                .on_drag(
+                    DraggedTab {
+                        scope,
+                        item,
+                        label: self.label.clone(),
+                        dirty: self.dirty,
+                    },
+                    |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+                )
+                .can_drop(move |value, _, _| {
+                    value
+                        .downcast_ref::<DraggedTab>()
+                        .is_some_and(|dragged| dragged.can_drop_on(scope, item))
+                })
+                .drag_over::<DraggedTab>(move |style, _, _, _| {
+                    style.bg(drop_background).border_color(accent)
+                })
+                .on_drop(move |dragged: &DraggedTab, window, cx| {
+                    if dragged.can_drop_on(scope, item) {
+                        handler(dragged.item, window, cx);
+                    }
+                });
+        }
+
         // Dirty indicator
         if self.dirty {
             tab = tab.child(
@@ -196,6 +280,11 @@ impl RenderOnce for Tab {
             tab = tab.child(
                 div()
                     .flex_shrink_0()
+                    .when(reorderable, |el| {
+                        // The close button still receives its click, but pressing
+                        // it must not arm a drag on the containing tab.
+                        el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    })
                     .when(!is_active, |el| {
                         el.invisible().group_hover("tab", |s| s.visible())
                     })

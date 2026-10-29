@@ -166,15 +166,29 @@ The launcher picks the most recently modified `target/debug/rgitui.exe` or
 run `cargo build --package rgitui` (optionally `--release`) to update it.
 Without a repository argument, normal saved-workspace restoration applies.
 
-Create **rgitui (latest)** shortcuts on your Desktop and in the Start Menu:
+Create **rgitui (latest)** and **rgitui (build & run)** shortcuts on your Desktop
+and in the Start Menu:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-shortcuts.ps1
 ```
 
-Re-run that command if you move the checkout. Shortcuts use the app icon and do
-not leave a terminal window open. These helpers use this checkout's default
-`target` directory, not a custom `CARGO_TARGET_DIR` or cross-compilation directory.
+**rgitui (build & run)** runs an incremental debug build of the current local
+source, then launches that exact build. Close the debug app first so Windows can
+replace its executable. Build progress appears in a console; failures show an
+error and never launch an older build. Cargo must be on your PATH. This does not
+pull changes from GitHub. You can also run it directly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-run-windows.ps1
+# Build without launching:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-run-windows.ps1 -BuildOnly
+```
+
+Re-run the installer if you move the checkout. Shortcuts use the app icon;
+**latest** opens silently, while **build & run** closes its console after a
+successful launch. These helpers use this checkout's default `target` directory,
+not a custom `CARGO_TARGET_DIR` or cross-compilation directory.
 
 To remove the old named preview bundles/copies (without touching current builds,
 demo repos, screenshots, or settings), preview the cleanup first:

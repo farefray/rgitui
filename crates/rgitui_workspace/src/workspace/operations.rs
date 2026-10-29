@@ -1,14 +1,40 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{div, px, ClickEvent, Context, SharedString};
 use rgitui_git::{GitOperationKind, GitOperationUpdate};
+use rgitui_i18n::t;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
-use rgitui_ui::{ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, Label, LabelSize};
+use rgitui_ui::{
+    ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip,
+};
 
 use crate::ToastKind;
 
-use super::{GitOperationTarget, RepositoryTarget, Workspace, OPERATION_OUTPUT_AUTO_HIDE_SECS};
+use super::{
+    GitOperationTarget, OperationOutput, RepositoryTarget, Workspace,
+    OPERATION_OUTPUT_AUTO_HIDE_SECS,
+};
+
+impl OperationOutput {
+    /// The timestamp identifies a particular collapsed lifetime, not just a result.
+    fn should_auto_hide(&self, scheduled_timestamp: Instant) -> bool {
+        self.timestamp == scheduled_timestamp && !self.expanded && !self.is_error
+    }
+
+    /// Expanding pauses expiry. Collapsing starts a fresh full timeout, even if
+    /// the previous timer already fired while the details were open.
+    fn toggle_expanded(&mut self, now: Instant) -> Option<Instant> {
+        self.expanded = !self.expanded;
+        if self.expanded {
+            return None;
+        }
+
+        // Also invalidate the old timer on clocks with coarse resolution.
+        self.timestamp = now.max(self.timestamp + Duration::from_nanos(1));
+        (!self.is_error).then_some(self.timestamp)
+    }
+}
 
 impl Workspace {
     /// Legacy rebase/bisect/previous-branch APIs still assume the owning checkout.
@@ -133,7 +159,7 @@ impl Workspace {
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
                     if let Some(output) = &this.operations.last_operation_output {
-                        if output.timestamp == timestamp && !output.expanded && !output.is_error {
+                        if output.should_auto_hide(timestamp) {
                             this.operations.last_operation_output = None;
                             cx.notify();
                         }
@@ -145,7 +171,7 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn render_operation_output_bar(
+    pub(super) fn render_operation_output_notification(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
@@ -156,11 +182,6 @@ impl Workspace {
             cx.status().error
         } else {
             cx.status().success
-        };
-        let bg = if output.is_error {
-            cx.status().error_background
-        } else {
-            cx.status().success_background
         };
         let icon = if output.is_error {
             IconName::FileConflict
@@ -176,41 +197,53 @@ impl Workspace {
         let operation_label = output.operation.translated();
         let full_output = output.output.translated();
         let first_line: SharedString = full_output.lines().next().unwrap_or("").to_string().into();
-        let expanded = output.expanded;
-        let has_multiple_lines = full_output.lines().count() > 1;
+        let expandable = !full_output.is_empty();
+        let expanded = expandable && output.expanded;
 
-        let mut bar = div()
-            .id("operation-output-bar")
+        let mut card = div()
+            .id("operation-output-notification")
             .v_flex()
             .w_full()
-            .bg(bg)
-            .border_b_1()
-            .border_color(accent);
+            .flex_shrink_0()
+            .occlude()
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .rounded(px(8.))
+            .border_color(accent)
+            .elevation_3(cx);
 
         let mut header = div()
             .h_flex()
             .w_full()
-            .min_h(px(28.))
+            .min_h(px(30.))
             .px(px(10.))
-            .py(px(2.))
+            .py(px(4.))
             .gap(px(6.))
             .items_center()
             .child(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
             .child(
-                Label::new(operation_label)
-                    .size(LabelSize::XSmall)
-                    .weight(gpui::FontWeight::SEMIBOLD),
-            )
-            .child(
-                div().flex_1().min_w_0().overflow_hidden().child(
-                    Label::new(first_line)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                ),
+                div()
+                    .id("operation-output-summary")
+                    .v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .tooltip(Tooltip::text(operation_label.clone()))
+                    .child(
+                        Label::new(operation_label)
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD)
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(first_line)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
             );
 
-        if has_multiple_lines {
+        if expandable {
             header = header.child(
                 IconButton::new(
                     "output-expand",
@@ -223,9 +256,19 @@ impl Workspace {
                 .size(ButtonSize::Compact)
                 .style(ButtonStyle::Transparent)
                 .color(Color::Muted)
+                .tooltip(if expanded {
+                    t!("workspace.operation.hide_details")
+                } else {
+                    t!("workspace.operation.show_details")
+                })
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    if let Some(op_output) = &mut this.operations.last_operation_output {
-                        op_output.expanded = !op_output.expanded;
+                    let restart_at = this
+                        .operations
+                        .last_operation_output
+                        .as_mut()
+                        .and_then(|output| output.toggle_expanded(Instant::now()));
+                    if let Some(timestamp) = restart_at {
+                        this.schedule_operation_output_auto_hide(timestamp, cx);
                     }
                     cx.notify();
                 })),
@@ -237,21 +280,22 @@ impl Workspace {
                 .size(ButtonSize::Compact)
                 .style(ButtonStyle::Transparent)
                 .color(Color::Muted)
+                .tooltip(t!("workspace.operation.dismiss"))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.operations.last_operation_output = None;
                     cx.notify();
                 })),
         );
 
-        bar = bar.child(header);
+        card = card.child(header);
 
         if expanded {
-            bar = bar.child(
+            card = card.child(
                 div()
                     .id("operation-output-content")
                     .w_full()
-                    .max_h(px(120.))
-                    .overflow_y_scroll()
+                    .max_h(px(160.))
+                    .overflow_scroll()
                     .px(px(10.))
                     .pb(px(6.))
                     .child(
@@ -265,7 +309,7 @@ impl Workspace {
             );
         }
 
-        Some(bar.into_any_element())
+        Some(card.into_any_element())
     }
 
     pub(super) fn retry_git_operation(
@@ -365,5 +409,88 @@ impl Workspace {
             self.operations.last_failed_git_operation = None;
             self.operations.last_failed_git_operation_target = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgitui_i18n::Message;
+
+    fn success(timestamp: Instant) -> OperationOutput {
+        OperationOutput {
+            operation: Message::verbatim("Fetch completed in repository"),
+            output: Message::verbatim("A single output line can also be expanded"),
+            is_error: false,
+            timestamp,
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn only_the_current_collapsed_success_expires() {
+        assert_eq!(OPERATION_OUTPUT_AUTO_HIDE_SECS, 10);
+        let started = Instant::now();
+        let mut output = success(started);
+        assert!(output.should_auto_hide(started));
+
+        // A previous result's timer must not dismiss a newer result.
+        output.timestamp = started + Duration::from_secs(1);
+        assert!(!output.should_auto_hide(started));
+        assert!(output.should_auto_hide(output.timestamp));
+
+        output.is_error = true;
+        assert!(!output.should_auto_hide(output.timestamp));
+    }
+
+    #[test]
+    fn collapse_restarts_timeout_after_original_timer_fired_while_expanded() {
+        let started = Instant::now();
+        let mut output = success(started);
+        assert_eq!(output.toggle_expanded(started), None);
+        assert!(output.expanded);
+        // Simulate the original timer firing while details remain open.
+        assert!(!output.should_auto_hide(started));
+
+        let collapsed = started + Duration::from_secs(OPERATION_OUTPUT_AUTO_HIDE_SECS + 5);
+        assert_eq!(output.toggle_expanded(collapsed), Some(collapsed));
+        assert!(!output.expanded);
+        assert_eq!(output.timestamp, collapsed);
+        assert!(!output.should_auto_hide(started));
+        assert!(output.should_auto_hide(collapsed));
+    }
+
+    #[test]
+    fn rapid_expansion_cycles_invalidate_all_previous_timers() {
+        let started = Instant::now();
+        let mut output = success(started);
+        assert_eq!(output.toggle_expanded(started), None);
+        // Even two clicks in the same clock tick must create a new lifetime.
+        let first_restart = output.toggle_expanded(started).unwrap();
+        assert!(first_restart > started);
+        assert!(!output.should_auto_hide(started));
+
+        assert_eq!(output.toggle_expanded(first_restart), None);
+        assert!(!output.should_auto_hide(first_restart));
+        let second_restart = output.toggle_expanded(first_restart).unwrap();
+        assert!(second_restart > first_restart);
+        assert!(!output.should_auto_hide(started));
+        assert!(!output.should_auto_hide(first_restart));
+        assert!(output.should_auto_hide(second_restart));
+    }
+
+    #[test]
+    fn collapsing_error_details_does_not_schedule_expiry() {
+        let started = Instant::now();
+        let mut output = success(started);
+        output.is_error = true;
+        assert_eq!(output.toggle_expanded(started), None);
+        assert!(output.expanded);
+        assert_eq!(
+            output.toggle_expanded(started + Duration::from_secs(1)),
+            None
+        );
+        assert!(!output.expanded);
+        assert!(!output.should_auto_hide(output.timestamp));
     }
 }
