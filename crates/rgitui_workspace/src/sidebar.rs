@@ -4082,7 +4082,6 @@ impl Render for Sidebar {
                                         .unwrap_or("")
                                         .to_string()
                                         .into();
-                                    let kind_color = Sidebar::file_change_color(file.kind);
                                     let file_path_for_emit: String =
                                         file.path.display().to_string();
                                     let file_path_clone = file_path_for_emit.clone();
@@ -4128,11 +4127,7 @@ impl Render for Sidebar {
                                                 });
                                             }
                                         }})
-                                        .child(
-                                            Label::new(Sidebar::file_change_symbol(file.kind))
-                                                .size(LabelSize::XSmall)
-                                                .color(kind_color),
-                                        )
+                                        .child(crate::file_status::FileStatusBadge::new(file.kind).compact())
                                         .child(
                                             Label::new(file_name)
                                                 .size(LabelSize::XSmall)
@@ -4421,7 +4416,6 @@ impl Render for Sidebar {
                                         .unwrap_or("")
                                         .to_string()
                                         .into();
-                                    let kind_color = Sidebar::file_change_color(file.kind);
                                     let file_path_for_emit: String =
                                         file.path.display().to_string();
                                     let file_path_clone = file_path_for_emit.clone();
@@ -4468,11 +4462,7 @@ impl Render for Sidebar {
                                                 ));
                                             }).ok();
                                         }})
-                                        .child(
-                                            Label::new(Sidebar::file_change_symbol(file.kind))
-                                                .size(LabelSize::XSmall)
-                                                .color(kind_color),
-                                        )
+                                        .child(crate::file_status::FileStatusBadge::new(file.kind).compact())
                                         .child(
                                             Label::new(file_name)
                                                 .size(LabelSize::XSmall)

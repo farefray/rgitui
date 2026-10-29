@@ -49,13 +49,6 @@ fn repository_names(paths: &[std::path::PathBuf], names: &[String]) -> Vec<Strin
         .collect()
 }
 
-fn repository_label(name: &str, worktree: Option<&str>) -> String {
-    match worktree {
-        Some(worktree) => format!("{name} · {worktree}"),
-        None => name.to_owned(),
-    }
-}
-
 /// Identity comes from the already-open validation handle, not extra filesystem probes.
 #[derive(Debug, PartialEq, Eq)]
 struct RepositoryIdentity {
@@ -183,9 +176,11 @@ impl Workspace {
     }
 
     pub(super) fn repo_tab_labels(&self, cx: &gpui::App) -> Vec<String> {
+        // Checkout context belongs in the title bar and switcher, not in tab
+        // identity: changing worktrees must not rename repository navigation.
         self.open_repo_entries(cx)
-            .iter()
-            .map(|entry| repository_label(&entry.name, entry.worktree.as_deref()))
+            .into_iter()
+            .map(|entry| entry.name)
             .collect()
     }
 
@@ -1100,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_labels_disambiguate_duplicates_and_include_checkout() {
+    fn repo_labels_disambiguate_duplicates_and_keep_unique_names_compact() {
         let names = repository_names(
             &[
                 "/team/a/repo".into(),
@@ -1113,7 +1108,5 @@ mod tests {
         assert!(names[0].contains("/team/a"));
         assert!(names[1].contains("/team/b"));
         assert_eq!(names[2], "other");
-        assert_eq!(repository_label("repo", Some("feature")), "repo · feature");
-        assert_eq!(repository_label("repo", None), "repo");
     }
 }

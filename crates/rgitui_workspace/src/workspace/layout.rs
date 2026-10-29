@@ -409,27 +409,32 @@ impl Render for Workspace {
             return div().into_any_element();
         };
         let project = active_tab.project.read(cx);
-        // While a worktree is being inspected the whole window shows *that*
-        // checkout, so the title bar has to name it too. Reporting the main
-        // repository's branch here put the header in direct contradiction with
-        // the inspection banner sitting right underneath it.
+        // The title bar describes the active checkout; repository identity is
+        // shown only in the tabs. Read HEAD from the live worktree snapshot so
+        // branch changes never leave stale context in the header.
         let inspected = active_tab
             .inspecting_worktree
             .as_ref()
             .and_then(|inspecting| project.worktree_at(&inspecting.path));
-        let repo_name: SharedString = match inspected {
-            Some(worktree) => format!("{} › {}", project.repo_name(), worktree.name).into(),
-            None => project.repo_name().to_string().into(),
-        };
-        let head_detached = match inspected {
-            Some(worktree) => worktree.head_detached,
-            None => project.is_head_detached(),
-        };
-        let branch_name: SharedString = match inspected {
-            Some(worktree) => head_display_name(worktree.branch.as_deref(), worktree.head_oid),
-            None => head_display_name(project.head_branch(), project.head_oid()),
-        }
-        .into();
+        let worktree_name = active_tab.inspecting_worktree.as_ref().map(|inspecting| {
+            inspected
+                .map(|worktree| worktree.name.clone())
+                .unwrap_or_else(|| inspecting.name.clone())
+        });
+        let (head_detached, branch_name): (bool, SharedString) =
+            match (active_tab.inspecting_worktree.as_ref(), inspected) {
+                (_, Some(worktree)) => (
+                    worktree.head_detached,
+                    head_display_name(worktree.branch.as_deref(), worktree.head_oid).into(),
+                ),
+                // A missing snapshot must not borrow a different checkout's
+                // branch while actions still target the inspected path.
+                (Some(_), None) => (false, t!("graph.worktree.branch_unknown")),
+                (None, None) => (
+                    project.is_head_detached(),
+                    head_display_name(project.head_branch(), project.head_oid()).into(),
+                ),
+            };
         let (has_changes, staged_count, unstaged_count) = match active_tab.inspecting_worktree {
             // An inspected worktree whose status has not been computed yet
             // reports no changes rather than borrowing the main checkout's
@@ -450,25 +455,6 @@ impl Render for Workspace {
                 project.status().unstaged.len(),
             ),
         };
-        // Built from the live snapshot rather than from what was captured when
-        // the worktree was clicked, so switching branches inside the inspected
-        // worktree updates the banner instead of freezing the old branch there.
-        let inspecting_banner_label: Option<SharedString> =
-            active_tab.inspecting_worktree.as_ref().map(|inspecting| {
-                let name = &inspecting.name;
-                match inspected {
-                    Some(worktree) => match &worktree.branch {
-                        Some(branch) => {
-                            t!("workspace.inspecting.branch", name = name, branch = branch)
-                        }
-                        None if worktree.head_detached => {
-                            t!("workspace.inspecting.detached", name = name)
-                        }
-                        None => t!("workspace.inspecting.plain", name = name),
-                    },
-                    None => t!("workspace.inspecting.plain", name = name),
-                }
-            });
         // A conflicted merge inside a linked worktree records itself under
         // `.git/worktrees/<name>/`, so the project's own state stays clean and
         // the banner would hide conflicts the user is looking straight at.
@@ -486,7 +472,7 @@ impl Render for Workspace {
             None => project.conflicted_files().len(),
         };
         // Only the main checkout's detached HEAD gets this banner. An inspected
-        // worktree's is already named by the inspection banner, and a rebase or
+        // worktree's is already named by the title bar, and a rebase or
         // bisect detaches HEAD as part of an operation its own banner covers.
         let detached_head = (active_tab.inspecting_worktree.is_none()
             && project.is_head_detached()
@@ -501,11 +487,8 @@ impl Render for Workspace {
                 .map(|branch| branch.to_owned().into()),
         });
         let stash_count = project.stashes().len();
-        let repo_path_display: SharedString = rgitui_git::display_path(match inspected {
-            Some(worktree) => &worktree.path,
-            None => project.repo_path(),
-        })
-        .into();
+        let repo_path_display: SharedString =
+            rgitui_git::display_path(&active_tab.effective_repo_path(cx)).into();
         let overlays_active = self.any_overlay_visible(cx);
 
         // Detect which panel has keyboard focus for visual indicators
@@ -821,9 +804,19 @@ impl Render for Workspace {
         root
             // Title bar
             .child({
-                let title = TitleBar::new(repo_name.clone(), branch_name.clone())
+                let mut title = TitleBar::new(branch_name.clone())
+                    .checkout_path(repo_path_display.clone())
                     .has_changes(has_changes)
                     .head_detached(head_detached);
+                if let Some(name) = worktree_name {
+                    title = title.worktree(name).on_exit_worktree(cx.listener(
+                        |this, _: &ClickEvent, _, cx| {
+                            // Return to the original checkout without modifying
+                            // either worktree's HEAD or files.
+                            super::events::set_inspecting_worktree(this, None, cx);
+                        },
+                    ));
+                }
                 // A detached HEAD has no branch to find in the sidebar, so its
                 // pill shows HEAD's commit in the graph instead.
                 let mut title = if detached_head_banner.is_some() {
@@ -934,51 +927,6 @@ impl Render for Workspace {
                                 .color(Color::Error)
                                 .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                                     this.execute_command(CommandId::AbortOperation, cx);
-                                })),
-                        ),
-                )
-            })
-            .when_some(inspecting_banner_label, |el, label| {
-                el.child(
-                    div()
-                        .h_flex()
-                        .w_full()
-                        .min_h(px(32.))
-                        .px(px(10.))
-                        .py(px(4.))
-                        .gap(px(6.))
-                        .items_center()
-                        .bg(cx.status().info_background)
-                        .border_b_1()
-                        .border_color(cx.status().info)
-                        .child(
-                            Icon::new(IconName::Folder)
-                                .size(IconSize::Small)
-                                .color(Color::Info),
-                        )
-                        .child(
-                            div()
-                                .id("worktree-context-label")
-                                .min_w_0()
-                                .overflow_hidden()
-                                .tooltip(Tooltip::text(t!("workspace.worktree.context.tooltip", path = repo_path_display.clone())))
-                                .child(Label::new(label)
-                                    .size(LabelSize::Small)
-                                    .weight(gpui::FontWeight::SEMIBOLD)
-                                    .truncate()),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            // Not "back to main": leaving inspection returns to
-                            // whichever checkout rgitui was opened on, which may
-                            // be on any branch — or be a linked worktree itself.
-                            Button::new("exit-worktree-inspection", t!("workspace.worktree.exit"))
-                                .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Subtle)
-                                .color(Color::Info)
-                                .tooltip(t!("workspace.worktree.exit.tooltip"))
-                                .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                                    super::events::set_inspecting_worktree(this, None, cx);
                                 })),
                         ),
                 )

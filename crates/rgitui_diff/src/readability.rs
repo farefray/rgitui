@@ -6,11 +6,12 @@ use std::{cell::RefCell, collections::HashMap};
 
 pub(super) const MIN_CONTRAST: f32 = 4.5;
 pub(super) const WORD_ALPHA: f32 = 0.18;
-/// Added/removed line fills: strong enough that a removed line cannot pass for
-/// context at a glance, light enough that syntax ink rarely needs correcting.
-const LINE_TINT: f32 = 0.11;
+/// Added/removed line fills must remain visible independently of syntax ink.
+/// The former 11% wash nearly disappeared against Forest's green editor.
+/// InkCache corrects text against these stronger fills (and word overlays).
+const LINE_TINT: f32 = 0.24;
 /// The number gutter carries the change color more strongly than the code.
-const GUTTER_TINT: f32 = 0.20;
+const GUTTER_TINT: f32 = 0.34;
 
 /// All diff surfaces are flattened before painting, so nested gutter/word
 /// fills have an unambiguous backing.
@@ -238,6 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn forest_change_fills_are_visible_without_relying_on_text_color() {
+        let colors = rgitui_theme::forest_colors();
+        let s = DiffSurfaces::new(&colors);
+        for (row, gutter, accent) in [
+            (s.added, s.added_gutter, colors.vc_added),
+            (s.deleted, s.deleted_gutter, colors.vc_deleted),
+        ] {
+            // These are fill-separation thresholds, not WCAG text thresholds.
+            // In particular, the removal fill must not pass for context.
+            assert!(contrast_ratio(row, s.editor) >= 1.5);
+            assert!(contrast_ratio(gutter, row) >= 1.15);
+            let word = tint(accent, WORD_ALPHA, row);
+            assert!(contrast_ratio(word, row) >= 1.2);
+            assert!(contrast_ratio(colors.text, row) >= MIN_CONTRAST);
+            for surface in [row, gutter, word] {
+                assert_eq!(surface.a, 1.0);
+            }
+        }
+        // Similar luminance is fine, but red and green fills must remain
+        // chromatically distinct after compositing onto the green editor.
+        let added = Rgba::from(s.added);
+        let deleted = Rgba::from(s.deleted);
+        assert!(added.g - added.r >= 0.06);
+        assert!(deleted.r - deleted.g >= 0.06);
+        let distance = ((added.r - deleted.r).powi(2)
+            + (added.g - deleted.g).powi(2)
+            + (added.b - deleted.b).powi(2))
+        .sqrt();
+        assert!(distance >= 0.12);
+    }
+
+    #[test]
     fn all_theme_surfaces_support_readable_distinct_syntax() {
         for theme in builtin_themes() {
             let s = DiffSurfaces::new(&theme.colors);
@@ -256,12 +289,21 @@ mod tests {
                     tint(theme.colors.vc_added, WORD_ALPHA, background),
                     tint(theme.colors.vc_deleted, WORD_ALPHA, background),
                 ] {
-                    for ink in ["#65737e", "#96b5b4", "#8fa1b3", "#a3be8c", "#bf616a"] {
-                        let original = hex_to_hsla(ink);
+                    for original in [
+                        hex_to_hsla("#65737e"),
+                        hex_to_hsla("#96b5b4"),
+                        hex_to_hsla("#8fa1b3"),
+                        hex_to_hsla("#a3be8c"),
+                        hex_to_hsla("#bf616a"),
+                        theme.colors.text,
+                        theme.colors.text_muted,
+                        theme.colors.vc_added,
+                        theme.colors.vc_deleted,
+                    ] {
                         let corrected = readable_ink(original, surface);
                         assert!(
                             contrast_ratio(composite(corrected, surface), surface) >= MIN_CONTRAST,
-                            "{} {ink}",
+                            "{} {original:?}",
                             theme.name
                         );
                         assert_eq!(corrected.h, original.h);
@@ -294,6 +336,14 @@ mod tests {
             assert_eq!(s.editor, theme.colors.editor_background);
             assert_eq!(s.added, tint(theme.colors.vc_added, LINE_TINT, s.editor));
             assert_eq!(
+                s.deleted,
+                tint(theme.colors.vc_deleted, LINE_TINT, s.editor)
+            );
+            assert_eq!(
+                s.deleted_gutter,
+                tint(theme.colors.vc_deleted, GUTTER_TINT, s.editor)
+            );
+            assert_eq!(
                 s.added_gutter,
                 tint(theme.colors.vc_added, GUTTER_TINT, s.editor)
             );
@@ -301,6 +351,10 @@ mod tests {
         let mut colors = builtin_themes()[0].colors.clone();
         colors.editor_background.a = 0.4;
         colors.vc_added.a = 0.5;
+        colors.vc_deleted = Hsla {
+            a: 0.35,
+            ..hex_to_hsla("#a060ff")
+        };
         colors.element_selected = Hsla {
             a: 0.3,
             ..hex_to_hsla("#ff00ff")
@@ -318,6 +372,24 @@ mod tests {
                 s.editor
             )
         );
+        assert_eq!(
+            s.deleted,
+            composite(
+                Hsla {
+                    a: 0.35 * LINE_TINT,
+                    ..colors.vc_deleted
+                },
+                s.editor
+            )
+        );
+        // Never force our semantic hues or a minimum opacity on custom tokens.
+        colors.vc_added.a = 0.0;
+        colors.vc_deleted.a = 0.0;
+        let transparent = DiffSurfaces::new(&colors);
+        assert_eq!(transparent.added, transparent.editor);
+        assert_eq!(transparent.deleted, transparent.editor);
+        assert_eq!(transparent.added_gutter, transparent.editor);
+        assert_eq!(transparent.deleted_gutter, transparent.editor);
         for bg in [s.gutter, s.added_gutter, s.deleted_gutter, s.selected] {
             let ink = readable_ink(colors.text_muted, bg);
             assert!(contrast_ratio(composite(ink, bg), bg) >= MIN_CONTRAST);

@@ -50,23 +50,25 @@ pub fn forest_colors() -> ThemeColors {
 
         hint_background: hex("#303e35"),
 
-        // Status is not interchangeable with navigation: retain separate hues.
-        vc_added: hex("#b2cf76"),
-        vc_modified: hex("#e4b66e"),
-        vc_deleted: hex("#ec9790"),
-        vc_conflict: hex("#d8a4ca"),
-        vc_renamed: hex("#90bed0"),
+        // Git states need distinct hue families, not the olive action accent:
+        // green additions, blue edits, pink-red removals, amber conflicts,
+        // and violet renames. Keep warning amber out of the modified state.
+        vc_added: hex("#83d69a"),
+        vc_modified: hex("#82b7ff"),
+        vc_deleted: hex("#ff8299"),
+        vc_conflict: hex("#f2c66d"),
+        vc_renamed: hex("#c3a0ef"),
         vc_untracked: hex("#89c6b3"),
     }
 }
 
 pub fn forest_status() -> StatusColors {
     StatusColors {
-        error: hex("#ec9790"),
+        error: hex("#ff8299"),
         error_background: hex("#492d2d"),
         warning: hex("#e4b66e"),
         warning_background: hex("#453b26"),
-        success: hex("#b2cf76"),
+        success: hex("#83d69a"),
         success_background: hex("#34432b"),
         info: hex("#90bed0"),
         info_background: hex("#2c404b"),
@@ -149,6 +151,31 @@ mod tests {
             assert!(contrast_ratio(ink, c.editor_background) >= 4.5);
             assert!(contrast_ratio(ink, c.panel_background) >= 4.5);
         }
+    }
+
+    #[test]
+    fn forest_git_statuses_have_separate_semantic_hue_families() {
+        let c = forest_colors();
+        let statuses = [
+            (c.vc_added, 120.0..155.0),
+            (c.vc_modified, 200.0..230.0),
+            (c.vc_deleted, 330.0..360.0),
+            (c.vc_conflict, 30.0..50.0),
+            (c.vc_renamed, 250.0..285.0),
+        ];
+        for (i, (color, family)) in statuses.iter().enumerate() {
+            let hue = color.h * 360.0;
+            assert!(family.contains(&hue), "{}: {hue}", hsla_to_hex(*color));
+            // Hue separation alone is meaningless for nearly gray colors.
+            assert!(color.s >= 0.4);
+            assert_eq!(color.a, 1.0);
+            for (other, _) in &statuses[..i] {
+                let distance = (hue - other.h * 360.0).abs();
+                assert!(distance.min(360.0 - distance) >= 45.0);
+            }
+        }
+        assert_eq!(forest_status().success, c.vc_added);
+        assert_eq!(forest_status().error, c.vc_deleted);
     }
 
     #[test]

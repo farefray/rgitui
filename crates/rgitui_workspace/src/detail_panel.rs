@@ -21,6 +21,7 @@ use rgitui_ui::{
     IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent, Tooltip,
 };
 
+use crate::file_status::{file_change_color, FileStatusBadge};
 use crate::keymap;
 use crate::markdown_view::render_markdown;
 use crate::CommandId;
@@ -314,19 +315,6 @@ fn file_change_icon(kind: FileChangeKind) -> IconName {
     }
 }
 
-fn file_change_color(kind: FileChangeKind) -> Color {
-    match kind {
-        FileChangeKind::Added => Color::Added,
-        FileChangeKind::Modified => Color::Modified,
-        FileChangeKind::Deleted => Color::Deleted,
-        FileChangeKind::Renamed => Color::Renamed,
-        FileChangeKind::Copied => Color::Info,
-        FileChangeKind::TypeChange => Color::Warning,
-        FileChangeKind::Untracked => Color::Untracked,
-        FileChangeKind::Conflicted => Color::Conflict,
-    }
-}
-
 struct CachedFileDiffTree {
     /// Rows for flat view: one per file, in diff order (the search-relevance
     /// ordering is applied later by `filtered_files`). Held behind an `Arc` so
@@ -348,8 +336,7 @@ struct CachedFlatRow {
     deletions: usize,
     icon_name: IconName,
     icon_color: Color,
-    change_code: SharedString,
-    change_color: Color,
+    kind: FileChangeKind,
 }
 
 /// A file leaf in the tree view. Carries only what a file row renders — the
@@ -362,8 +349,7 @@ struct CachedTreeFile {
     deletions: usize,
     icon_name: IconName,
     icon_color: Color,
-    change_code: SharedString,
-    change_color: Color,
+    kind: FileChangeKind,
 }
 
 #[derive(Clone)]
@@ -443,8 +429,7 @@ fn flatten_tree(
                 deletions: fr.deletions,
                 icon_name: fr.icon_name,
                 icon_color: fr.icon_color,
-                change_code: fr.change_code.clone(),
-                change_color: fr.change_color,
+                kind: fr.kind,
             }),
         });
     }
@@ -537,8 +522,7 @@ fn build_cached_file_tree(files: &[FileDiff]) -> CachedFileDiffTree {
                 deletions: file.deletions,
                 icon_name: file_change_icon(file.kind),
                 icon_color: file_change_color(file.kind),
-                change_code: file.kind.short_code().into(),
-                change_color: file_change_color(file.kind),
+                kind: file.kind,
             }
         })
         .collect();
@@ -1283,21 +1267,7 @@ impl DetailPanel {
                                             .truncate(),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .w(px(16.))
-                                    .h(px(16.))
-                                    .rounded(px(3.))
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Label::new(row.change_code.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(row.change_color)
-                                            .weight(gpui::FontWeight::BOLD),
-                                    ),
-                            )
+                            .child(FileStatusBadge::new(row.kind))
                             .child(DiffStat::new(row.additions, row.deletions))
                             .into_any_element()
                     })
@@ -1463,21 +1433,7 @@ impl DetailPanel {
                                                 .truncate(),
                                         ),
                                     )
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .w(px(16.))
-                                            .h(px(16.))
-                                            .rounded(px(3.))
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Label::new(file.change_code.clone())
-                                                    .size(LabelSize::XSmall)
-                                                    .color(file.change_color)
-                                                    .weight(gpui::FontWeight::BOLD),
-                                            ),
-                                    )
+                                    .child(FileStatusBadge::new(file.kind))
                                     .child(DiffStat::new(file.additions, file.deletions))
                                     .into_any_element()
                             }
@@ -1595,6 +1551,7 @@ impl Render for DetailPanel {
                                             .child(Label::new(file_name).size(LabelSize::Small).truncate()))
                                         .when_some(directory, |el, directory| el.child(div().flex_1().min_w_0()
                                             .child(Label::new(directory).size(LabelSize::XSmall).color(Color::Muted).truncate()))))
+                                    .child(FileStatusBadge::new(file.kind))
                                     // Conflicts must go through the resolver, not blind staging.
                                     .when(!conflicted, |el| el.child(IconButton::new(ElementId::NamedInteger("working-stage".into(), row as u64), if staged { IconName::Minus } else { IconName::Plus })
                                         .size(ButtonSize::Compact)
@@ -2391,19 +2348,17 @@ mod census {
         DetailPanel,
     };
 
-    /// A flat row's numbers and colours are inline; its three shared strings
+    /// A flat row's numbers and colours are inline; its two shared strings
     /// are not, and a file path is exactly the length that stops being inline.
     impl HeapSize for CachedFlatRow {
         fn heap_size(&self, census: &mut Census) -> usize {
-            self.file_name.heap_size(census)
-                + self.dir_path.heap_size(census)
-                + self.change_code.heap_size(census)
+            self.file_name.heap_size(census) + self.dir_path.heap_size(census)
         }
     }
 
     impl HeapSize for CachedTreeFile {
-        fn heap_size(&self, census: &mut Census) -> usize {
-            self.change_code.heap_size(census)
+        fn heap_size(&self, _census: &mut Census) -> usize {
+            0
         }
     }
 
@@ -3100,15 +3055,15 @@ mod tests {
         ];
         let cached = build_cached_file_tree(&files);
         assert_eq!(cached.flat_rows.len(), 8);
-        // Verify each kind gets the correct short code
-        assert_eq!(cached.flat_rows[0].change_code.as_str(), "A");
-        assert_eq!(cached.flat_rows[1].change_code.as_str(), "M");
-        assert_eq!(cached.flat_rows[2].change_code.as_str(), "D");
-        assert_eq!(cached.flat_rows[3].change_code.as_str(), "R");
-        assert_eq!(cached.flat_rows[4].change_code.as_str(), "C");
-        assert_eq!(cached.flat_rows[5].change_code.as_str(), "T");
-        assert_eq!(cached.flat_rows[6].change_code.as_str(), "?");
-        assert_eq!(cached.flat_rows[7].change_code.as_str(), "!");
+        // Preserve typed status so badges translate at render time.
+        assert_eq!(cached.flat_rows[0].kind, FileChangeKind::Added);
+        assert_eq!(cached.flat_rows[1].kind, FileChangeKind::Modified);
+        assert_eq!(cached.flat_rows[2].kind, FileChangeKind::Deleted);
+        assert_eq!(cached.flat_rows[3].kind, FileChangeKind::Renamed);
+        assert_eq!(cached.flat_rows[4].kind, FileChangeKind::Copied);
+        assert_eq!(cached.flat_rows[5].kind, FileChangeKind::TypeChange);
+        assert_eq!(cached.flat_rows[6].kind, FileChangeKind::Untracked);
+        assert_eq!(cached.flat_rows[7].kind, FileChangeKind::Conflicted);
     }
 
     #[test]

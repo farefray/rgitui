@@ -12,6 +12,7 @@ mod confirm_dialog;
 mod create_pr_dialog;
 mod detail_panel;
 mod file_history_view;
+mod file_status;
 mod github_api;
 mod github_data_service;
 mod github_device_flow;
