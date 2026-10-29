@@ -5,7 +5,7 @@ pub mod json_theme;
 mod theme;
 
 pub use colors::*;
-pub use contrast::{contrast_ratio, contrast_text_on};
+pub use contrast::{composite, contrast_ratio, contrast_text_on};
 pub use forest::{forest_colors, forest_status};
 pub use theme::*;
 

@@ -1,35 +1,20 @@
 //! Diff-local typography and surface-aware ink; no theme schema or palette overrides.
-use gpui::{font, px, Font, HighlightStyle, Hsla, Rgba, TextStyle, Window};
+use gpui::{font, px, Font, HighlightStyle, Hsla, TextStyle, Window};
 use rgitui_settings::Compactness;
 use rgitui_theme::{contrast_ratio, ThemeColors};
 use std::{cell::RefCell, collections::HashMap};
 
 pub(super) const MIN_CONTRAST: f32 = 4.5;
 pub(super) const WORD_ALPHA: f32 = 0.18;
+/// Added/removed line fills: strong enough that a removed line cannot pass for
+/// context at a glance, light enough that syntax ink rarely needs correcting.
+const LINE_TINT: f32 = 0.11;
+/// The number gutter carries the change color more strongly than the code.
+const GUTTER_TINT: f32 = 0.20;
 
-/// Source-over in sRGB, matching the renderer. All diff surfaces are flattened
-/// before painting, so nested gutter/word fills have an unambiguous backing.
-pub(super) fn composite(front: Hsla, back: Hsla) -> Hsla {
-    if front.a == 1.0 {
-        return front;
-    }
-    if front.a == 0.0 {
-        return back;
-    }
-    let f = Rgba::from(front);
-    let b = Rgba::from(back);
-    let a = f.a + b.a * (1.0 - f.a);
-    if a == 0.0 {
-        return Hsla::transparent_black();
-    }
-    Rgba {
-        r: (f.r * f.a + b.r * b.a * (1.0 - f.a)) / a,
-        g: (f.g * f.a + b.g * b.a * (1.0 - f.a)) / a,
-        b: (f.b * f.a + b.b * b.a * (1.0 - f.a)) / a,
-        a,
-    }
-    .into()
-}
+/// All diff surfaces are flattened before painting, so nested gutter/word
+/// fills have an unambiguous backing.
+pub(super) use rgitui_theme::composite;
 
 pub(super) fn tint(color: Hsla, opacity: f32, background: Hsla) -> Hsla {
     composite(
@@ -142,10 +127,10 @@ impl DiffSurfaces {
         let editor = composite(colors.editor_background, backing);
         Self {
             editor,
-            added: tint(colors.vc_added, 0.07, editor),
-            deleted: tint(colors.vc_deleted, 0.07, editor),
-            added_gutter: tint(colors.vc_added, 0.12, editor),
-            deleted_gutter: tint(colors.vc_deleted, 0.12, editor),
+            added: tint(colors.vc_added, LINE_TINT, editor),
+            deleted: tint(colors.vc_deleted, LINE_TINT, editor),
+            added_gutter: tint(colors.vc_added, GUTTER_TINT, editor),
+            deleted_gutter: tint(colors.vc_deleted, GUTTER_TINT, editor),
             gutter: tint(colors.text, 0.035, editor),
             selected: composite(colors.element_selected, editor),
             active: composite(colors.element_active, editor),
@@ -242,6 +227,7 @@ impl CodeTypography {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Rgba;
     use rgitui_theme::{builtin_themes, hex_to_hsla};
 
     #[test]
@@ -306,8 +292,11 @@ mod tests {
         for theme in builtin_themes() {
             let s = DiffSurfaces::new(&theme.colors);
             assert_eq!(s.editor, theme.colors.editor_background);
-            assert_eq!(s.added, tint(theme.colors.vc_added, 0.07, s.editor));
-            assert_eq!(s.added_gutter, tint(theme.colors.vc_added, 0.12, s.editor));
+            assert_eq!(s.added, tint(theme.colors.vc_added, LINE_TINT, s.editor));
+            assert_eq!(
+                s.added_gutter,
+                tint(theme.colors.vc_added, GUTTER_TINT, s.editor)
+            );
         }
         let mut colors = builtin_themes()[0].colors.clone();
         colors.editor_background.a = 0.4;
@@ -323,7 +312,7 @@ mod tests {
             s.added,
             composite(
                 Hsla {
-                    a: 0.035,
+                    a: 0.5 * LINE_TINT,
                     ..colors.vc_added
                 },
                 s.editor

@@ -1115,6 +1115,38 @@ pub fn lane_color(index: usize) -> Hsla {
     GRAPH_LANE_COLORS[index % GRAPH_LANE_COLORS.len()]()
 }
 
+/// Contrast each light-theme lane color keeps against white, so it still reads
+/// as label text once a ref badge tints the surface behind it.
+const LIGHT_LANE_CONTRAST: f32 = 5.5;
+
+/// The lane color for a theme of `appearance`.
+///
+/// The palette is pastel, which is right on dark surfaces and washes out on
+/// light ones: there each hue is darkened just until it reads as text on white.
+pub fn lane_color_for(index: usize, appearance: crate::Appearance) -> Hsla {
+    static LIGHT: std::sync::OnceLock<Vec<Hsla>> = std::sync::OnceLock::new();
+    match appearance {
+        crate::Appearance::Dark => lane_color(index),
+        crate::Appearance::Light => {
+            let light = LIGHT.get_or_init(|| {
+                let white = hsla(0.0, 0.0, 100.0, 1.0);
+                (0..GRAPH_LANE_COLORS.len())
+                    .map(|i| {
+                        let mut color = lane_color(i);
+                        while color.l > 0.0
+                            && crate::contrast_ratio(color, white) < LIGHT_LANE_CONTRAST
+                        {
+                            color.l = (color.l - 0.01).max(0.0);
+                        }
+                        color
+                    })
+                    .collect()
+            });
+            light[index % light.len()]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,6 +1394,25 @@ mod tests {
                 i,
                 c.a
             );
+        }
+    }
+
+    #[test]
+    fn lane_colors_keep_contrast_on_every_builtin_editor_surface() {
+        use crate::{contrast_ratio, Appearance};
+        for theme in crate::builtin_themes() {
+            for i in 0..super::GRAPH_LANE_COLORS.len() {
+                let lane = lane_color_for(i, theme.appearance);
+                let ratio = contrast_ratio(lane, theme.colors.editor_background);
+                assert!(ratio >= 3.0, "{} lane {i}: {ratio:.2}:1", theme.name);
+            }
+        }
+        // Dark themes keep the palette exactly; only hues on light ones change.
+        for i in 0..super::GRAPH_LANE_COLORS.len() {
+            assert_eq!(lane_color_for(i, Appearance::Dark), lane_color(i));
+            let light = lane_color_for(i, Appearance::Light);
+            assert_eq!(light.h, lane_color(i).h);
+            assert!(light.l < lane_color(i).l);
         }
     }
 

@@ -82,6 +82,57 @@ fn lane_center(lane: usize, lane_width: f32, padding: f32) -> f32 {
     padding + (lane as f32 + 0.5) * lane_width
 }
 
+/// Lane spacing when commits are drawn as plain dots.
+const DOT_LANE_WIDTH: f32 = 20.0;
+/// Lane spacing when commits are drawn as avatars: the avatar plus a clear gap
+/// to the neighbouring lane's line.
+const AVATAR_LANE_WIDTH: f32 = 26.0;
+/// Width of every lane line, wide enough to follow across a busy graph.
+const LANE_STROKE: f32 = 2.5;
+/// Diameter of an avatar node before compactness scaling.
+const AVATAR_NODE_SIZE: f32 = 22.0;
+/// Opacity of the band that runs from a commit's node to its message, so the
+/// eye can follow a row from the graph to its text. Light themes darken the
+/// lane colors, so the same tint would shout there.
+fn lane_band_alpha(appearance: rgitui_theme::Appearance) -> f32 {
+    match appearance {
+        rgitui_theme::Appearance::Dark => 0.16,
+        rgitui_theme::Appearance::Light => 0.09,
+    }
+}
+
+/// Up to two capitals for an avatar with no image: "Noah Clarkson" is "NC".
+fn author_initials(name: &str) -> SharedString {
+    let initials: String = name
+        .split_whitespace()
+        .take(2)
+        .filter_map(|word| word.chars().find(|c| c.is_alphanumeric()))
+        .flat_map(char::to_uppercase)
+        .collect();
+    if initials.is_empty() {
+        SharedString::new_static("?")
+    } else {
+        initials.into()
+    }
+}
+
+/// The first line of a commit's body, shown dimmed after its subject. The
+/// subject paragraph, blank lines and trailers such as `Co-Authored-By:` are
+/// skipped: they say nothing the row does not already show.
+fn commit_body_preview(message: &str) -> Option<&str> {
+    let mut lines = message.lines();
+    lines.by_ref().find(|line| line.trim().is_empty())?;
+    lines
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !is_trailer(line))
+}
+
+fn is_trailer(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(key, _)| {
+        key.contains('-') && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
 /// The checkout a local branch is checked out in.
 #[derive(Clone, Debug, PartialEq)]
 struct BranchCheckout {
@@ -126,6 +177,7 @@ impl RefEntry {
         match &self.label {
             RefLabel::Tag(_) => IconName::Tag,
             RefLabel::Head => IconName::Check,
+            _ if self.is_head => IconName::Check,
             _ if self.worktree.is_some() => IconName::Folder,
             _ => IconName::GitBranch,
         }
@@ -2205,6 +2257,7 @@ impl Render for GraphView {
         let hover_bg = colors.ghost_element_hover;
         let active_bg = colors.ghost_element_active;
         let panel_bg = colors.editor_background;
+        let avatar_ink = colors.text;
         let border_color = colors.border_variant;
         let accent_border = colors.border_focused;
         let selected_border = colors.border_selected;
@@ -2274,8 +2327,15 @@ impl Render for GraphView {
         let has_search_query = self.show_search && !self.search_editor.read(cx).is_empty();
         let has_context_menu = self.context_menu.is_some();
 
-        let lane_width: f32 = 20.0;
+        let lane_width: f32 = if self.show_avatars {
+            AVATAR_LANE_WIDTH
+        } else {
+            DOT_LANE_WIDTH
+        };
         let graph_padding_left: f32 = 10.0;
+        let appearance = cx.theme().appearance;
+        let lane_color = move |index: usize| rgitui_theme::lane_color_for(index, appearance);
+        let band_alpha = lane_band_alpha(appearance);
         let compactness = cx.global::<SettingsState>().settings().compactness;
         let graph_style = cx.global::<SettingsState>().settings().graph_style;
         let compact_mul = compactness.multiplier();
@@ -2610,7 +2670,7 @@ impl Render for GraphView {
                             let row_node_color = if info.is_current || is_orphan {
                                 working_tree_node_color
                             } else {
-                                rgitui_theme::lane_color(position.color_index)
+                                lane_color(position.color_index)
                             };
                             let row_bg = if info.is_current || is_orphan {
                                 working_tree_bg
@@ -2680,6 +2740,8 @@ impl Render for GraphView {
                                 compact_mul,
                                 has_context_menu,
                                 graph_style,
+                                appearance,
+                                avatar_nodes: show_avatars,
                                 node_lane: position.node_lane,
                                 parent_lane: position.parent_lane,
                             });
@@ -2722,7 +2784,26 @@ impl Render for GraphView {
                         let node_lane = graph_row.node_lane;
                         let node_x = lane_center(node_lane, lane_width, graph_padding_left);
 
-                        let node_color = rgitui_theme::lane_color(graph_row.node_color);
+                        let node_color = lane_color(graph_row.node_color);
+                        // Merges stay small dots: they join lines rather than
+                        // carry someone's work, and a smaller mark keeps them quiet.
+                        let avatar_node = show_avatars && !is_merge_commit;
+                        let node_radius = if avatar_node {
+                            AVATAR_NODE_SIZE * compact_mul / 2.0
+                        } else if is_head_row {
+                            5.5 * compact_mul
+                        } else if is_merge_commit {
+                            5.0 * compact_mul
+                        } else {
+                            4.0 * compact_mul
+                        };
+                        let band_color = gpui::Hsla {
+                            a: band_alpha,
+                            ..node_color
+                        };
+                        // Nodes cover the lines and band beneath them, so they
+                        // are filled with the row's colour flattened to opaque.
+                        let row_opaque_bg = rgitui_theme::composite(bg, panel_bg);
                         let has_virtual_parent_above = worktree_targets_commit_immediately_above(
                             &worktree_row_positions,
                             i,
@@ -2756,7 +2837,6 @@ impl Render for GraphView {
 
                         // Clone only the edges vec for canvas closure (not the entire GraphRow)
                         let edges: Vec<GraphEdge> = graph_row.edges.clone();
-                        let row_bg_for_canvas = bg;
 
                         let view_clone = view.clone();
                         let view_ctx_menu = view.clone();
@@ -2850,13 +2930,20 @@ impl Render for GraphView {
                                 let key_details = details.clone();
                                 let ref_view = view.clone();
                                 let key_view = view.clone();
+                                // The checked-out branch is the one solid badge,
+                                // so it is found without reading any names.
+                                let (pill_bg, pill_ink) = if is_head_branch {
+                                    (node_color, rgitui_theme::contrast_text_on(node_color))
+                                } else {
+                                    (gpui::Hsla { a: 0.16, ..node_color }, node_color)
+                                };
                                 ref_column = ref_column.child(
                                     div().id(ElementId::NamedInteger("graph-refs".into(), i as u64))
                                         .tab_index(0)
                                         .h_flex().min_w_0().max_w_full().h(px(20.0 * compact_mul))
-                                        .px(px(5.)).gap(px(4.)).rounded(px(3.))
-                                        .bg(gpui::Hsla { a: 0.12, ..node_color })
-                                        .border_1().border_color(gpui::Hsla { a: 0.65, ..node_color })
+                                        .px(px(6.)).gap(px(4.)).rounded(px(4.))
+                                        .bg(pill_bg)
+                                        .border_1().border_color(gpui::Hsla { a: 0.7, ..node_color })
                                         .focus_visible(move |s| s.border_color(selected_border))
                                         .tooltip(Tooltip::text(tooltip_text))
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2878,14 +2965,14 @@ impl Render for GraphView {
                                                 }).ok();
                                             }
                                         })
-                                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(node_color)))
+                                        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(pill_ink)))
                                         .child(div().min_w_0().overflow_hidden().child(
-                                            Label::new(text).size(LabelSize::XSmall).color(Color::Custom(node_color))
-                                                .when(is_head_branch, |label| label.weight(gpui::FontWeight::SEMIBOLD))
+                                            Label::new(text).size(LabelSize::XSmall).color(Color::Custom(pill_ink))
+                                                .weight(if is_head_branch { gpui::FontWeight::BOLD } else { gpui::FontWeight::MEDIUM })
                                                 .truncate(),
                                         ))
                                         .when(ref_overflow > 0, |el| el.child(
-                                            div().flex_shrink_0().child(Label::new(format!("+{ref_overflow}")).size(LabelSize::XSmall).color(Color::Custom(node_color))),
+                                            div().flex_shrink_0().child(Label::new(format!("+{ref_overflow}")).size(LabelSize::XSmall).color(Color::Custom(pill_ink))),
                                         )),
                                 );
                             }
@@ -2914,17 +3001,24 @@ impl Render for GraphView {
                                             let mid_y = px(row_height / 2.0);
                                             let node_x_px = px(node_x);
 
-                                            // Ref connector is dashed so crossings cannot be read as ancestry.
+                                            // The lane band starts under the node and runs out to
+                                            // the message, beneath every line in the row.
+                                            window.paint_quad(gpui::fill(
+                                                Bounds::from_corners(
+                                                    point(origin.x + node_x_px, origin.y),
+                                                    point(origin.x + bounds.size.width, origin.y + h),
+                                                ),
+                                                band_color,
+                                            ));
+
+                                            // The ref leader is thin and translucent beside the
+                                            // 2.5px lanes, so crossing one never reads as ancestry.
                                             if has_ref_connector {
-                                                let mut connector = PathBuilder::stroke(px(1.25));
-                                                let mut x = 0.0;
-                                                while x < node_x {
-                                                    connector.move_to(point(origin.x + px(x), origin.y + mid_y));
-                                                    connector.line_to(point(origin.x + px((x + 3.0).min(node_x)), origin.y + mid_y));
-                                                    x += 5.0;
-                                                }
+                                                let mut connector = PathBuilder::stroke(px(1.0));
+                                                connector.move_to(point(origin.x, origin.y + mid_y));
+                                                connector.line_to(point(origin.x + px(node_x - node_radius), origin.y + mid_y));
                                                 if let Ok(path) = connector.build() {
-                                                    window.paint_path(path, node_color);
+                                                    window.paint_path(path, gpui::Hsla { a: 0.6, ..node_color });
                                                 }
                                             }
 
@@ -2938,7 +3032,7 @@ impl Render for GraphView {
                                                 } else {
                                                     origin.y - px(4.0)
                                                 };
-                                                let mut approach = PathBuilder::stroke(px(2.0));
+                                                let mut approach = PathBuilder::stroke(px(LANE_STROKE));
                                                 approach.move_to(point(
                                                     origin.x + node_x_px,
                                                     approach_top,
@@ -2965,7 +3059,7 @@ impl Render for GraphView {
                                                         + graph_padding_left,
                                                 );
                                                 let color =
-                                                    rgitui_theme::lane_color(edge.color_index);
+                                                    lane_color(edge.color_index);
 
                                                 let start_y = if edge.from_lane == node_lane {
                                                     origin.y + mid_y
@@ -2974,7 +3068,7 @@ impl Render for GraphView {
                                                 };
                                                 let end_y = origin.y + h + px(4.0);
 
-                                                let stroke_width = px(2.0);
+                                                let stroke_width = px(LANE_STROKE);
 
                                                 let edge_color = if edge.is_merge {
                                                     gpui::Hsla { a: 0.85, ..color }
@@ -3071,80 +3165,71 @@ impl Render for GraphView {
                                                 }
                                             }
 
-                                            // Node dot: HEAD=larger filled, merge=filled+ring, normal=filled
-                                            let dot_radius = if is_head_row {
-                                                5.5_f32 * compact_mul
-                                            } else if is_merge_commit {
-                                                5.0_f32 * compact_mul
-                                            } else {
-                                                4.0_f32 * compact_mul
-                                            };
                                             let cx_x = origin.x + node_x_px;
                                             let cy_y = origin.y + mid_y;
-                                            // Background ring to occlude lines passing behind the dot
-                                            let ring_r = dot_radius + 2.0 * compact_mul;
-                                            if let Some(built_ring) = build_filled_circle(cx_x, cy_y, ring_r) {
-                                                window.paint_path(built_ring, row_bg_for_canvas);
-                                            }
-
-                                            // HEAD commit: glow ring + filled circle
+                                            // The HEAD commit is haloed so it can be found at a glance.
                                             if is_head_row {
-                                                let glow_r = dot_radius + 4.0 * compact_mul;
-                                                if let Some(built_glow) = build_stroked_circle(cx_x, cy_y, glow_r, px(2.5)) {
-                                                    let glow_color = gpui::Hsla {
-                                                        a: 0.35,
-                                                        ..node_color
-                                                    };
-                                                    window.paint_path(built_glow, glow_color);
+                                                let glow_r = node_radius + 3.5 * compact_mul;
+                                                if let Some(glow) = build_stroked_circle(cx_x, cy_y, glow_r, px(2.0)) {
+                                                    window.paint_path(glow, gpui::Hsla { a: 0.45, ..node_color });
                                                 }
-
-                                                // Filled circle for HEAD
-                                                if let Some(built_head) = build_filled_circle(cx_x, cy_y, dot_radius) {
-                                                    window.paint_path(built_head, node_color);
+                                            }
+                                            if avatar_node {
+                                                // An opaque disc tinted and ringed with the lane; the
+                                                // photo or initials are laid over it.
+                                                if let Some(disc) = build_filled_circle(cx_x, cy_y, node_radius) {
+                                                    window.paint_path(disc, row_opaque_bg);
                                                 }
-                                            } else if is_merge_commit {
-                                                // Merge commit: filled circle with outer ring
-                                                if let Some(built_merge) = build_filled_circle(cx_x, cy_y, dot_radius) {
-                                                    window.paint_path(built_merge, node_color);
+                                                if let Some(tint) = build_filled_circle(cx_x, cy_y, node_radius) {
+                                                    window.paint_path(tint, gpui::Hsla { a: 0.3, ..node_color });
                                                 }
-
-                                                let outer_r = dot_radius + 2.5;
-                                                if let Some(built_merge) = build_stroked_circle(cx_x, cy_y, outer_r, px(1.5)) {
-                                                    let merge_ring_color = gpui::Hsla {
-                                                        a: 0.6,
-                                                        ..node_color
-                                                    };
-                                                    window.paint_path(
-                                                        built_merge,
-                                                        merge_ring_color,
-                                                    );
+                                                if let Some(ring) = build_stroked_circle(cx_x, cy_y, node_radius - 1.0, px(2.0)) {
+                                                    window.paint_path(ring, node_color);
                                                 }
                                             } else {
-                                                // Normal commit: filled circle
-                                                if let Some(built_normal) = build_filled_circle(cx_x, cy_y, dot_radius) {
-                                                    window.paint_path(built_normal, node_color);
+                                                if let Some(dot) = build_filled_circle(cx_x, cy_y, node_radius) {
+                                                    window.paint_path(dot, node_color);
+                                                }
+                                                // Among plain dots a merge needs a ring to stand apart;
+                                                // beside avatars its smaller size already does that.
+                                                if is_merge_commit && !show_avatars {
+                                                    if let Some(ring) = build_stroked_circle(cx_x, cy_y, node_radius + 2.5, px(1.5)) {
+                                                        window.paint_path(ring, gpui::Hsla { a: 0.6, ..node_color });
+                                                    }
                                                 }
                                             }
                                         },
                                     )
                                     .size_full(),
                                 )
-                                // Missing/failed photos leave the actual graph dot visible.
-                                // Photos do not set lane colors; those belong to graph topology.
-                                .when(show_avatars, |el| {
+                                // A photo when one resolves, initials until then or
+                                // when none does. Lane colors stay with the topology.
+                                .when(avatar_node, |el| {
                                     let avatar_url = cx.try_global::<AvatarCache>()
                                         .and_then(|cache| cache.avatar_url(&author_email))
                                         .map(|url| url.to_string());
-                                    el.when_some(avatar_url, |el, url| {
-                                        let avatar_size = 16.0 * compact_mul;
-                                        el.child(div().absolute()
-                                            .left(px(node_x - avatar_size / 2.0))
-                                            .top(px((row_height - avatar_size) / 2.0))
-                                            .size(px(avatar_size))
-                                            .child(img(url).rounded_full().size_full()
+                                    let initials = author_initials(&commit.author.name);
+                                    let initials_el = move || {
+                                        div().size_full().flex().items_center().justify_center()
+                                            .text_size(px(node_radius * 0.9))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(avatar_ink)
+                                            .child(initials.clone())
+                                            .into_any_element()
+                                    };
+                                    el.child(div().absolute()
+                                        .left(px(node_x - node_radius))
+                                        .top(px(row_height / 2.0 - node_radius))
+                                        .size(px(2.0 * node_radius))
+                                        // Inset inside the lane ring.
+                                        .p(px(2.))
+                                        .child(match avatar_url {
+                                            Some(url) => img(url).rounded_full().size_full()
                                                 .object_fit(ObjectFit::Cover)
-                                                .with_fallback(|| div().into_any_element())))
-                                    })
+                                                .with_fallback(initials_el)
+                                                .into_any_element(),
+                                            None => initials_el(),
+                                        }))
                                 }),
                         );
                         }
@@ -3156,7 +3241,17 @@ impl Render for GraphView {
                         let grip_tooltip = Tooltip::text(t!("graph.drag_to_rebase"));
                         let entity_for_grip = view.clone();
                         let oid_for_grip = oid;
+                        // The grip fades with its opacity, so the lane band that
+                        // carries on to the message is painted by a wrapper.
                         row = row.child(
+                            div()
+                                .w(px(16.))
+                                .h_full()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .when(show_graph_lanes, |el| el.bg(band_color))
+                                .child(
                             div()
                                 .id(ElementId::NamedInteger("rebase-grip".into(), i as u64))
                                 .w(px(16.))
@@ -3177,6 +3272,7 @@ impl Render for GraphView {
                                             })
                                             .ok();
                                     },
+                                ),
                                 ),
                         );
 
@@ -3216,6 +3312,17 @@ impl Render for GraphView {
                             if commit.is_signed {
                                 message_col = message_col.child(
                                     div().flex_shrink_0().child(Badge::new(t!("graph.signed")).color(Color::Success).compact()),
+                                );
+                            }
+                            // Zero basis: the body only fills what the subject leaves.
+                            if let Some(body) = commit_body_preview(&commit.message) {
+                                message_col = message_col.child(
+                                    div().flex_1().min_w_0().ml(px(4.)).overflow_hidden().child(
+                                        Label::new(SharedString::from(body.to_owned()))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Placeholder)
+                                            .truncate(),
+                                    ),
                                 );
                             }
 
@@ -4224,6 +4331,9 @@ struct WorkingTreeRowParams {
     compact_mul: f32,
     has_context_menu: bool,
     graph_style: GraphStyle,
+    appearance: rgitui_theme::Appearance,
+    /// Commits are drawn as avatars, so the pending node grows to match.
+    avatar_nodes: bool,
     /// Lane occupied by the pending-changes pseudo-node.
     node_lane: usize,
     /// Lane occupied by the visible HEAD commit this pseudo-node descends from.
@@ -4275,6 +4385,8 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         compact_mul,
         has_context_menu,
         graph_style,
+        appearance,
+        avatar_nodes,
         node_lane,
         parent_lane,
     } = params;
@@ -4506,13 +4618,16 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                     let lane_x = px(edge.from_lane as f32 * lane_width
                                         + lane_width / 2.0
                                         + graph_padding_left);
-                                    let mut pass = PathBuilder::stroke(px(2.0));
+                                    let mut pass = PathBuilder::stroke(px(LANE_STROKE));
                                     pass.move_to(point(origin.x + lane_x, origin.y - px(4.0)));
                                     pass.line_to(point(origin.x + lane_x, origin.y + h + px(4.0)));
                                     if let Ok(built) = pass.build() {
                                         window.paint_path(
                                             built,
-                                            rgitui_theme::lane_color(edge.color_index),
+                                            rgitui_theme::lane_color_for(
+                                                edge.color_index,
+                                                appearance,
+                                            ),
                                         );
                                     }
                                 }
@@ -4526,7 +4641,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                             + lane_width / 2.0
                                             + graph_padding_left);
                                     let end_y = origin.y + h + px(4.0);
-                                    let mut path = PathBuilder::stroke(px(2.0));
+                                    let mut path = PathBuilder::stroke(px(LANE_STROKE));
 
                                     if parent_x == cx_x {
                                         path.move_to(point(cx_x, cy_y));
@@ -4575,7 +4690,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                 }
 
                                 // Background ring to occlude lines behind the dot
-                                let ring_r = 7.0_f32 * compact_mul;
+                                let ring_r = if avatar_nodes { 9.0_f32 } else { 7.0 } * compact_mul;
                                 let steps = 32_usize;
                                 let mut ring = PathBuilder::fill();
                                 for s in 0..steps {
@@ -4594,7 +4709,9 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                 }
 
                                 // Hollow circle (stroke only, no fill) to distinguish from commits
-                                let dot_radius = 5.0_f32 * compact_mul;
+                                // Hollow, and as large as the avatars it sits among.
+                                let dot_radius =
+                                    if avatar_nodes { 7.0_f32 } else { 5.0 } * compact_mul;
                                 let mut circle = PathBuilder::stroke(px(2.0));
                                 for s in 0..=steps {
                                     let angle = (s as f32) * std::f32::consts::TAU / (steps as f32);
@@ -4832,6 +4949,44 @@ mod tests {
                 20.0
             );
         }
+    }
+
+    #[test]
+    fn initials_take_the_first_letter_of_up_to_two_names() {
+        assert_eq!(author_initials("Noah Clarkson"), "NC");
+        assert_eq!(author_initials("farefray"), "F");
+        assert_eq!(author_initials("  ada   king lovelace "), "AK");
+        assert_eq!(author_initials("(bot) renovate"), "BR");
+        assert_eq!(author_initials("élodie"), "É");
+        assert_eq!(author_initials(""), "?");
+        assert_eq!(author_initials("--- ***"), "?");
+    }
+
+    #[test]
+    fn body_preview_is_the_first_body_line_that_is_not_a_trailer() {
+        assert_eq!(commit_body_preview("Subject only"), None);
+        assert_eq!(commit_body_preview("Subject only\n"), None);
+        assert_eq!(
+            commit_body_preview("Subject\n\n  Why it changed.\nMore."),
+            Some("Why it changed.")
+        );
+        // A wrapped subject paragraph is not mistaken for the body.
+        assert_eq!(
+            commit_body_preview("Subject that\nwraps\n\n\nBody"),
+            Some("Body")
+        );
+        assert_eq!(
+            commit_body_preview("Subject\n\nCo-Authored-By: A <a@x>\nSigned-off-by: B <b@x>"),
+            None
+        );
+        assert_eq!(
+            commit_body_preview("Subject\n\nCo-Authored-By: A <a@x>\n\nFixes: the crash"),
+            Some("Fixes: the crash")
+        );
+        assert_eq!(
+            commit_body_preview("Subject\r\n\r\n- Abilities own state\r\n"),
+            Some("- Abilities own state")
+        );
     }
 
     #[test]

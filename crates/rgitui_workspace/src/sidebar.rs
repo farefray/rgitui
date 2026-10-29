@@ -144,6 +144,29 @@ enum SidebarItem {
     UnstagedDir(String), // collapsed_dirs key for an unstaged directory row
 }
 
+/// Group a sidebar row joins so its action buttons appear while it is hovered.
+const ROW_ACTIONS_GROUP: &str = "sidebar-row-actions";
+
+/// Lays a row's action buttons over its right end, shown only while the row is
+/// hovered or keyboard-focused. Names keep the full width the rest of the time,
+/// instead of every row repeating the same strip of icons. The row must be
+/// `relative()` and in [`ROW_ACTIONS_GROUP`]; `backdrop` is its opaque hover fill.
+fn row_actions_overlay(actions: gpui::Div, backdrop: gpui::Hsla, revealed: bool) -> gpui::Div {
+    actions
+        .absolute()
+        .right(px(4.))
+        .top_0()
+        .bottom_0()
+        .h_flex()
+        .gap(px(2.))
+        .pl(px(6.))
+        .bg(backdrop)
+        .when(!revealed, |el| {
+            el.invisible()
+                .group_hover(ROW_ACTIONS_GROUP, |style| style.visible())
+        })
+}
+
 /// `is_current` identifies the checkout the project was opened on, not the
 /// checkout currently being inspected. Only one row should claim "viewing".
 fn viewed_worktree(selected: Option<usize>, index: usize, is_current: bool) -> bool {
@@ -2226,6 +2249,8 @@ impl Render for Sidebar {
         // Track flat navigation index for keyboard highlighting
         let mut nav_idx: usize = 0;
         let kb_accent = colors.border_focused;
+        let row_backdrop =
+            rgitui_theme::composite(colors.ghost_element_hover, colors.panel_background);
 
         if !self.show_change_sections {
             let working_nav_index = nav_idx;
@@ -2413,6 +2438,8 @@ impl Render for Sidebar {
 
                         let mut item = div()
                             .id(ElementId::NamedInteger("local-branch".into(), i as u64))
+                            .relative()
+                            .group(ROW_ACTIONS_GROUP)
                             .h_flex()
                             .w_full()
                             .h(px(item_h))
@@ -2571,9 +2598,6 @@ impl Render for Sidebar {
                             let w_cp = w.clone();
                             let bn_cp = name.clone();
                             let mut actions = div()
-                                .flex_shrink_0()
-                                .h_flex()
-                                .gap(px(2.))
                                 .child(
                                     IconButton::new(
                                         ElementId::NamedInteger("copy-branch-name".into(), i as u64),
@@ -2656,7 +2680,7 @@ impl Render for Sidebar {
                                         }),
                                     );
                             }
-                            item = item.child(actions);
+                            item = item.child(row_actions_overlay(actions, row_backdrop, kb_active));
                         }
 
                         item
@@ -3245,6 +3269,8 @@ impl Render for Sidebar {
 
                                 let mut item = div()
                                     .id(ElementId::NamedInteger("tag-item".into(), i as u64))
+                                    .relative()
+                                    .group(ROW_ACTIONS_GROUP)
                                     .h_flex()
                                     .w_full()
                                     .h(px(item_h))
@@ -3296,7 +3322,7 @@ impl Render for Sidebar {
                                 // Checkout button
                                 let w_chk = w.clone();
                                 let tc = tag_checkout.clone();
-                                item = item.child(
+                                let actions = div().child(
                                     IconButton::new(
                                         ElementId::NamedInteger("checkout-tag".into(), i as u64),
                                         IconName::ArrowDown,
@@ -3319,7 +3345,7 @@ impl Render for Sidebar {
                                 // Delete button
                                 let w_del = w.clone();
                                 let td = tag_delete.clone();
-                                item.child(
+                                let actions = actions.child(
                                     IconButton::new(
                                         ElementId::NamedInteger("delete-tag".into(), i as u64),
                                         IconName::Trash,
@@ -3337,7 +3363,8 @@ impl Render for Sidebar {
                                                 });
                                         },
                                     ),
-                                )
+                                );
+                                item.child(row_actions_overlay(actions, row_backdrop, kb_active))
                             })
                             .collect()
                     },
@@ -3467,6 +3494,8 @@ impl Render for Sidebar {
 
                                     let mut item = div()
                                         .id(ElementId::NamedInteger("stash-item".into(), i as u64))
+                                        .relative()
+                                        .group(ROW_ACTIONS_GROUP)
                                         .h_flex()
                                         .w_full()
                                         .h(px(item_h))
@@ -3523,9 +3552,7 @@ impl Render for Sidebar {
                                         .child(Label::new(msg).size(LabelSize::XSmall).truncate())
                                         .child(div().flex_1())
                                         .child(
-                                            div()
-                                                .h_flex()
-                                                .gap(px(2.))
+                                            row_actions_overlay(div()
                                                 .child({
                                                     let w_apply = w.clone();
                                                     IconButton::new(
@@ -3620,7 +3647,7 @@ impl Render for Sidebar {
                                                     });
                                                 },
                                             )
-                                                }),
+                                                }), row_backdrop, kb_active),
                                         );
 
                                     item
@@ -3778,6 +3805,8 @@ impl Render for Sidebar {
                                         "worktree-item".into(),
                                         i as u64,
                                     ))
+                                    .relative()
+                                    .group(ROW_ACTIONS_GROUP)
                                     .cursor_pointer()
                                     .tooltip(Tooltip::text(tooltip))
                                     .h_flex()
@@ -3852,7 +3881,7 @@ impl Render for Sidebar {
                                         )
                                     })
                                     .when(!worktree.is_current, |el| {
-                                        el.child(
+                                        el.child(row_actions_overlay(div().child(
                                             IconButton::new(
                                                 ElementId::NamedInteger(
                                                     "remove-worktree".into(),
@@ -3871,7 +3900,7 @@ impl Render for Sidebar {
                                                     ));
                                                 });
                                             }),
-                                        )
+                                        ), row_backdrop, kb_active))
                                     })
                             })
                             .collect()

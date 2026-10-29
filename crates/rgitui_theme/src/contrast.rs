@@ -14,6 +14,30 @@ fn luminance(color: Hsla) -> f32 {
     0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
 }
 
+/// Source-over in sRGB, matching the renderer: `front` painted on `back`.
+/// Use it to flatten a translucent fill before measuring or occluding with it.
+pub fn composite(front: Hsla, back: Hsla) -> Hsla {
+    if front.a == 1.0 {
+        return front;
+    }
+    if front.a == 0.0 {
+        return back;
+    }
+    let f = Rgba::from(front);
+    let b = Rgba::from(back);
+    let a = f.a + b.a * (1.0 - f.a);
+    if a == 0.0 {
+        return Hsla::transparent_black();
+    }
+    Rgba {
+        r: (f.r * f.a + b.r * b.a * (1.0 - f.a)) / a,
+        g: (f.g * f.a + b.g * b.a * (1.0 - f.a)) / a,
+        b: (f.b * f.a + b.b * b.a * (1.0 - f.a)) / a,
+        a,
+    }
+    .into()
+}
+
 /// WCAG contrast ratio (1–21) between opaque/composited sRGB colors.
 /// Alpha is deliberately not interpreted without a known backing surface.
 pub fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
