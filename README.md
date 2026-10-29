@@ -158,6 +158,34 @@ Open a specific repository:
 rgitui /path/to/repo
 ```
 
+### Windows: launch the latest local build
+
+Double-click `rgitui.cmd`, or run `rgitui.cmd "C:\path\to\repo"`.
+The launcher picks the most recently modified `target/debug/rgitui.exe` or
+`target/release/rgitui.exe` on every launch. It does not download or build anything;
+run `cargo build --package rgitui` (optionally `--release`) to update it.
+Without a repository argument, normal saved-workspace restoration applies.
+
+Create **rgitui (latest)** shortcuts on your Desktop and in the Start Menu:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-shortcuts.ps1
+```
+
+Re-run that command if you move the checkout. Shortcuts use the app icon and do
+not leave a terminal window open. These helpers use this checkout's default
+`target` directory, not a custom `CARGO_TARGET_DIR` or cross-compilation directory.
+
+To remove the old named preview bundles/copies (without touching current builds,
+demo repos, screenshots, or settings), preview the cleanup first:
+
+```powershell
+./scripts/clean-windows-builds.ps1
+./scripts/clean-windows-builds.ps1 -Apply
+# Also clear regenerable incremental compilation caches (next build is slower):
+./scripts/clean-windows-builds.ps1 -Incremental -Apply
+```
+
 ### NixOS on WSL (WSLg)
 
 Use a WSLg-enabled session with working host GPU drivers and the NixOS graphics
