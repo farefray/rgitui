@@ -105,7 +105,7 @@ impl Render for AppRoot {
         // Each branch returns a different concrete type due to GPUI's builder pattern.
         // Type-erase with into_any_element() to avoid a massive enum that overflows
         // the stack frame.
-        if let Some(splash) = &self.splash {
+        let content = if let Some(splash) = &self.splash {
             if !self.focus.is_focused(window) {
                 self.focus.focus(window, cx);
             }
@@ -137,7 +137,8 @@ impl Render for AppRoot {
                 .into_any_element()
         } else {
             div().id("app-root-empty").size_full().into_any_element()
-        }
+        };
+        rgitui_ui::client_window_frame(window, cx, content)
     }
 }
 

@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{div, px, App, ClickEvent, Decorations, SharedString, Window};
+use gpui::{div, px, App, ClickEvent, Decorations, MouseButton, SharedString, Window};
 use rgitui_i18n::t;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
@@ -195,11 +195,13 @@ impl RenderOnce for TitleBar {
             .gap(px(8.))
             .items_center();
 
-        // On Linux with server decorations, the WM owns the window controls so we
-        // don't render them here. On client decorations we render them.
-        let use_window_controls = matches!(window.window_decorations(), Decorations::Client { .. });
+        // Native/server decorations own their chrome. Fullscreen keeps the repo
+        // information, but has neither custom controls nor a move/zoom region.
+        let use_custom_chrome = cfg!(any(target_os = "linux", target_os = "freebsd"))
+            && matches!(window.window_decorations(), Decorations::Client { .. })
+            && !window.is_fullscreen();
 
-        if use_window_controls {
+        if use_custom_chrome {
             // Window controls on the left (Linux CSD convention)
             bar = bar.child(
                 div()
@@ -293,7 +295,30 @@ impl RenderOnce for TitleBar {
             );
         }
 
-        bar = bar.child(div().flex_1());
+        // Only this blank sibling is draggable: branch and window-control events
+        // must never bubble into a move handler on the whole title bar.
+        bar = bar.child(div().id("title-bar-drag-area").flex_1().h_full().when(
+            use_custom_chrome,
+            |spacer| {
+                spacer
+                    // Keep a usable target when a maximized window is restored to
+                    // the small startup bounds, even with long repo/branch names.
+                    .min_w(px(32.))
+                    .on_mouse_down(MouseButton::Left, |event, window, cx| {
+                        if window.is_fullscreen() {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        if event.click_count == 2 {
+                            window.zoom_window();
+                        } else {
+                            // Start synchronously on mouse-down so Wayland can use the
+                            // real pointer-button serial for the compositor move grab.
+                            window.start_window_move();
+                        }
+                    })
+            },
+        ));
 
         bar.child(
             div()

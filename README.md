@@ -158,6 +158,44 @@ Open a specific repository:
 rgitui /path/to/repo
 ```
 
+### NixOS on WSL (WSLg)
+
+Use a WSLg-enabled session with working host GPU drivers and the NixOS graphics
+libraries already available at `/run/opengl-driver/lib`. From the checkout:
+
+```bash
+nix-shell
+cargo build --release --locked -p rgitui
+bash scripts/run-wsl.sh /path/to/repo
+```
+
+Run the launcher **inside the project's `nix-shell`** for its runtime libraries;
+it does not enter Nix automatically or install dependencies. From another working
+directory in that shell, use `bash /path/to/rgitui/scripts/run-wsl.sh [repo]`.
+The binary is always the checkout's `target/release/rgitui`; arguments and the
+caller's working directory are preserved.
+
+The launcher retains `WAYLAND_DISPLAY` (Wayland preferred), sets `DISPLAY=:0`
+and `GALLIUM_DRIVER=d3d12`, clears `LIBGL_ALWAYS_INDIRECT`,
+`LIBGL_ALWAYS_SOFTWARE`, `VK_DRIVER_FILES`, and `VK_ICD_FILENAMES`, and prepends
+`/run/opengl-driver/lib` to the existing `LD_LIBRARY_PATH`. These changes apply
+only to the launched process, not global configuration. It does not force Vulkan
+or verify hardware acceleration; a successful launch alone does not rule out
+software rendering. If graphics initialization fails, check the WSLg/host driver
+and NixOS graphics setup rather than treating software fallback as success.
+
+When the compositor does not supply window decorations, the main window has a
+thin resize border: drag an edge or corner to resize, drag the blank title-bar
+space to move, and double-click that space to maximize/restore. Resize handles
+are hidden on maximized/fullscreen windows and on tiled edges. Branch and
+window-control buttons remain independent of the drag area. Native Windows and
+server-decorated Linux windows keep their existing window management.
+
+Window snapping and Windows snap layouts are compositor-controlled; WSLg may
+behave differently from the native Windows app. This launches the **Linux** app,
+using Linux-native configuration (`$XDG_CONFIG_HOME/rgitui/settings.json`, or
+`~/.config/rgitui/settings.json` by default), not the native Windows app's config.
+
 ## Keyboard shortcuts
 
 ### Global
