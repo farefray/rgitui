@@ -4,6 +4,81 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, PathBuf};
 
+use rgitui_git::FileChangeKind;
+
+/// Sections with more files than this open with their top-level folders
+/// collapsed, so the folder summaries fit on screen before any scrolling.
+pub(super) const AUTO_COLLAPSE_FILE_COUNT: usize = 24;
+
+/// What a folder's descendants changed, summarized the way a collapsed folder
+/// shows it: edits, additions, removals and conflicts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ChangeTally {
+    /// Modified, renamed, copied and type-changed files.
+    pub modified: usize,
+    /// Added and untracked files.
+    pub added: usize,
+    pub deleted: usize,
+    pub conflicted: usize,
+}
+
+impl ChangeTally {
+    fn add(&mut self, kind: FileChangeKind) {
+        match kind {
+            FileChangeKind::Modified
+            | FileChangeKind::Renamed
+            | FileChangeKind::Copied
+            | FileChangeKind::TypeChange => self.modified += 1,
+            FileChangeKind::Added | FileChangeKind::Untracked => self.added += 1,
+            FileChangeKind::Deleted => self.deleted += 1,
+            FileChangeKind::Conflicted => self.conflicted += 1,
+        }
+    }
+}
+
+/// One tally per row of `rows` (from [`build_tree`] over the same files),
+/// counting every file below a directory whether or not it is collapsed.
+/// File rows get an empty tally. `kinds` is indexed like the tree's input paths.
+pub(super) fn directory_tallies(rows: &[TreeRow], kinds: &[FileChangeKind]) -> Vec<ChangeTally> {
+    let mut tallies = vec![ChangeTally::default(); rows.len()];
+    // Rows are depth-first, so the open directories are a stack.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        while open.last().is_some_and(|&(_, depth)| depth >= row.depth()) {
+            open.pop();
+        }
+        match row {
+            TreeRow::Directory { depth, .. } => open.push((row_index, *depth)),
+            TreeRow::File { index, .. } => {
+                if let Some(&kind) = kinds.get(*index) {
+                    for &(directory, _) in &open {
+                        tallies[directory].add(kind);
+                    }
+                }
+            }
+        }
+    }
+    tallies
+}
+
+/// The folders a section opens with collapsed: its top-level folders once it
+/// has more than [`AUTO_COLLAPSE_FILE_COUNT`] files, otherwise none.
+pub(super) fn default_collapsed(rows: &[TreeRow]) -> HashSet<String> {
+    let files = rows
+        .iter()
+        .filter(|row| matches!(row, TreeRow::File { .. }))
+        .count();
+    if files <= AUTO_COLLAPSE_FILE_COUNT {
+        return HashSet::new();
+    }
+    rows.iter()
+        .filter_map(|row| match row {
+            TreeRow::Directory { path, depth: 0, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TreeRow {
     Directory {
@@ -356,6 +431,82 @@ mod tests {
         assert_eq!(reconcile_collapsed(&split, &nested), nested);
         assert_eq!(reconcile_collapsed(&compacted, &nested), reconciled);
         assert!(reconcile_collapsed(&tree(&["other/a.rs"]), &nested).is_empty());
+    }
+
+    #[test]
+    fn tallies_count_every_descendant_by_kind_even_when_collapsed() {
+        use FileChangeKind::*;
+        // Indices: 0 src/z.rs, 1 README.md, 2 src/nested/b.rs, 3 docs/guide.md,
+        // 4 src/a.rs, 5 src/nested/a.rs, 6 Cargo.toml.
+        let rows = nested_tree();
+        let kinds = [
+            Modified, Untracked, Deleted, Added, Renamed, Conflicted, Modified,
+        ];
+        let tallies = directory_tallies(&rows, &kinds);
+        assert_eq!(tallies.len(), rows.len());
+        let tally = |modified, added, deleted, conflicted| ChangeTally {
+            modified,
+            added,
+            deleted,
+            conflicted,
+        };
+        // docs
+        assert_eq!(tallies[0], tally(0, 1, 0, 0));
+        // src: z.rs, nested/b.rs, a.rs, nested/a.rs
+        assert_eq!(tallies[2], tally(2, 0, 1, 1));
+        // src/nested
+        assert_eq!(tallies[3], tally(0, 0, 1, 1));
+        // File rows carry nothing; root files belong to no directory.
+        assert_eq!(tallies[1], ChangeTally::default());
+        assert_eq!(tallies[9], ChangeTally::default());
+    }
+
+    #[test]
+    fn tallies_follow_compacted_directory_chains() {
+        use FileChangeKind::*;
+        let rows = tree(&[
+            "crates/foo/src/lib.rs",
+            "crates/foo/src/deep/module/file.rs",
+            "crates/bar/src/lib.rs",
+        ]);
+        let tallies = directory_tallies(&rows, &[Modified, Added, Deleted]);
+        assert_eq!(
+            tallies[0].modified + tallies[0].added + tallies[0].deleted,
+            3
+        );
+        // crates/bar/src holds only the deleted file.
+        assert_eq!(tallies[1].deleted, 1);
+        assert_eq!(tallies[1].modified + tallies[1].added, 0);
+        // crates/foo/src holds the other two.
+        assert_eq!((tallies[3].modified, tallies[3].added), (1, 1));
+    }
+
+    #[test]
+    fn large_sections_open_with_top_level_folders_collapsed() {
+        let small = nested_tree();
+        assert!(default_collapsed(&small).is_empty());
+
+        let paths: Vec<String> = (0..=AUTO_COLLAPSE_FILE_COUNT)
+            .map(|i| match i % 3 {
+                0 => format!("src/nested/f{i}.rs"),
+                1 => format!("docs/f{i}.md"),
+                _ => format!("root{i}.txt"),
+            })
+            .collect();
+        let rows = build_tree(&paths.iter().map(PathBuf::from).collect::<Vec<_>>());
+        let collapsed = default_collapsed(&rows);
+        assert_eq!(
+            collapsed,
+            HashSet::from(["docs".to_string(), "src/nested".to_string()])
+        );
+        // Root files stay visible beside the collapsed folders.
+        let visible = visible_rows(&rows, &collapsed, None);
+        assert!(visible
+            .iter()
+            .any(|&row| matches!(rows[row], TreeRow::File { depth: 0, .. })));
+        assert!(!visible
+            .iter()
+            .any(|&row| matches!(rows[row], TreeRow::File { depth: 1, .. })));
     }
 
     #[test]

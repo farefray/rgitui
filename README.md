@@ -74,7 +74,7 @@
 ### UI
 
 - **Graph-focused layout** — full-height Graph and reusable file views; return to Graph without losing your place
-- **Classic split layout** remains available through the visible Split view / Graph focus control
+- **Classic split layout** remains available through the Split view icon at the end of the toolbar (Graph focus returns from the classic panel header)
 - Drag-resizable sidebar, detail panel, split-layout diff viewer, and commit panel
 - Command palette (`Ctrl+P`) with context-aware commands
 - Toolbar with one-click fetch, pull, push, branch, stash, create PR, and more

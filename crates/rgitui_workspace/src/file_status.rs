@@ -3,7 +3,7 @@ use gpui::{div, App, SharedString, Window};
 use rgitui_git::FileChangeKind;
 use rgitui_i18n::t;
 use rgitui_theme::Color;
-use rgitui_ui::{Badge, Tooltip};
+use rgitui_ui::{Badge, Label, LabelSize, Tooltip};
 
 pub(crate) fn file_change_color(kind: FileChangeKind) -> Color {
     match kind {
@@ -31,24 +31,41 @@ fn file_change_label(kind: FileChangeKind) -> SharedString {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BadgeStyle {
+    /// The translated status name in a pill.
+    Word,
+    /// Git's status code in a pill.
+    Code,
+    /// Git's status code alone, in a fixed-width column.
+    Letter,
+}
+
 /// A textual status cue, not just a color. Narrow sidebar rows use Git's
 /// familiar status code and expose the same translated label on hover.
 #[derive(IntoElement)]
 pub(crate) struct FileStatusBadge {
     kind: FileChangeKind,
-    compact: bool,
+    style: BadgeStyle,
 }
 
 impl FileStatusBadge {
     pub(crate) fn new(kind: FileChangeKind) -> Self {
         Self {
             kind,
-            compact: false,
+            style: BadgeStyle::Word,
         }
     }
 
     pub(crate) fn compact(mut self) -> Self {
-        self.compact = true;
+        self.style = BadgeStyle::Code;
+        self
+    }
+
+    /// Just the colored status letter, for long lists whose rows already lead
+    /// with a status icon: a column of pills would outweigh the file names.
+    pub(crate) fn letter(mut self) -> Self {
+        self.style = BadgeStyle::Letter;
         self
     }
 }
@@ -56,20 +73,23 @@ impl FileStatusBadge {
 impl RenderOnce for FileStatusBadge {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let label = file_change_label(self.kind);
-        let text = if self.compact {
-            self.kind.short_code().into()
-        } else {
-            label.clone()
-        };
-        div()
+        let color = file_change_color(self.kind);
+        let badge = div()
             .id("file-status")
             .flex_shrink_0()
-            .tooltip(Tooltip::text(label))
-            .child(
-                Badge::new(text)
-                    .color(file_change_color(self.kind))
-                    .compact(),
-            )
+            .tooltip(Tooltip::text(label.clone()));
+        match self.style {
+            BadgeStyle::Word => badge.child(Badge::new(label).color(color).compact()),
+            BadgeStyle::Code => {
+                badge.child(Badge::new(self.kind.short_code()).color(color).compact())
+            }
+            BadgeStyle::Letter => badge.w(gpui::px(14.)).flex().justify_center().child(
+                Label::new(self.kind.short_code())
+                    .size(LabelSize::XSmall)
+                    .weight(gpui::FontWeight::BOLD)
+                    .color(color),
+            ),
+        }
     }
 }
 

@@ -53,6 +53,7 @@ pub enum IconName {
     File,
     Tag,
     Stash,
+    StashPop,
     Terminal,
 
     // AI
@@ -70,6 +71,7 @@ pub enum IconName {
     Dot,
     DotOutline,
     Menu,
+    SplitView,
 
     // Window controls
     Maximize,
@@ -123,6 +125,7 @@ impl IconName {
             IconName::File => "icons/file.svg",
             IconName::Tag => "icons/tag.svg",
             IconName::Stash => "icons/archive.svg",
+            IconName::StashPop => "icons/archive-restore.svg",
             IconName::Terminal => "icons/terminal.svg",
             IconName::Sparkle => "icons/sparkle.svg",
             IconName::Info => "icons/info.svg",
@@ -134,6 +137,7 @@ impl IconName {
             IconName::Dot => "icons/dot.svg",
             IconName::DotOutline => "icons/dot-outline.svg",
             IconName::Menu => "icons/menu.svg",
+            IconName::SplitView => "icons/split-view.svg",
             IconName::MoreHorizontal => "icons/more-horizontal.svg",
             IconName::Maximize => "icons/maximize.svg",
             IconName::Minimize => "icons/minimize.svg",

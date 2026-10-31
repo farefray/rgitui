@@ -40,6 +40,8 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     text_layout: TextLayout,
     multiline: bool,
+    /// Grow to the height a flex column parent leaves, instead of hugging content.
+    fill_height: bool,
     masked: bool,
     font_size: Option<Pixels>,
     compact: bool,
@@ -61,6 +63,7 @@ impl TextInput {
             focus_handle: cx.focus_handle(),
             text_layout: TextLayout::default(),
             multiline: false,
+            fill_height: false,
             masked: false,
             font_size: None,
             compact: false,
@@ -72,6 +75,13 @@ impl TextInput {
 
     pub fn multiline(mut self) -> Self {
         self.multiline = true;
+        self
+    }
+
+    /// Fill the remaining height of a flex column parent; the minimum height
+    /// still applies when there is little room.
+    pub fn fill_height(mut self) -> Self {
+        self.fill_height = true;
         self
     }
 
@@ -701,6 +711,7 @@ impl Render for TextInput {
             .text_size(font_size_px)
             .line_height(target_line_height)
             .when(self.multiline, |el| el.flex().flex_col())
+            .when(self.fill_height, |el| el.flex_1())
             .overflow_hidden();
 
         if self.multiline {

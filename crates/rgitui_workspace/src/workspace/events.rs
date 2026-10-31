@@ -3461,6 +3461,9 @@ pub(super) fn subscribe_toolbar(
                 return;
             }
             match event {
+                ToolbarEvent::Undo => {
+                    this.execute_undo(cx);
+                }
                 ToolbarEvent::Fetch => {
                     let worktree_path = this.effective_worktree_path(cx);
                     _project.update(cx, |proj, cx| {

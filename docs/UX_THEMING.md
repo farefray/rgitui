@@ -117,3 +117,40 @@ ink against composited row/selection/word backgrounds. The underlying syntax
 palettes are still syntect's light/dark palettes, not a VS Code theme import.
 Full keyboard-navigation audits, cross-platform screenshots, and comprehensive
 large-font/custom-theme acceptance remain follow-up work.
+
+## Second pass: GitKraken-style chrome and working changes
+
+Compared side by side with GitKraken on a real repository, rgitui spent three
+rows on chrome, mixed bordered and borderless toolbar buttons, and made the
+working-changes list read as a wall of `Modified` pills with a `+` on every row.
+
+- **One chrome row fewer.** With native window decorations there is no in-app
+  title bar: the repository tabs come first, ending in the command palette and
+  help hints. Linux client-side decorations keep a slim title bar for window
+  controls and moving the window.
+- **Toolbar.** A `Repository › Branch` breadcrumb starts the row (repository
+  opens the switcher; branch reveals it in the sidebar, or HEAD when detached;
+  worktree inspection and repository state live here too). Actions are uniform,
+  borderless icon-over-label buttons centered in the remaining space: Undo,
+  Fetch, Pull, Push, Branch, Stash, Pop, Create PR and Terminal. Pull/Push carry
+  their behind/ahead counts on the icon. Undo names what it would reverse and is
+  disabled when the workspace's undo history is empty or expired.
+- **Center tabs only when useful.** In the focused layout the Graph/file strip
+  appears once a file or tool view is open; the Split view switch is an icon at
+  the end of the toolbar.
+- **Working changes.** Rows end in a one-letter status column (`M`, `A`, `D`,
+  `?`…, with the full name on hover) after the colored status icon; stage,
+  unstage and discard appear on hover or on the selected row. Folder rows
+  summarize their descendants by kind (edits, additions, removals, conflicts),
+  and a section with more than 24 files opens with its top-level folders
+  collapsed. Folder expansion is remembered per checkout across visits to
+  commits. Stage All is the section's tinted primary action; one Expand/Collapse
+  All toggle sits beside Path/Tree. Commit file lists use the same status letter.
+- **Commit composer.** The description grows into the panel's spare height, and
+  the button says what is missing or what will happen: *Stage Changes to
+  Commit*, *Enter a Summary to Commit*, *Commit 3 Files*.
+
+Pure helpers (`directory_tallies`, `default_collapsed`, `UndoStack::peek_label`,
+toolbar count rules) are unit-tested; layout was checked in isolated debug-harness
+screenshots on Windows. Hover states, Linux client-side decorations and light
+themes still need an interactive look.

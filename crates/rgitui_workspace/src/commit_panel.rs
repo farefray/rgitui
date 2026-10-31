@@ -238,7 +238,7 @@ impl CheckoutDraft {
             ti
         });
         let description_editor = cx.new(|cx| {
-            let mut ti = TextInput::new(cx).multiline();
+            let mut ti = TextInput::new(cx).multiline().fill_height();
             ti.set_placeholder_message(key!("commit.description.placeholder"));
             ti
         });
@@ -563,6 +563,8 @@ impl CommitPanel {
         self.focus_handle.contains_focused(window, cx)
     }
 
+    /// The button says what happens next, or what is missing before it can:
+    /// a disabled button is the only place that hint needs to live.
     fn commit_button_label(&self, summary_empty: bool) -> SharedString {
         if self.staged_count == 0 {
             t!("commit.no_staged")
@@ -571,7 +573,7 @@ impl CommitPanel {
         } else if self.amend {
             t!("commit.amend_commit")
         } else {
-            t!("commit.commit")
+            tp!("commit.commit_files", self.staged_count)
         }
     }
 
@@ -1048,12 +1050,14 @@ impl Render for CommitPanel {
                                     )
                                     .child(self.summary_editor.clone()),
                             )
+                            // The description takes whatever height the panel
+                            // has left, rather than leaving it empty below.
                             .child(
                                 div()
                                     .v_flex()
                                     .gap(px(4.))
-                                    .flex_shrink_0()
-                                    .min_h(px(50.))
+                                    .flex_1()
+                                    .min_h(px(96.))
                                     .child(
                                         div()
                                             .h_flex()
@@ -1314,34 +1318,18 @@ impl Render for CommitPanel {
                                             ),
                                     )
                                     .child(
-                                        div()
-                                            .h_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .justify_end()
-                                            .when(self.staged_count == 0, |el| {
+                                        div().h_flex().flex_1().min_w_0().justify_end().when_some(
+                                            crate::keymap::shortcut(crate::CommandId::Commit, cx)
+                                                .filter(|_| can_commit),
+                                            |el, keystrokes| {
                                                 el.child(
-                                                    Label::new(t!("commit.no_staged_hint"))
+                                                    Label::new(SharedString::from(keystrokes))
                                                         .size(LabelSize::XSmall)
-                                                        .color(Color::Warning)
+                                                        .color(Color::Muted)
                                                         .truncate(),
                                                 )
-                                            })
-                                            .when_some(
-                                                crate::keymap::shortcut(
-                                                    crate::CommandId::Commit,
-                                                    cx,
-                                                )
-                                                .filter(|_| can_commit),
-                                                |el, keystrokes| {
-                                                    el.child(
-                                                        Label::new(SharedString::from(keystrokes))
-                                                            .size(LabelSize::XSmall)
-                                                            .color(Color::Muted)
-                                                            .truncate(),
-                                                    )
-                                                },
-                                            ),
+                                            },
+                                        ),
                                     ),
                             )
                             .child(

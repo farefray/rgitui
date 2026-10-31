@@ -125,6 +125,15 @@ impl UndoStack {
         self.entries.pop()
     }
 
+    /// What the next [`Self::pop`] would undo, if anything has not expired.
+    pub fn peek_label(&self) -> Option<&Message> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| !e.is_expired())
+            .map(|e| &e.label)
+    }
+
     /// Number of non-expired entries remaining.
     pub fn count(&self) -> usize {
         self.entries.iter().filter(|e| !e.is_expired()).count()
@@ -415,6 +424,24 @@ mod tests {
         // 2 raw entries, 1 expired → count = 1
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(stack.count(), 1);
+    }
+
+    #[test]
+    fn peek_names_what_pop_would_undo_without_removing_it() {
+        let mut stack = UndoStack::new();
+        assert!(stack.peek_label().is_none());
+        stack.push(make_entry("older"));
+        stack.push(make_entry("newest"));
+        assert_eq!(stack.peek_label().unwrap().english(), "newest");
+        assert_eq!(stack.count(), 2);
+
+        // An expired top entry is never offered, even before a purge.
+        stack.entries.push(UndoEntry::expired_entry(
+            "dead",
+            UndoAction::StageFiles { paths: vec![] },
+        ));
+        assert_eq!(stack.peek_label().unwrap().english(), "newest");
+        assert_eq!(stack.pop().unwrap().label.english(), "newest");
     }
 
     #[test]

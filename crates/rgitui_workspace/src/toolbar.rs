@@ -1,13 +1,10 @@
 use gpui::prelude::*;
 use gpui::SharedString;
 use gpui::{div, px, ClickEvent, Context, EventEmitter, Render, Window};
-use rgitui_i18n::{key, t};
+use rgitui_i18n::{key, t, Message};
 use rgitui_settings::SettingsState;
-use rgitui_theme::{ActiveTheme, Color, StyledExt};
-use rgitui_ui::{
-    Badge, Button, ButtonSize, ButtonStyle, Icon, IconButton, IconName, IconSize, Indicator, Label,
-    LabelSize, Tooltip, VerticalDivider,
-};
+use rgitui_theme::{contrast_text_on, ActiveTheme, Color, StyledExt};
+use rgitui_ui::{Icon, IconButton, IconName, IconSize, Label, LabelSize, Tooltip, VerticalDivider};
 
 use crate::keymap;
 use crate::CommandId;
@@ -17,16 +14,46 @@ type TooltipFactory = Box<dyn Fn(&mut gpui::Window, &mut gpui::App) -> gpui::Any
 struct ToolbarButtonState {
     disabled: bool,
     loading: bool,
-    /// Message key of the tooltip, translated when the button renders.
-    tooltip_text: &'static str,
+    /// Tooltip text, already translated.
+    tooltip_text: SharedString,
     /// The command the button runs, if it is one a keystroke can reach. The
     /// tooltip shows that command's current binding rather than a literal.
     command: Option<CommandId>,
+    /// A count drawn on the icon's corner (commits to pull or push).
+    count: Option<(usize, Color)>,
+}
+
+impl ToolbarButtonState {
+    fn new(tooltip_text: SharedString, command: Option<CommandId>) -> Self {
+        Self {
+            disabled: false,
+            loading: false,
+            tooltip_text,
+            command,
+            count: None,
+        }
+    }
+
+    fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
+        self
+    }
+
+    fn count(mut self, count: usize, color: Color) -> Self {
+        self.count = (count > 0).then_some((count, color));
+        self
+    }
 }
 
 /// Events emitted by the toolbar.
 #[derive(Debug, Clone)]
 pub enum ToolbarEvent {
+    Undo,
     Fetch,
     Pull,
     Push,
@@ -54,6 +81,8 @@ pub struct Toolbar {
     has_github_token: bool,
     ahead: usize,
     behind: usize,
+    /// What Undo would reverse, or `None` when there is nothing to undo.
+    undo: Option<Message>,
 }
 
 impl EventEmitter<ToolbarEvent> for Toolbar {}
@@ -77,6 +106,7 @@ impl Toolbar {
             has_github_token: false,
             ahead: 0,
             behind: 0,
+            undo: None,
         }
     }
 
@@ -111,6 +141,16 @@ impl Toolbar {
         }
         self.ahead = ahead;
         self.behind = behind;
+        cx.notify();
+    }
+
+    /// The workspace's undo history is shared by every tab; it hands the
+    /// active toolbar the label of the entry Undo would reverse.
+    pub fn set_undo(&mut self, undo: Option<Message>, cx: &mut Context<Self>) {
+        if self.undo == undo {
+            return;
+        }
+        self.undo = undo;
         cx.notify();
     }
 
@@ -157,71 +197,99 @@ impl Toolbar {
         }
     }
 
-    // TODO(audit) QUAL-11: the network-operation buttons (fetch/pull/push) stay
-    // hand-rolled because the shared `Button` cannot express their behavior: it has
-    // no child API for the inline ahead/behind `Badge`, and it forces a disabled
-    // icon color, so the non-interactive `Color::Accent` "loading" affordance is
-    // not reproducible. Consolidating them needs loading + child support on the
-    // shared `Button`, which lives in `rgitui_ui::button`.
-    fn icon_button(
+    /// A labelled action: icon above a short label, borderless until hovered.
+    ///
+    /// Hand-rolled rather than the shared `Button`, which cannot stack its
+    /// label under the icon, draw a count on the icon, or keep the accent icon
+    /// of a running (non-interactive) operation instead of the disabled color.
+    fn action_button(
         &self,
         id: &'static str,
         icon: IconName,
         label: SharedString,
         state: ToolbarButtonState,
+        height: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let disabled = state.disabled;
-        let loading = state.loading;
-        let colors = cx.colors();
-        let hover_bg = colors.ghost_element_hover;
-        let active_bg = colors.ghost_element_active;
+        let hover_bg = cx.colors().ghost_element_hover;
+        let active_bg = cx.colors().ghost_element_active;
 
-        let is_inactive = disabled || loading;
-
-        let icon_color = if loading {
+        let is_inactive = state.disabled || state.loading;
+        let icon_color = if state.loading {
             Color::Accent
-        } else if disabled {
+        } else if state.disabled {
             Color::Disabled
         } else {
             Color::Default
         };
-        let text_color = if loading {
+        let text_color = if state.loading {
             Color::Muted
-        } else if disabled {
+        } else if state.disabled {
             Color::Disabled
         } else {
             Color::Default
         };
 
-        let tooltip_fn =
-            Self::build_tooltip(rgitui_i18n::translate(state.tooltip_text), state.command);
+        let tooltip_fn = Self::build_tooltip(state.tooltip_text, state.command);
+        let count = state
+            .count
+            .filter(|_| !state.loading)
+            .map(|(count, color)| {
+                let background = color.color(cx);
+                div()
+                    .absolute()
+                    .top(px(-6.))
+                    .left(px(11.))
+                    .h(px(15.))
+                    .min_w(px(15.))
+                    .px(px(4.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(background)
+                    .text_color(contrast_text_on(background))
+                    .text_size(px(10.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(SharedString::from(count.to_string()))
+            });
 
         div()
             .id(id)
-            .h_flex()
-            .h(px(30.))
-            .min_h(gpui::rems(1.875))
+            .v_flex()
+            .h(px(height))
+            .min_w(px(54.))
             .flex_shrink_0()
             .px(px(8.))
-            .gap(px(5.))
+            .gap(px(4.))
             .items_center()
             .justify_center()
-            .rounded(px(4.))
-            .bg(colors.element_background)
-            .border_1()
-            .border_color(colors.border)
+            .rounded(px(6.))
             .when(!is_inactive, move |el| {
                 el.hover(move |s| s.bg(hover_bg))
                     .active(move |s| s.bg(active_bg))
                     .cursor_pointer()
             })
             .tooltip(move |window, cx| tooltip_fn(window, cx))
-            .child(Icon::new(icon).size(IconSize::Small).color(icon_color))
-            .child(Label::new(label).size(LabelSize::Small).color(text_color))
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        Icon::new(icon)
+                            .size(IconSize::Custom(gpui::rems(1.125)))
+                            .color(icon_color),
+                    )
+                    .children(count),
+            )
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .weight(gpui::FontWeight::MEDIUM)
+                    .color(text_color),
+            )
     }
 
-    fn render_left_group(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_actions(&mut self, height: f32, cx: &mut Context<Self>) -> gpui::Div {
         let fetch_label = if self.is_fetching {
             t!("toolbar.fetching")
         } else {
@@ -237,280 +305,266 @@ impl Toolbar {
         } else {
             t!("toolbar.push")
         };
+        let undo_tooltip = match &self.undo {
+            Some(label) => t!("toolbar.undo.tooltip", action = label.translated()),
+            None => t!("workspace.undo.nothing"),
+        };
 
         div()
             .h_flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(6.))
+            .gap(px(2.))
+            .child(
+                self.action_button(
+                    "tb-undo",
+                    IconName::Undo,
+                    t!("toolbar.undo"),
+                    ToolbarButtonState::new(undo_tooltip, Some(CommandId::Undo))
+                        .disabled(self.undo.is_none()),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.undo.is_some() {
+                        cx.emit(ToolbarEvent::Undo);
+                    }
+                })),
+            )
+            .child(VerticalDivider::new())
             // Network operations group
             .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(
-                        self.icon_button(
-                            "tb-fetch",
-                            IconName::Refresh,
-                            fetch_label,
-                            ToolbarButtonState {
-                                disabled: !self.fetch_enabled(),
-                                loading: self.is_fetching,
-                                tooltip_text: key!("common.fetch_remote.tooltip"),
-                                command: Some(CommandId::Fetch),
-                            },
-                            cx,
-                        )
-                        .on_click(cx.listener(
-                            |this, _: &ClickEvent, _, cx| {
-                                if this.fetch_enabled() {
-                                    cx.emit(ToolbarEvent::Fetch);
-                                }
-                            },
-                        )),
+                self.action_button(
+                    "tb-fetch",
+                    IconName::Refresh,
+                    fetch_label,
+                    ToolbarButtonState::new(
+                        rgitui_i18n::translate(key!("common.fetch_remote.tooltip")),
+                        Some(CommandId::Fetch),
                     )
-                    .child({
-                        let mut btn = self
-                            .icon_button(
-                                "tb-pull",
-                                IconName::ArrowDown,
-                                pull_label,
-                                ToolbarButtonState {
-                                    disabled: !self.pull_enabled(),
-                                    loading: self.is_pulling,
-                                    tooltip_text: key!("common.pull_remote.tooltip"),
-                                    command: Some(CommandId::Pull),
-                                },
-                                cx,
-                            )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if this.pull_enabled() {
-                                    cx.emit(ToolbarEvent::Pull);
-                                }
-                            }));
-                        if self.behind > 0 && !self.is_pulling {
-                            btn = btn.child(
-                                Badge::new(SharedString::from(self.behind.to_string()))
-                                    .color(Color::Info),
-                            );
-                        }
-                        btn
-                    })
-                    .child({
-                        let mut btn = self
-                            .icon_button(
-                                "tb-push",
-                                IconName::ArrowUp,
-                                push_label,
-                                ToolbarButtonState {
-                                    disabled: !self.push_enabled(),
-                                    loading: self.is_pushing,
-                                    tooltip_text: key!("common.push_remote.tooltip"),
-                                    command: Some(CommandId::Push),
-                                },
-                                cx,
-                            )
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                if this.push_enabled() {
-                                    cx.emit(ToolbarEvent::Push);
-                                }
-                            }));
-                        if self.ahead > 0 && !self.is_pushing {
-                            btn = btn.child(
-                                Badge::new(SharedString::from(self.ahead.to_string()))
-                                    .color(Color::Success),
-                            );
-                        }
-                        btn
-                    })
-                    .when(self.ahead > 0 && self.behind == 0, |el| {
-                        el.child(Indicator::dot(Color::Success))
-                    })
-                    .when(self.behind > 0 && self.ahead == 0, |el| {
-                        el.child(Indicator::dot(Color::Warning))
-                    })
-                    .when(self.ahead > 0 && self.behind > 0, |el| {
-                        el.child(Indicator::dot(Color::Info))
-                    }),
+                    .disabled(!self.fetch_enabled())
+                    .loading(self.is_fetching),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.fetch_enabled() {
+                        cx.emit(ToolbarEvent::Fetch);
+                    }
+                })),
             )
-            .child(VerticalDivider::new())
-            // Branch operations group
             .child(
-                Button::new("tb-branch", t!("toolbar.branch"))
-                    .size(ButtonSize::Default)
-                    .style(ButtonStyle::Outlined)
-                    .icon(IconName::GitBranch)
-                    .tooltip_fn(keymap::command_tooltip(
-                        "Create new branch",
-                        CommandId::CreateBranch,
-                    ))
-                    .on_click(
-                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Branch)),
-                    ),
-            )
-            .child(VerticalDivider::new())
-            // Stash operations group
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .child(
-                        Button::new("tb-stash", t!("toolbar.stash"))
-                            .size(ButtonSize::Default)
-                            .icon(IconName::Stash)
-                            .disabled(!self.has_changes)
-                            .tooltip_fn(keymap::command_tooltip(
-                                "Stash working changes",
-                                CommandId::StashSave,
-                            ))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::StashSave)
-                            })),
+                self.action_button(
+                    "tb-pull",
+                    IconName::ArrowDown,
+                    pull_label,
+                    ToolbarButtonState::new(
+                        rgitui_i18n::translate(key!("common.pull_remote.tooltip")),
+                        Some(CommandId::Pull),
                     )
-                    .child(
-                        Button::new("tb-pop", t!("toolbar.pop"))
-                            .size(ButtonSize::Default)
-                            .icon(IconName::Undo)
-                            .disabled(!self.has_stashes)
-                            .tooltip_fn(keymap::command_tooltip(
-                                "Pop top stash entry",
-                                CommandId::StashPop,
-                            ))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::StashPop)
-                            })),
-                    ),
+                    .disabled(!self.pull_enabled())
+                    .loading(self.is_pulling)
+                    .count(self.behind, Color::Info),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.pull_enabled() {
+                        cx.emit(ToolbarEvent::Pull);
+                    }
+                })),
+            )
+            .child(
+                self.action_button(
+                    "tb-push",
+                    IconName::ArrowUp,
+                    push_label,
+                    ToolbarButtonState::new(
+                        rgitui_i18n::translate(key!("common.push_remote.tooltip")),
+                        Some(CommandId::Push),
+                    )
+                    .disabled(!self.push_enabled())
+                    .loading(self.is_pushing)
+                    .count(self.ahead, Color::Success),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.push_enabled() {
+                        cx.emit(ToolbarEvent::Push);
+                    }
+                })),
             )
             .child(VerticalDivider::new())
-            // PR creation group
+            // Branch and stash operations group
             .child(
-                Button::new("tb-pr", t!("toolbar.create_pr"))
-                    .size(ButtonSize::Default)
-                    .style(ButtonStyle::Outlined)
-                    .icon(IconName::GitPullRequest)
-                    .disabled(!self.has_github_token)
-                    .tooltip_fn(keymap::command_tooltip(
+                self.action_button(
+                    "tb-branch",
+                    IconName::GitBranch,
+                    t!("toolbar.branch"),
+                    ToolbarButtonState::new(
+                        t!("toolbar.branch.tooltip"),
+                        Some(CommandId::CreateBranch),
+                    ),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Branch))),
+            )
+            .child(
+                self.action_button(
+                    "tb-stash",
+                    IconName::Stash,
+                    t!("toolbar.stash"),
+                    ToolbarButtonState::new(
+                        t!("toolbar.stash.tooltip"),
+                        Some(CommandId::StashSave),
+                    )
+                    .disabled(!self.has_changes),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.has_changes {
+                        cx.emit(ToolbarEvent::StashSave);
+                    }
+                })),
+            )
+            .child(
+                self.action_button(
+                    "tb-pop",
+                    IconName::StashPop,
+                    t!("toolbar.pop"),
+                    ToolbarButtonState::new(t!("toolbar.pop.tooltip"), Some(CommandId::StashPop))
+                        .disabled(!self.has_stashes),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.has_stashes {
+                        cx.emit(ToolbarEvent::StashPop);
+                    }
+                })),
+            )
+            .child(VerticalDivider::new())
+            // PR creation and the terminal: leaving the app for related work.
+            .child(
+                self.action_button(
+                    "tb-pr",
+                    IconName::GitPullRequest,
+                    t!("toolbar.create_pr"),
+                    ToolbarButtonState::new(
                         t!("toolbar.create_pr.tooltip"),
-                        CommandId::CreatePr,
-                    ))
-                    .on_click(
-                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::CreatePr)),
-                    ),
+                        Some(CommandId::CreatePr),
+                    )
+                    .disabled(!self.has_github_token),
+                    height,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if this.has_github_token {
+                        cx.emit(ToolbarEvent::CreatePr);
+                    }
+                })),
+            )
+            .child(
+                self.action_button(
+                    "tb-terminal",
+                    IconName::Terminal,
+                    t!("toolbar.terminal"),
+                    ToolbarButtonState::new(t!("toolbar.terminal.tooltip"), None),
+                    height,
+                    cx,
+                )
+                .on_click(
+                    cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::OpenTerminal)),
+                ),
             )
     }
 
-    fn render_right_group(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_utilities(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .h_flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(6.))
-            // External tools group
+            .gap(px(2.))
             .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .child(
-                        IconButton::new("tb-explorer", IconName::Folder)
-                            .color(Color::Muted)
-                            .tooltip(t!("toolbar.explorer.tooltip"))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::OpenFileExplorer)
-                            })),
-                    )
-                    .child(
-                        IconButton::new("tb-terminal", IconName::Terminal)
-                            .color(Color::Muted)
-                            .tooltip(t!("toolbar.terminal.tooltip"))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::OpenTerminal)
-                            })),
-                    )
-                    .child(
-                        IconButton::new("tb-editor", IconName::ExternalLink)
-                            .color(Color::Muted)
-                            .tooltip(t!("toolbar.editor.tooltip"))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::OpenEditor)
-                            })),
+                IconButton::new("tb-explorer", IconName::Folder)
+                    .color(Color::Muted)
+                    .tooltip(t!("toolbar.explorer.tooltip"))
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                        cx.emit(ToolbarEvent::OpenFileExplorer)
+                    })),
+            )
+            .child(
+                IconButton::new("tb-editor", IconName::ExternalLink)
+                    .color(Color::Muted)
+                    .tooltip(t!("toolbar.editor.tooltip"))
+                    .on_click(
+                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::OpenEditor)),
                     ),
             )
             .child(VerticalDivider::new())
-            // Utility actions group
             .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .child(
-                        IconButton::new("tb-search", IconName::Search)
-                            .color(Color::Muted)
-                            .tooltip_fn(keymap::command_tooltip(
-                                t!("toolbar.search_commits.tooltip"),
-                                CommandId::Search,
-                            ))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::Search)
-                            })),
-                    )
-                    .child(
-                        IconButton::new("tb-refresh", IconName::Refresh)
-                            .color(Color::Muted)
-                            .tooltip_fn(keymap::command_tooltip(
-                                t!("toolbar.refresh.tooltip"),
-                                CommandId::Refresh,
-                            ))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::Refresh)
-                            })),
-                    )
-                    .child(
-                        IconButton::new("tb-settings", IconName::Settings)
-                            .color(Color::Muted)
-                            .tooltip_fn(keymap::command_tooltip(
-                                t!("toolbar.settings.tooltip"),
-                                CommandId::Settings,
-                            ))
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                cx.emit(ToolbarEvent::Settings)
-                            })),
+                IconButton::new("tb-search", IconName::Search)
+                    .color(Color::Muted)
+                    .tooltip_fn(keymap::command_tooltip(
+                        t!("toolbar.search_commits.tooltip"),
+                        CommandId::Search,
+                    ))
+                    .on_click(
+                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Search)),
+                    ),
+            )
+            .child(
+                IconButton::new("tb-refresh", IconName::Refresh)
+                    .color(Color::Muted)
+                    .tooltip_fn(keymap::command_tooltip(
+                        t!("toolbar.refresh.tooltip"),
+                        CommandId::Refresh,
+                    ))
+                    .on_click(
+                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Refresh)),
+                    ),
+            )
+            .child(
+                IconButton::new("tb-settings", IconName::Settings)
+                    .color(Color::Muted)
+                    .tooltip_fn(keymap::command_tooltip(
+                        t!("toolbar.settings.tooltip"),
+                        CommandId::Settings,
+                    ))
+                    .on_click(
+                        cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ToolbarEvent::Settings)),
                     ),
             )
     }
 }
 
 impl Render for Toolbar {
+    /// The actions part of the toolbar row. The workspace draws the row itself
+    /// (surface, border and height) and puts the checkout breadcrumb before
+    /// this; the actions are centered in the space that leaves.
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let compactness = cx.global::<SettingsState>().settings().compactness;
-        let toolbar_h = compactness.spacing(44.0).max(36.0);
-        let toolbar_bg = cx.colors().toolbar_background;
-        let border_color = cx.colors().border_variant;
+        let button_h = compactness.spacing(46.0).max(40.0);
 
-        let left = self.render_left_group(cx);
-        let right = self.render_right_group(cx);
+        let actions = self.render_actions(button_h, cx);
+        let utilities = self.render_utilities(cx);
 
         div()
             .id("repository-toolbar")
             .h_flex()
-            .w_full()
+            .flex_1()
             .min_w_0()
-            .h(px(toolbar_h))
-            .min_h(gpui::rems(2.375))
-            .flex_shrink_0()
+            .h_full()
             // Keep one action row; narrow windows can scroll to utilities.
             .overflow_x_scroll()
             .gap(px(12.))
-            .px(px(10.))
             .items_center()
-            .justify_between()
-            .bg(toolbar_bg)
-            .border_b_1()
-            .border_color(border_color)
-            .child(left)
-            .child(right)
+            .child(div().flex_1())
+            .child(actions)
+            .child(div().h_flex().flex_1().justify_end().child(utilities))
     }
 }
 
@@ -542,7 +596,20 @@ mod tests {
     }
 
     #[test]
+    fn counts_are_drawn_only_when_there_is_something_to_count() {
+        let state = ToolbarButtonState::new("Push".into(), None);
+        assert_eq!(state.count, None);
+        let state = ToolbarButtonState::new("Push".into(), None).count(0, Color::Success);
+        assert_eq!(state.count, None);
+        let state = ToolbarButtonState::new("Push".into(), None).count(3, Color::Success);
+        assert_eq!(state.count, Some((3, Color::Success)));
+    }
+
+    #[test]
     fn test_toolbar_event_debug() {
+        let event = ToolbarEvent::Undo;
+        assert_eq!(format!("{:?}", event), "Undo");
+
         let event = ToolbarEvent::Fetch;
         assert_eq!(format!("{:?}", event), "Fetch");
 

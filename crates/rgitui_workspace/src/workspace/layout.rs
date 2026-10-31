@@ -11,7 +11,7 @@ use rgitui_ui::{
 };
 
 use crate::keymap;
-use crate::{CommandId, StatusBar, TitleBar, ToastKind};
+use crate::{CheckoutBreadcrumb, CommandId, StatusBar, TitleBar, ToastKind};
 
 use super::{
     BottomPanelMode, CommitInputResize, DetailPanelResize, DiffViewerResize, FocusedPanel,
@@ -123,6 +123,19 @@ impl Workspace {
         }))
     }
 
+    /// The focused layout's way back to the classic split, kept in the toolbar
+    /// so it stays reachable when no file view (and so no center tab strip) is
+    /// open. Classic mode shows [`Self::render_layout_toggle`] in its panel.
+    fn render_split_view_button(&self, cx: &mut Context<Self>) -> IconButton {
+        IconButton::new("workspace-split-view", IconName::SplitView)
+            .color(Color::Muted)
+            .tooltip(t!("workspace.layout.classic.tooltip"))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.set_graph_focused_layout(false, window, cx);
+            }))
+    }
+
     /// Repository tabs own entities; these tabs only choose which existing
     /// center entity is rendered. Switching never recreates graph/diff state.
     fn render_center_tab_bar(&self, cx: &mut Context<Self>) -> TabBar {
@@ -178,7 +191,7 @@ impl Workspace {
                     })),
             );
         }
-        bar.end_slot(self.render_layout_toggle(cx))
+        bar
     }
 
     /// Translate the configured base font size into a window rem size.
@@ -295,6 +308,11 @@ impl Render for Workspace {
             tab.sidebar.update(cx, |sidebar, cx| {
                 sidebar.set_show_change_sections(show_sections, cx);
             });
+            // Undo history is workspace-wide; the visible toolbar names what
+            // Undo would reverse. Expiry notifies this view, so it stays current.
+            let undo = self.undo_stack.peek_label().cloned();
+            tab.toolbar
+                .update(cx, |toolbar, cx| toolbar.set_undo(undo, cx));
         }
 
         // Nothing holds focus on a fresh launch. gpui dispatches an action
@@ -586,7 +604,9 @@ impl Render for Workspace {
             );
         }
 
-        // Add workspace and repo actions to tab bar
+        // Add workspace and repo actions to tab bar. Without custom window
+        // chrome there is no title bar, so the keyboard hints end this strip.
+        let custom_chrome = crate::title_bar::uses_custom_chrome(window);
         let ws_home = workspace_handle.clone();
         let ws_open = workspace_handle.clone();
         let ws_switch = workspace_handle.clone();
@@ -594,6 +614,9 @@ impl Render for Workspace {
             div()
                 .h_flex()
                 .gap_1()
+                .when(!custom_chrome, |el| {
+                    el.child(crate::title_bar::keyboard_hints(cx).mr(px(10.)))
+                })
                 .child(
                     Button::new("tab-bar-repositories", t!("workspace.repositories"))
                         .size(ButtonSize::Default)
@@ -812,48 +835,81 @@ impl Render for Workspace {
         let detached_head_banner =
             detached_head.map(|head| self.render_detached_head_banner(head, cx));
 
+        // The checkout this window's actions apply to, at the start of the
+        // toolbar: repository › branch (or worktree), as in GitKraken.
+        let breadcrumb = {
+            let repo_name = tab_labels.get(self.active_tab).cloned().unwrap_or_default();
+            let mut crumb = CheckoutBreadcrumb::new(repo_name, branch_name.clone())
+                .checkout_path(repo_path_display.clone())
+                .has_changes(has_changes)
+                .head_detached(head_detached)
+                .on_repo_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.toggle_repository_switcher(window, cx);
+                }));
+            if let Some(name) = worktree_name {
+                crumb = crumb.worktree(name).on_exit_worktree(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        // Return to the original checkout without modifying
+                        // either worktree's HEAD or files.
+                        super::events::set_inspecting_worktree(this, None, cx);
+                    },
+                ));
+            }
+            // A detached HEAD has no branch to find in the sidebar, so its
+            // crumb shows HEAD's commit in the graph instead.
+            let mut crumb = if detached_head_banner.is_some() {
+                crumb.on_branch_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.reveal_head(window, cx);
+                }))
+            } else {
+                let sidebar = active_tab.sidebar.clone();
+                crumb.on_branch_click(move |_, window, cx| {
+                    sidebar.update(cx, |sb, cx| {
+                        sb.ensure_branches_visible(window, cx);
+                    });
+                })
+            };
+            if !repo_state.is_clean() {
+                crumb = crumb.repo_state(repo_state.label().translated());
+            }
+            crumb
+        };
+        let toolbar_height = cx
+            .global::<rgitui_settings::SettingsState>()
+            .settings()
+            .compactness
+            .spacing(54.0)
+            .max(46.0);
+
         let root = self.workspace_root(cx, ui_font, colors.background).v_flex();
 
         root
-            // Title bar
-            .child({
-                let mut title = TitleBar::new(branch_name.clone())
-                    .checkout_path(repo_path_display.clone())
-                    .has_changes(has_changes)
-                    .head_detached(head_detached);
-                if let Some(name) = worktree_name {
-                    title = title.worktree(name).on_exit_worktree(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            // Return to the original checkout without modifying
-                            // either worktree's HEAD or files.
-                            super::events::set_inspecting_worktree(this, None, cx);
-                        },
-                    ));
-                }
-                // A detached HEAD has no branch to find in the sidebar, so its
-                // pill shows HEAD's commit in the graph instead.
-                let mut title = if detached_head_banner.is_some() {
-                    title.on_branch_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.reveal_head(window, cx);
-                    }))
-                } else {
-                    let sidebar = active_tab.sidebar.clone();
-                    title.on_branch_click(move |_, window, cx| {
-                        sidebar.update(cx, |sb, cx| {
-                            sb.ensure_branches_visible(window, cx);
-                        });
-                    })
-                };
-                if !repo_state.is_clean() {
-                    title = title.repo_state(repo_state.label().translated());
-                }
-                title
-            })
+            // Native decorations already draw the window's title bar.
+            .when(custom_chrome, |el| el.child(TitleBar::new()))
             // Repository navigation sits above the controls it scopes, rather
             // than looking like another panel selector below the toolbar.
             .child(tab_bar)
-            // Toolbar
-            .child(active_tab.toolbar.clone())
+            // Toolbar: checkout context, then the actions that apply to it.
+            .child(
+                div()
+                    .id("repository-toolbar-row")
+                    .h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(toolbar_height))
+                    .flex_shrink_0()
+                    .pl(px(6.))
+                    .pr(px(10.))
+                    .gap(px(8.))
+                    .bg(colors.toolbar_background)
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .child(breadcrumb)
+                    .child(active_tab.toolbar.clone())
+                    .when(graph_focused_layout, |el| {
+                        el.child(self.render_split_view_button(cx))
+                    }),
+            )
             .when_some(update_banner, |el, banner| el.child(banner))
             // Conflict state banner (merge/rebase/cherry-pick/revert in progress)
             .when(!repo_state.is_clean(), |el| {
@@ -1117,7 +1173,9 @@ impl Render for Workspace {
                                         ),
                                 )
                             })
-                            .when(graph_focused_layout, |el| {
+                            // A lone Graph tab says nothing the graph does not, so
+                            // the strip appears only once a file/tool view opens.
+                            .when(graph_focused_layout && active_tab.content_open, |el| {
                                 el.child(self.render_center_tab_bar(cx))
                             })
                             // The graph entity stays alive when a file view replaces it.

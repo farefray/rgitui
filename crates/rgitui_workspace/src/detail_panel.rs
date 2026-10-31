@@ -13,12 +13,12 @@ use rgitui_git::{
     compact_ref_labels, BranchInfo, CommitDiff, CommitInfo, FileChangeKind, FileDiff, RefLabel,
     Signature,
 };
-use rgitui_i18n::{key, t};
+use rgitui_i18n::{key, t, tp};
 use rgitui_settings::SettingsState;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
     AvatarCache, Badge, Button, ButtonSize, ButtonStyle, DiffStat, Icon, IconButton, IconName,
-    IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent, Tooltip,
+    IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent, TintColor, Tooltip,
 };
 
 use crate::file_status::{file_change_color, FileStatusBadge};
@@ -161,6 +161,8 @@ enum WorkingRow {
         name: String,
         depth: usize,
         count: usize,
+        /// Every file below, by kind, whether or not the folder is collapsed.
+        tally: working_tree::ChangeTally,
         staged: bool,
         collapsed: bool,
     },
@@ -264,6 +266,8 @@ fn working_tree_rows(
             staged,
             count: files.len(),
         });
+        let kinds: Vec<_> = files.iter().map(|file| file.kind).collect();
+        let tallies = working_tree::directory_tallies(&trees[section], &kinds);
         let matches = query.as_ref().map(|query| {
             files
                 .iter()
@@ -291,6 +295,7 @@ fn working_tree_rows(
                     name: name.clone(),
                     depth: *depth,
                     count: *count,
+                    tally: tallies[index],
                     staged,
                     collapsed: matches.is_none() && collapsed[section].contains(path),
                 },
@@ -383,6 +388,44 @@ fn file_change_icon(kind: FileChangeKind) -> IconName {
         FileChangeKind::TypeChange => IconName::FileModified,
         FileChangeKind::Untracked => IconName::FileAdded,
         FileChangeKind::Conflicted => IconName::FileConflict,
+    }
+}
+
+/// A folder's changes at a glance — edits, additions, removals, conflicts —
+/// each as its icon and count in the status color, so a collapsed folder still
+/// says what is inside it. Empty kinds are left out.
+#[derive(IntoElement)]
+struct ChangeTallySummary(working_tree::ChangeTally);
+
+impl RenderOnce for ChangeTallySummary {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let tally = self.0;
+        let part = |count: usize, icon: IconName, color: Color| {
+            (count > 0).then(|| {
+                div()
+                    .h_flex()
+                    .gap(px(2.))
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .child(
+                        Label::new(SharedString::from(count.to_string()))
+                            .size(LabelSize::XSmall)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .color(color),
+                    )
+            })
+        };
+        div()
+            .h_flex()
+            .flex_shrink_0()
+            .gap(px(8.))
+            .children(part(tally.modified, IconName::Edit, Color::Modified))
+            .children(part(tally.added, IconName::Plus, Color::Added))
+            .children(part(tally.deleted, IconName::Minus, Color::Deleted))
+            .children(part(
+                tally.conflicted,
+                IconName::AlertTriangle,
+                Color::Conflict,
+            ))
     }
 }
 
@@ -661,6 +704,9 @@ pub struct DetailPanel {
     cached_working_rows: Arc<Vec<WorkingRow>>,
     working_trees: [Vec<working_tree::TreeRow>; 2],
     working_collapsed_dirs: [HashSet<String>; 2],
+    /// Folder expansion outlives visits to commits: a checkout's last state is
+    /// restored when its working changes are shown again.
+    working_collapse_memory: Option<(std::path::PathBuf, [HashSet<String>; 2])>,
     working_checkout: std::path::PathBuf,
     commit_diff: Option<Arc<CommitDiff>>,
     /// Provenance of `commit_diff`'s files — a commit or a stash. Set alongside
@@ -720,6 +766,7 @@ impl DetailPanel {
             cached_working_rows: Arc::default(),
             working_trees: Default::default(),
             working_collapsed_dirs: Default::default(),
+            working_collapse_memory: None,
             working_checkout: std::path::PathBuf::new(),
             commit_diff: None,
             diff_source: None,
@@ -944,8 +991,16 @@ impl DetailPanel {
         if !collapsed.remove(&path) {
             collapsed.insert(path);
         }
+        self.remember_working_collapses();
         self.rebuild_working_rows();
         cx.notify();
+    }
+
+    fn remember_working_collapses(&mut self) {
+        self.working_collapse_memory = Some((
+            self.working_checkout.clone(),
+            self.working_collapsed_dirs.clone(),
+        ));
     }
 
     fn set_working_directories_collapsed(&mut self, collapse: bool, cx: &mut Context<Self>) {
@@ -962,6 +1017,7 @@ impl DetailPanel {
                 }));
             }
         }
+        self.remember_working_collapses();
         self.rebuild_working_rows();
         self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
@@ -1112,11 +1168,12 @@ impl DetailPanel {
         if self.working_changes.as_ref() == Some(&status) && self.working_checkout == checkout {
             return;
         }
-        if let Some(previous) = self
+        let refresh = self
             .working_changes
             .as_ref()
-            .filter(|_| self.working_checkout == checkout)
-        {
+            .filter(|_| self.working_checkout == checkout);
+        let first_load = refresh.is_none();
+        if let Some(previous) = refresh {
             self.selected_file_index =
                 reconcile_working_selection(previous, &status, self.selected_file_index);
             // Keep the scroll handle, filter text/editor, and selected identity.
@@ -1127,6 +1184,8 @@ impl DetailPanel {
                 .update(cx, |editor, cx| editor.clear(cx));
             self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
+        // A first load has just been cleared, so every section counts as empty.
+        let previously_empty = self.working_trees.each_ref().map(Vec::is_empty);
         self.working_trees = [&status.staged, &status.unstaged].map(|files| {
             working_tree::build_tree(
                 &files
@@ -1135,6 +1194,24 @@ impl DetailPanel {
                     .collect::<Vec<_>>(),
             )
         });
+        // Back to a checkout whose folders the user arranged: as they left
+        // them. Otherwise a section that fills up (the first snapshot is often
+        // still empty) starts large ones as folder summaries.
+        match &self.working_collapse_memory {
+            Some((path, collapsed)) if *path == checkout => {
+                if first_load {
+                    self.working_collapsed_dirs = collapsed.clone();
+                }
+            }
+            _ => {
+                for (section, tree) in self.working_trees.iter().enumerate() {
+                    if previously_empty[section] {
+                        self.working_collapsed_dirs[section] =
+                            working_tree::default_collapsed(tree);
+                    }
+                }
+            }
+        }
         for (tree, collapsed) in self
             .working_trees
             .iter()
@@ -1414,8 +1491,8 @@ impl DetailPanel {
                                             .truncate(),
                                     ),
                             )
-                            .child(FileStatusBadge::new(row.kind))
                             .child(DiffStat::new(row.additions, row.deletions))
+                            .child(FileStatusBadge::new(row.kind).letter())
                             .into_any_element()
                     })
                     .collect()
@@ -1580,8 +1657,8 @@ impl DetailPanel {
                                                 .truncate(),
                                         ),
                                     )
-                                    .child(FileStatusBadge::new(file.kind))
                                     .child(DiffStat::new(file.additions, file.deletions))
+                                    .child(FileStatusBadge::new(file.kind).letter())
                                     .into_any_element()
                             }
                         }
@@ -1639,14 +1716,25 @@ impl Render for DetailPanel {
             let selected_bg = colors.element_selected;
             let hover_bg = colors.ghost_element_hover;
             let section_bg = colors.surface_background;
+            let section_border = colors.border_variant;
+            let count_bg = colors.element_background;
+            let any_collapsed = self
+                .working_collapsed_dirs
+                .iter()
+                .any(|dirs| !dirs.is_empty());
             return div()
                 .id("detail-panel")
                 .track_focus(&self.focus_handle)
                 .map(|el| keymap::bind_actions(el, "DetailPanel List", &["Menu", "DetailPanel"], cx, Self::dispatch_command))
                 .v_flex().size_full().min_h_0().bg(colors.panel_background)
                 .child(div().h_flex().px(px(10.)).py(px(8.)).gap(px(6.))
-                    .child(Label::new(t!("sidebar.working_changes")).size(LabelSize::Small))
-                    .child(div().flex_1())
+                    // The heading gives way before the controls. Counts live on
+                    // the section rows below, which always have room for them.
+                    .child(div().flex_1().min_w_0().child(Label::new(t!("sidebar.working_changes")).weight(gpui::FontWeight::SEMIBOLD).truncate()))
+                    // One toggle rather than a row of two: expand while anything is folded.
+                    .when(tree_mode && !clean, |el| el.child(Button::new("working-expand-toggle", if any_collapsed { t!("detail.expand_all") } else { t!("detail.collapse_all") })
+                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(searching)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_working_directories_collapsed(!any_collapsed, cx)))))
                     .child(Button::new("working-path-view", t!("detail.path_view"))
                         .size(ButtonSize::Compact).style(ButtonStyle::Subtle).selected(!tree_mode).disabled(clean)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1660,14 +1748,7 @@ impl Render for DetailPanel {
                     .child(IconButton::new("working-file-search", IconName::Search).size(ButtonSize::Compact)
                         .tooltip(t!("detail.search_files_hint"))
                         .on_click(cx.listener(|this, _, window, cx| this.dispatch_command(CommandId::FileSearch, window, cx)))))
-                .when(self.file_search_active || self.file_search_query.is_some(), |el| el.child(self.file_search_editor.clone()))
-                .when(tree_mode && !clean, |el| el.child(div().h_flex().px(px(10.)).gap(px(6.))
-                    .child(Button::new("working-expand-all", t!("detail.expand_all"))
-                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(searching)
-                        .on_click(cx.listener(|this, _, _, cx| this.set_working_directories_collapsed(false, cx))))
-                    .child(Button::new("working-collapse-all", t!("detail.collapse_all"))
-                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(searching)
-                        .on_click(cx.listener(|this, _, _, cx| this.set_working_directories_collapsed(true, cx))))))
+                .when(self.file_search_active || self.file_search_query.is_some(), |el| el.child(div().px(px(10.)).pb(px(6.)).child(self.file_search_editor.clone())))
                 .when(clean, |el| el.child(div().p(px(10.)).child(Label::new(t!("sidebar.working_clean")).size(LabelSize::Small).color(Color::Muted))))
                 .child(uniform_list("working-inspector-files", row_count, move |range: std::ops::Range<usize>, _window: &mut Window, _cx: &mut App| {
                     range.map(|row| {
@@ -1676,12 +1757,17 @@ impl Render for DetailPanel {
                         let weak = weak.clone();
                         match rows[actual_row].clone() {
                             WorkingRow::Section { staged, count } => {
-                                div().id(row).h_flex().w_full().h(px(32.)).px(px(10.)).gap(px(6.)).bg(section_bg)
+                                div().id(row).h_flex().w_full().h(px(34.)).px(px(10.)).gap(px(6.)).bg(section_bg)
+                                    .border_t_1().border_color(section_border)
                                     .child(Label::new(if staged { t!("sidebar.staged") } else { t!("sidebar.unstaged") }).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD))
-                                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                                    .child(div().h(px(18.)).px(px(6.)).rounded_full().flex().items_center().bg(count_bg)
+                                        .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted)))
                                     .child(div().flex_1())
                                     .child(Button::new(ElementId::NamedInteger("working-all".into(), row as u64), if staged { t!("sidebar.unstage_all") } else { t!("sidebar.stage_all") })
-                                        .size(ButtonSize::Compact).style(ButtonStyle::Subtle).disabled(count == 0)
+                                        .icon(if staged { IconName::Minus } else { IconName::Plus })
+                                        .size(ButtonSize::Compact)
+                                        .style(if staged { ButtonStyle::Subtle } else { ButtonStyle::Tinted(TintColor::Success) })
+                                        .disabled(count == 0)
                                         .on_click(move |_: &ClickEvent, _, cx| {
                                             cx.stop_propagation();
                                             weak.update(cx, |_, cx| {
@@ -1690,16 +1776,16 @@ impl Render for DetailPanel {
                                         }))
                                     .into_any_element()
                             }
-                            WorkingRow::Directory { path, name, depth, count, staged, collapsed } => {
+                            WorkingRow::Directory { path, name, depth, count, tally, staged, collapsed } => {
                                 div().id(row).h_flex().w_full().h(px(32.))
                                     .pl(px(10. + depth as f32 * 16.)).pr(px(10.)).gap(px(6.))
                                     .hover(move |style| style.bg(hover_bg)).cursor_pointer()
-                                    .tooltip(Tooltip::text(path.clone()))
+                                    .tooltip(Tooltip::text(format!("{path}\n{}", tp!("detail.working_files", count))))
                                     .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
                                         .size(IconSize::Small).color(Color::Muted))
                                     .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
-                                    .child(div().flex_1().min_w_0().child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate()))
-                                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                                    .child(div().flex_1().min_w_0().child(Label::new(name).size(LabelSize::Small).truncate()))
+                                    .child(ChangeTallySummary(tally))
                                     .on_click(move |_: &ClickEvent, window, cx| {
                                         weak.update(cx, |this, cx| {
                                             this.focus_handle.focus(window, cx);
@@ -1737,32 +1823,32 @@ impl Render for DetailPanel {
                                             .child(Label::new(file_name).size(LabelSize::Small).truncate()))
                                         .when_some(directory, |el, directory| el.child(div().flex_1().min_w_0()
                                             .child(Label::new(directory).size(LabelSize::XSmall).color(Color::Muted).truncate()))))
-                                    .child(FileStatusBadge::new(file.kind))
-                                    // Conflicts must go through the resolver, not blind staging.
-                                    .when(!conflicted, |el| el.child(IconButton::new(ElementId::NamedInteger("working-stage".into(), row as u64), if staged { IconName::Minus } else { IconName::Plus })
-                                        .size(ButtonSize::Compact)
-                                        .tooltip(if staged { t!("sidebar.unstage_file.tooltip") } else { t!("sidebar.stage_file.tooltip") })
-                                        .on_click(move |_: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            action_weak.update(cx, |_, cx| {
-                                                cx.emit(DetailPanelEvent::WorkingAction { checkout: action_checkout.clone(), action: if staged { WorkingChangesAction::UnstageFile(action_path.clone()) } else { WorkingChangesAction::StageFile(action_path.clone()) } });
-                                            }).ok();
-                                        })))
-                                    .when(!staged, |el| el.child(
-                                        div().flex_shrink_0().invisible().group_hover("working-file-row", |style| style.visible())
-                                            .child(IconButton::new(ElementId::NamedInteger("working-discard".into(), row as u64), IconName::Trash)
-                                                .size(ButtonSize::Compact).color(Color::Muted)
-                                                .tooltip(t!("sidebar.discard_changes.tooltip"))
-                                                .on_click(move |_: &ClickEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    discard_weak.update(cx, |_, cx| {
-                                                        cx.emit(DetailPanelEvent::WorkingAction {
-                                                            checkout: discard_checkout.clone(),
-                                                            action: WorkingChangesAction::DiscardFile(discard_path.clone()),
-                                                        });
-                                                    }).ok();
-                                                }))
-                                    ))
+                                    .child(div().h_flex().flex_shrink_0().gap(px(2.))
+                                        .when(selected != Some(index), |el| el.invisible().group_hover("working-file-row", |style| style.visible()))
+                                        .when(!staged, |el| el.child(IconButton::new(ElementId::NamedInteger("working-discard".into(), row as u64), IconName::Trash)
+                                            .size(ButtonSize::Compact).color(Color::Muted)
+                                            .tooltip(t!("sidebar.discard_changes.tooltip"))
+                                            .on_click(move |_: &ClickEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                discard_weak.update(cx, |_, cx| {
+                                                    cx.emit(DetailPanelEvent::WorkingAction {
+                                                        checkout: discard_checkout.clone(),
+                                                        action: WorkingChangesAction::DiscardFile(discard_path.clone()),
+                                                    });
+                                                }).ok();
+                                            })))
+                                        // Conflicts must go through the resolver, not blind staging.
+                                        .when(!conflicted, |el| el.child(IconButton::new(ElementId::NamedInteger("working-stage".into(), row as u64), if staged { IconName::Minus } else { IconName::Plus })
+                                            .size(ButtonSize::Compact)
+                                            .color(if staged { Color::Muted } else { Color::Added })
+                                            .tooltip(if staged { t!("sidebar.unstage_file.tooltip") } else { t!("sidebar.stage_file.tooltip") })
+                                            .on_click(move |_: &ClickEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                action_weak.update(cx, |_, cx| {
+                                                    cx.emit(DetailPanelEvent::WorkingAction { checkout: action_checkout.clone(), action: if staged { WorkingChangesAction::UnstageFile(action_path.clone()) } else { WorkingChangesAction::StageFile(action_path.clone()) } });
+                                                }).ok();
+                                            }))))
+                                    .child(FileStatusBadge::new(file.kind).letter())
                                     .on_click(move |_: &ClickEvent, window, cx| {
                                         weak.update(cx, |this, cx| {
                                             this.focus_handle.focus(window, cx);
