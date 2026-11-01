@@ -21,6 +21,7 @@ anyhow.workspace = true
 git2.workspace = true
 log.workspace = true
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2"
 rgitui_perf = { workspace = true, optional = true }
 rgitui_i18n.workspace = true
 

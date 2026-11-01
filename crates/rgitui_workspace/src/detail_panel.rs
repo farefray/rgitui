@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, uniform_list, App, ClickEvent, ClipboardItem, Context, ElementId, Entity,
-    EventEmitter, FocusHandle, ListSizingBehavior, ObjectFit, Render, ScrollStrategy, SharedString,
-    UniformListScrollHandle, WeakEntity, Window,
+    anchored, deferred, div, img, px, uniform_list, App, ClickEvent, ClipboardItem, Context,
+    ElementId, Entity, EventEmitter, FocusHandle, ListSizingBehavior, MouseButton, MouseDownEvent,
+    ObjectFit, Pixels, Point, Render, ScrollStrategy, SharedString, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 use rgitui_diff::DiffSource;
 use rgitui_git::{
@@ -17,8 +18,9 @@ use rgitui_i18n::{key, t, tp};
 use rgitui_settings::SettingsState;
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
-    AvatarCache, Badge, Button, ButtonSize, ButtonStyle, DiffStat, Icon, IconButton, IconName,
-    IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent, TintColor, Tooltip,
+    AvatarCache, Badge, Button, ButtonSize, ButtonStyle, ContextMenu, ContextMenuItem, DiffStat,
+    Icon, IconButton, IconName, IconSize, Label, LabelSize, Scrollbar, TextInput, TextInputEvent,
+    TintColor, Tooltip,
 };
 
 use crate::file_status::{file_change_color, FileStatusBadge};
@@ -172,6 +174,23 @@ enum WorkingRow {
         staged: bool,
         depth: usize,
     },
+}
+
+impl WorkingRow {
+    /// Copy the full repository-relative path, not a basename or compacted label.
+    fn copy_path(&self) -> Option<String> {
+        match self {
+            Self::Section { .. } => None,
+            Self::Directory { path, .. } => Some(path.clone()),
+            Self::File { file, .. } => Some(file.path.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+struct WorkingPathMenu {
+    /// Snapshot the clicked path so a selection change cannot retarget Copy.
+    path: String,
+    position: Point<Pixels>,
 }
 
 /// Staged and unstaged versions of the same path are distinct selections.
@@ -708,6 +727,7 @@ pub struct DetailPanel {
     /// restored when its working changes are shown again.
     working_collapse_memory: Option<(std::path::PathBuf, [HashSet<String>; 2])>,
     working_checkout: std::path::PathBuf,
+    working_path_menu: Option<WorkingPathMenu>,
     commit_diff: Option<Arc<CommitDiff>>,
     /// Provenance of `commit_diff`'s files — a commit or a stash. Set alongside
     /// the diff so file selections can report it without guessing.
@@ -768,6 +788,7 @@ impl DetailPanel {
             working_collapsed_dirs: Default::default(),
             working_collapse_memory: None,
             working_checkout: std::path::PathBuf::new(),
+            working_path_menu: None,
             commit_diff: None,
             diff_source: None,
             cached_file_tree: None,
@@ -845,6 +866,10 @@ impl DetailPanel {
     /// `v`, `[`, `]` and `/` out of the way while it has focus, and the arrow
     /// keys keep working because they are not scoped that way.
     fn dispatch_command(&mut self, cmd: CommandId, window: &mut Window, cx: &mut Context<Self>) {
+        if cmd == CommandId::Cancel && self.working_path_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.working_changes.is_some()
             && matches!(
                 cmd,
@@ -962,6 +987,7 @@ impl DetailPanel {
     }
 
     fn rebuild_working_rows(&mut self) {
+        self.working_path_menu = None;
         let Some(status) = &self.working_changes else {
             return;
         };
@@ -1120,6 +1146,7 @@ impl DetailPanel {
             );
         }
         self.working_changes = None;
+        self.working_path_menu = None;
         self.cached_file_tree = Some(cached_file_tree);
         self.commit = Some(commit);
         self.commit_diff = Some(diff);
@@ -1140,6 +1167,7 @@ impl DetailPanel {
         log::debug!("DetailPanel::clear");
         self.commit = None;
         self.working_changes = None;
+        self.working_path_menu = None;
         self.cached_working_rows = Arc::default();
         self.working_trees = Default::default();
         self.working_collapsed_dirs = Default::default();
@@ -1265,6 +1293,40 @@ impl DetailPanel {
         // Sort by score descending — higher score = better (earlier char match)
         scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         FilteredFiles::Matched(scored.into_iter().map(|(_, i)| i).collect())
+    }
+
+    fn render_working_path_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let state = self.working_path_menu.as_ref()?;
+        let menu = div()
+            .id("working-path-context-menu")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                if this.working_path_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .child(
+                ContextMenu::new().item(ContextMenuItem::new(t!("common.copy_path")).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(menu) = this.working_path_menu.take() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(menu.path));
+                            cx.notify();
+                        }
+                    }),
+                )),
+            );
+        Some(
+            deferred(
+                anchored()
+                    .position(state.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu),
+            )
+            .into_any_element(),
+        )
     }
 
     fn render_section_header(&self, label: &str) -> impl IntoElement {
@@ -1755,6 +1817,8 @@ impl Render for DetailPanel {
                         let actual_row = row;
                         let checkout = checkout.clone();
                         let weak = weak.clone();
+                        let menu_weak = weak.clone();
+                        let copy_path = rows[actual_row].copy_path();
                         match rows[actual_row].clone() {
                             WorkingRow::Section { staged, count } => {
                                 div().id(row).h_flex().w_full().h(px(34.)).px(px(10.)).gap(px(6.)).bg(section_bg)
@@ -1774,7 +1838,6 @@ impl Render for DetailPanel {
                                                 cx.emit(DetailPanelEvent::WorkingAction { checkout: checkout.clone(), action: if staged { WorkingChangesAction::UnstageAll } else { WorkingChangesAction::StageAll } });
                                             }).ok();
                                         }))
-                                    .into_any_element()
                             }
                             WorkingRow::Directory { path, name, depth, count, tally, staged, collapsed } => {
                                 div().id(row).h_flex().w_full().h(px(32.))
@@ -1791,7 +1854,7 @@ impl Render for DetailPanel {
                                             this.focus_handle.focus(window, cx);
                                             this.toggle_working_directory(staged, path.clone(), cx);
                                         }).ok();
-                                    }).into_any_element()
+                                    })
                             }
                             WorkingRow::File { index, file, staged, depth } => {
                                 let path = file.path.to_string_lossy().into_owned();
@@ -1856,11 +1919,27 @@ impl Render for DetailPanel {
                                             cx.emit(DetailPanelEvent::WorkingFileSelected { path: path.clone(), staged, conflicted, checkout: checkout.clone() });
                                             cx.notify();
                                         }).ok();
-                                    }).into_any_element()
+                                    })
                             }
                         }
+                        .when_some(copy_path, |el, path| el.on_mouse_down(
+                            MouseButton::Right,
+                            move |event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                menu_weak.update(cx, |this, cx| {
+                                    this.focus_handle.focus(window, cx);
+                                    this.working_path_menu = Some(WorkingPathMenu {
+                                        path: path.clone(),
+                                        position: event.position,
+                                    });
+                                    cx.notify();
+                                }).ok();
+                            },
+                        ))
+                        .into_any_element()
                     }).collect()
                 }).flex_1().min_h_0().track_scroll(&self.file_scroll))
+                .children(self.render_working_path_menu(cx))
                 .into_any_element();
         }
 
@@ -2694,6 +2773,97 @@ mod tests {
             staged: files(staged),
             unstaged: files(unstaged),
         })
+    }
+
+    #[test]
+    fn working_copy_paths_use_current_full_paths_in_both_views_and_sections() {
+        let files = vec![
+            rgitui_git::FileStatus {
+                path: "src/nested/deep/new name-λ.rs".into(),
+                kind: FileChangeKind::Renamed,
+                old_path: Some("old name.rs".into()),
+                additions: 0,
+                deletions: 0,
+            },
+            rgitui_git::FileStatus {
+                path: "src/root.rs".into(),
+                kind: FileChangeKind::Deleted,
+                old_path: None,
+                additions: 0,
+                deletions: 0,
+            },
+        ];
+        let status = rgitui_git::WorkingTreeStatus {
+            staged: files.clone(),
+            unstaged: files,
+        };
+        let trees = [&status.staged, &status.unstaged].map(|files| {
+            working_tree::build_tree(
+                &files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let flat = working_rows(&status);
+        let tree = working_tree_rows(&status, &trees, &Default::default(), None);
+        for rows in [&flat, &tree] {
+            for staged in [true, false] {
+                let paths: Vec<_> = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        WorkingRow::File { staged: source, .. } if *source == staged => {
+                            row.copy_path()
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(paths, ["src/nested/deep/new name-λ.rs", "src/root.rs"]);
+            }
+            assert!(rows
+                .iter()
+                .filter(|row| matches!(row, WorkingRow::Section { .. }))
+                .all(|row| row.copy_path().is_none()));
+        }
+        for staged in [true, false] {
+            let compacted = tree
+                .iter()
+                .find(|row| {
+                    matches!(row,
+                        WorkingRow::Directory { name, staged: source, .. }
+                            if name == "nested/deep" && *source == staged
+                    )
+                })
+                .unwrap();
+            assert_eq!(compacted.copy_path().as_deref(), Some("src/nested/deep"));
+        }
+
+        // A collapsed folder still copies itself, not its label or descendants;
+        // filtering reveals the same full path without changing that identity.
+        let collapsed = [HashSet::from(["src".into()]), HashSet::from(["src".into()])];
+        let folded = working_tree_rows(&status, &trees, &collapsed, None);
+        assert_eq!(
+            folded
+                .iter()
+                .filter_map(WorkingRow::copy_path)
+                .collect::<Vec<_>>(),
+            ["src", "src"]
+        );
+        let searched = working_tree_rows(&status, &trees, &collapsed, Some("new name"));
+        assert_eq!(
+            searched
+                .iter()
+                .filter_map(WorkingRow::copy_path)
+                .collect::<Vec<_>>(),
+            [
+                "src",
+                "src/nested/deep",
+                "src/nested/deep/new name-λ.rs",
+                "src",
+                "src/nested/deep",
+                "src/nested/deep/new name-λ.rs",
+            ]
+        );
     }
 
     #[test]

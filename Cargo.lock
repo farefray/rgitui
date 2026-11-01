@@ -5575,6 +5575,7 @@ dependencies = [
  "rgitui_ui",
  "similar",
  "syntect",
+ "unicode-width",
 ]
 
 [[package]]

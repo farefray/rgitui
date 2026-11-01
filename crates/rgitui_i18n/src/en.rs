@@ -101,6 +101,7 @@ english_messages! {
     "common.comments.failed" => "Failed to load comments: {error}",
     "common.comments.loading" => "Loading comments...",
     "common.confirm_hint" => "Enter to confirm | Esc to cancel",
+    "common.copy_path" => "Copy path",
     "common.create_hint" => "Enter to create | Esc to cancel",
     "common.description" => "Description",
     "common.details" => "Details",

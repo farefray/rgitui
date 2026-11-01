@@ -1,14 +1,21 @@
+mod formatting;
 #[cfg(feature = "perf")]
 mod heap_size;
 mod image_preview;
 mod readability;
+mod syntax;
+mod text_selection;
+
+use text_selection::{TextPoint, TextSelection};
 
 use readability::{composite, tint, CodeTypography, DiffSurfaces, InkCache, WORD_ALPHA};
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use similar::{capture_diff_slices, Algorithm};
@@ -520,6 +527,36 @@ struct StyledLine {
 }
 
 impl StyledLine {
+    /// Selection must cover gaps too: syntax-less lines can have sparse
+    /// word-diff highlights rather than a run for every source byte.
+    fn apply_selection(&mut self, range: Range<usize>, background: gpui::Hsla) {
+        if range.is_empty() {
+            return;
+        }
+        let mut filled = Vec::new();
+        let mut end = 0;
+        for (span, style) in std::mem::take(&mut self.highlights) {
+            if end < span.start {
+                filled.push((end..span.start, HighlightStyle::default()));
+            }
+            end = span.end;
+            filled.push((span, style));
+        }
+        if end < self.text.len() {
+            filled.push((end..self.text.len(), HighlightStyle::default()));
+        }
+        self.highlights = filled;
+        self.apply_word_highlights(
+            Vec::new(),
+            vec![range],
+            HighlightStyle::default(),
+            HighlightStyle {
+                background_color: Some(background),
+                ..HighlightStyle::default()
+            },
+        );
+    }
+
     fn plain(text: impl Into<SharedString>) -> Self {
         Self {
             text: text.into(),
@@ -627,6 +664,19 @@ impl StyledLine {
 
         self.highlights = merged;
     }
+}
+
+type TextLayouts = Rc<RefCell<HashMap<(usize, &'static str), gpui::TextLayout>>>;
+
+struct TextInteraction {
+    layouts: TextLayouts,
+    view: WeakEntity<DiffViewer>,
+    selection: Option<TextSelection>,
+    row: usize,
+    lane: &'static str,
+    partial_mode: bool,
+    selection_bg: gpui::Hsla,
+    wrap: bool,
 }
 
 struct SyntaxAssets {
@@ -832,6 +882,7 @@ pub struct DiffViewer {
     partial_mode: bool,
     selection_anchor: Option<usize>,
     mouse_selecting: bool,
+    text_selection: Option<TextSelection>,
     /// Layout measurements must be invalidated when code font/size/density changes.
     code_typography: Option<CodeTypography>,
     max_line_number: std::cell::Cell<Option<usize>>,
@@ -918,6 +969,7 @@ impl DiffViewer {
             partial_mode: false,
             selection_anchor: None,
             mouse_selecting: false,
+            text_selection: None,
             code_typography: None,
             max_line_number: std::cell::Cell::new(None),
             pending_scroll_top: None,
@@ -1049,6 +1101,7 @@ impl DiffViewer {
         source: DiffSource,
         cx: &mut Context<Self>,
     ) {
+        self.text_selection = None;
         log::debug!("DiffViewer::set_diff: path={} source={:?}", path, source);
         self.generation = self.generation.wrapping_add(1);
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
@@ -1160,6 +1213,7 @@ impl DiffViewer {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.text_selection = None;
         log::debug!("DiffViewer::clear");
         self.generation = self.generation.wrapping_add(1);
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
@@ -1188,6 +1242,7 @@ impl DiffViewer {
 
     /// Set a 3-way conflict diff to display.
     pub fn set_three_way_diff(&mut self, diff: ThreeWayFileDiff, cx: &mut Context<Self>) {
+        self.text_selection = None;
         self.generation = self.generation.wrapping_add(1);
         self.loading = true;
         self.error = None;
@@ -1253,6 +1308,7 @@ impl DiffViewer {
     /// Begin loading a conflict and return the generation that owns the request.
     /// Callers compare it again before applying the background result.
     pub fn set_conflict_loading(&mut self, path: String, cx: &mut Context<Self>) -> u64 {
+        self.text_selection = None;
         self.generation = self.generation.wrapping_add(1);
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
         self.loading = true;
@@ -1290,6 +1346,7 @@ impl DiffViewer {
         source: DiffSource,
         cx: &mut Context<Self>,
     ) -> u64 {
+        self.text_selection = None;
         self.generation = self.generation.wrapping_add(1);
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
         self.loading = true;
@@ -1324,6 +1381,7 @@ impl DiffViewer {
     /// its repository query completes (for example a commit or stash diff).
     /// Every later selection invalidates the returned generation.
     pub fn begin_diff_request(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.text_selection = None;
         self.generation = self.generation.wrapping_add(1);
         self.preparation_generation = self.preparation_generation.wrapping_add(1);
         self.loading = true;
@@ -1372,6 +1430,7 @@ impl DiffViewer {
     }
 
     fn handle_line_click(&mut self, row_ix: usize, shift: bool, cx: &mut Context<Self>) {
+        self.text_selection = None;
         // The keyboard cursor follows the pointer, so arrow keys carry on from
         // the clicked line rather than from wherever the cursor was left.
         self.highlighted_row = Some(row_ix);
@@ -1394,8 +1453,31 @@ impl DiffViewer {
         self.handle_line_click(row_ix, shift, cx);
     }
 
-    fn extend_mouse_selection(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+    fn extend_mouse_selection_at(
+        &mut self,
+        row_ix: usize,
+        position: gpui::Point<gpui::Pixels>,
+        layouts: &TextLayouts,
+        cx: &mut Context<Self>,
+    ) {
         if !self.mouse_selecting {
+            return;
+        }
+        if let Some(selection) = self.text_selection {
+            if let Some(text) = self.text_at(row_ix, selection.lane) {
+                if let Some(layout) = layouts.borrow().get(&(row_ix, selection.lane)) {
+                    let (Ok(byte) | Err(byte)) = layout.index_for_position(position);
+                    let byte = formatting::expand_tabs(text).display_to_raw(byte);
+                    self.extend_text_selection(TextPoint { row: row_ix, byte }, selection.lane, cx);
+                }
+            }
+            return;
+        }
+        self.extend_mouse_selection(row_ix, cx);
+    }
+
+    fn extend_mouse_selection(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+        if !self.mouse_selecting || self.text_selection.is_some() {
             return;
         }
         let anchor = self.selection_anchor.unwrap_or(row_ix);
@@ -1404,6 +1486,86 @@ impl DiffViewer {
         if self.selected_lines.as_ref() != Some(&range) {
             self.selected_lines = Some(range);
             cx.notify();
+        }
+    }
+
+    fn text_at(&self, row: usize, lane: &str) -> Option<&str> {
+        match self.display_mode {
+            DiffDisplayMode::Unified => match self.display_rows.get(row)? {
+                DisplayRow::Line { styled, .. } => Some(&styled.text),
+                _ => None,
+            },
+            DiffDisplayMode::SideBySide => match self.sbs_rows.get(row)? {
+                SideBySideRow::Pair {
+                    left_styled,
+                    right_styled,
+                    left_kind,
+                    right_kind,
+                    ..
+                } => {
+                    let (styled, kind) = if lane == "sbs-left" {
+                        (left_styled, left_kind)
+                    } else {
+                        (right_styled, right_kind)
+                    };
+                    (*kind != SideBySideLineKind::Empty).then_some(styled.text.as_ref())
+                }
+                _ => None,
+            },
+            DiffDisplayMode::ThreeWay => match self.three_way_rows.get(row)? {
+                ThreeWayRow::Triple {
+                    left_styled,
+                    mid_styled,
+                    right_styled,
+                    left_num,
+                    mid_num,
+                    right_num,
+                    ..
+                } => {
+                    let (styled, number) = match lane {
+                        "tw-left" => (left_styled, left_num),
+                        "tw-mid" => (mid_styled, mid_num),
+                        _ => (right_styled, right_num),
+                    };
+                    number.map(|_| styled.text.as_ref())
+                }
+                _ => None,
+            },
+        }
+    }
+
+    fn begin_text_selection(
+        &mut self,
+        point: TextPoint,
+        lane: &'static str,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let anchor = self
+            .text_selection
+            .filter(|selection| shift && selection.lane == lane)
+            .map_or(point, |selection| selection.anchor);
+        self.text_selection = Some(TextSelection {
+            lane,
+            anchor,
+            head: point,
+        });
+        self.selected_lines = None;
+        self.selection_anchor = None;
+        self.highlighted_row = Some(point.row);
+        self.mouse_selecting = true;
+        cx.notify();
+    }
+
+    fn extend_text_selection(&mut self, point: TextPoint, lane: &str, cx: &mut Context<Self>) {
+        if !self.mouse_selecting {
+            return;
+        }
+        if let Some(selection) = self.text_selection.as_mut() {
+            if selection.lane == lane && selection.head != point {
+                selection.head = point;
+                cx.notify();
+            }
         }
     }
 
@@ -1420,6 +1582,17 @@ impl DiffViewer {
     }
 
     fn copy_selected_lines(&self, cx: &mut Context<Self>) {
+        if let Some(selection) = self.text_selection {
+            let (start, end) = selection.bounds();
+            let text = selection.copy_from(
+                (start.row..=end.row)
+                    .filter_map(|row| self.text_at(row, selection.lane).map(|text| (row, text))),
+            );
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         let range = match &self.selected_lines {
             Some(r) => r.clone(),
             None => return,
@@ -1690,6 +1863,7 @@ impl DiffViewer {
     /// Moves the cursor to `row`, scrolling only as far as needed to keep it on
     /// screen.
     fn step_cursor_to(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.text_selection = None;
         self.highlighted_row = Some(row);
         self.scroll_row_into_view(row, ScrollStrategy::Nearest, cx);
         cx.notify();
@@ -1697,6 +1871,7 @@ impl DiffViewer {
 
     /// Moves the cursor to `row`, bringing it to the top of the viewport.
     fn highlight_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.text_selection = None;
         self.highlighted_row = Some(row);
         self.scroll_row_into_view(row, ScrollStrategy::Top, cx);
         cx.notify();
@@ -1757,6 +1932,7 @@ impl DiffViewer {
         if self.display_mode == DiffDisplayMode::ThreeWay || self.is_image_diff() {
             return;
         }
+        self.text_selection = None;
         self.partial_mode = !self.partial_mode;
         if !self.partial_mode {
             self.selected_lines = None;
@@ -1767,6 +1943,7 @@ impl DiffViewer {
 
     /// Selects every row in the diff.
     pub fn select_all_lines(&mut self, cx: &mut Context<Self>) {
+        self.text_selection = None;
         let row_count = self.row_count();
         if row_count == 0 {
             return;
@@ -2190,6 +2367,7 @@ impl DiffViewer {
     }
 
     pub fn toggle_display_mode(&mut self, cx: &mut Context<Self>) {
+        self.text_selection = None;
         // A three-way conflict has no unified/side-by-side representation, so the
         // toggle is inert while one is shown — flipping to Unified would render an
         // empty diff.
@@ -2582,17 +2760,7 @@ impl DiffViewer {
 
     fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
         let assets = Self::syntax_assets();
-        assets
-            .syntax_set
-            .find_syntax_for_file(Path::new(path))
-            .ok()
-            .flatten()
-            .or_else(|| {
-                Path::new(path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| assets.syntax_set.find_syntax_by_token(name))
-            })
+        syntax::syntax_for_path(&assets.syntax_set, path)
             .or_else(|| {
                 // Fallback: map common extensions that syntect's defaults don't cover
                 // to the closest available syntax grammar.
@@ -2705,7 +2873,7 @@ impl DiffViewer {
     }
 
     fn highlight_text(text: &str, highlighter: &mut SyntaxLineHighlighter) -> StyledLine {
-        let trimmed = text.trim_end();
+        let trimmed = formatting::line_content(text);
         if trimmed.is_empty() {
             return StyledLine::plain(trimmed.to_string());
         }
@@ -2780,7 +2948,9 @@ impl DiffViewer {
                 .enumerate()
                 .map(|(i, row)| {
                     let len = match row {
-                        DisplayRow::Line { styled, .. } => styled.text.len(),
+                        DisplayRow::Line { styled, .. } => {
+                            formatting::expand_tabs(&styled.text).text.len()
+                        }
                         DisplayRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
@@ -2797,7 +2967,10 @@ impl DiffViewer {
                             left_styled,
                             right_styled,
                             ..
-                        } => left_styled.text.len().max(right_styled.text.len()),
+                        } => formatting::expand_tabs(&left_styled.text)
+                            .text
+                            .len()
+                            .max(formatting::expand_tabs(&right_styled.text).text.len()),
                         SideBySideRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
@@ -2815,11 +2988,11 @@ impl DiffViewer {
                             mid_styled,
                             right_styled,
                             ..
-                        } => left_styled
+                        } => formatting::expand_tabs(&left_styled.text)
                             .text
                             .len()
-                            .max(mid_styled.text.len())
-                            .max(right_styled.text.len()),
+                            .max(formatting::expand_tabs(&mid_styled.text).text.len())
+                            .max(formatting::expand_tabs(&right_styled.text).text.len()),
                         ThreeWayRow::HunkHeader { .. } => 0,
                     };
                     (i, len)
@@ -2837,8 +3010,16 @@ impl DiffViewer {
         typography: &CodeTypography,
         ink: &InkCache,
         default_color: gpui::Hsla,
-        wrap: bool,
+        interaction: TextInteraction,
     ) -> gpui::AnyElement {
+        let wrap = interaction.wrap;
+        let mut text = std::borrow::Cow::Borrowed(text);
+        if let Some(selection) = interaction.selection.filter(|s| s.lane == interaction.lane) {
+            if let Some(range) = selection.range_on(interaction.row, &text.text) {
+                text.to_mut()
+                    .apply_selection(range, interaction.selection_bg);
+            }
+        }
         // Runs (colors / font) are built from this style. StyledText's layout
         // reads `window.text_style()` — NOT this local — for white_space,
         // line_height, etc., so we also push those onto the ancestor div below.
@@ -2846,7 +3027,25 @@ impl DiffViewer {
         let run_style =
             typography.run_style(window.text_style(), ink.get(default_color, background));
 
-        let styled_text = StyledText::new(text.text.clone());
+        let display = formatting::expand_tabs(&text.text);
+        let display_string: SharedString = match &display.text {
+            std::borrow::Cow::Borrowed(_) => text.text.clone(),
+            std::borrow::Cow::Owned(value) => value.clone().into(),
+        };
+        let styled_text = StyledText::new(display_string);
+        let layout_down = styled_text.layout().clone();
+        let layout_move = layout_down.clone();
+        interaction
+            .layouts
+            .borrow_mut()
+            .insert((interaction.row, interaction.lane), layout_down.clone());
+        let down_view = interaction.view.clone();
+        let move_view = interaction.view;
+        let row = interaction.row;
+        let lane = interaction.lane;
+        let partial_mode = interaction.partial_mode;
+        let down_text = text.text.clone();
+        let move_text = down_text.clone();
         // Guard: if text is empty but highlights exist, GPUI panics on
         // StyledText::with_default_highlights (Text: '', run: len: N).
         // This can happen with word-level diff on whitespace-only lines.
@@ -2854,7 +3053,7 @@ impl DiffViewer {
         // syntect palette's nominal background. Selection replaces the row fill.
         let highlights = text.highlights.iter().map(|(range, style)| {
             (
-                range.clone(),
+                display.raw_range_to_display(range.clone()),
                 ink.highlight(*style, default_color, background),
             )
         });
@@ -2867,6 +3066,50 @@ impl DiffViewer {
                 .with_default_highlights(&run_style, highlights)
                 .into_any_element()
         };
+
+        let styled = div()
+            .id(ElementId::NamedInteger(lane.into(), row as u64))
+            .min_h(px(row_height))
+            .cursor(CursorStyle::IBeam)
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    if partial_mode {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let (Ok(byte) | Err(byte)) = layout_down.index_for_position(event.position);
+                    let byte = formatting::expand_tabs(&down_text).display_to_raw(byte);
+                    down_view
+                        .update(cx, |this, cx| {
+                            this.focus_handle.focus(window, cx);
+                            this.begin_text_selection(
+                                TextPoint { row, byte },
+                                lane,
+                                event.modifiers.shift,
+                                cx,
+                            );
+                        })
+                        .ok();
+                },
+            )
+            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+                if partial_mode || !event.dragging() {
+                    return;
+                }
+                let (Ok(byte) | Err(byte)) = layout_move.index_for_position(event.position);
+                let byte = formatting::expand_tabs(&move_text).display_to_raw(byte);
+                let selecting_text = move_view
+                    .update(cx, |this, cx| {
+                        this.extend_text_selection(TextPoint { row, byte }, lane, cx);
+                        this.text_selection.is_some()
+                    })
+                    .unwrap_or(false);
+                if selecting_text {
+                    cx.stop_propagation();
+                }
+            })
+            .child(styled);
 
         // The text layouter reads `window.text_style()` at its request_layout
         // time, so white_space and line_height must be on an ancestor div via
@@ -3836,6 +4079,9 @@ impl Render for DiffViewer {
         let highlight_bg = surfaces.active;
         let selection_bg = surfaces.selected;
         let selected_lines = self.selected_lines.clone();
+        let text_selection = self.text_selection;
+        let text_layouts = TextLayouts::default();
+        let partial_mode = self.partial_mode;
         let display_longest_row_ix = self.display_longest_row_ix;
 
         // Restore the top row after a mode/metric change, not merely its visibility.
@@ -4043,6 +4289,7 @@ impl Render for DiffViewer {
 
                                     let view_line = view.clone();
                                     let view_line_drag = view.clone();
+                                    let drag_layouts = text_layouts.clone();
                                     let mut row_div = div()
                                         .id(ElementId::NamedInteger(
                                             "diff-line".into(),
@@ -4070,7 +4317,7 @@ impl Render for DiffViewer {
                                                 if event.dragging() {
                                                     view_line_drag
                                                         .update(cx, |this, cx| {
-                                                            this.extend_mouse_selection(i, cx);
+                                                            this.extend_mouse_selection_at(i, event.position, &drag_layouts, cx);
                                                         })
                                                         .ok();
                                                 }
@@ -4140,7 +4387,8 @@ impl Render for DiffViewer {
                                             .min_w_0()
                                             .pl(px(8.))
                                             .child(Self::render_styled_text(
-                                                window, styled, effective_bg, &typography, &ink, text_color, true,
+                                                window, styled, effective_bg, &typography, &ink, text_color,
+                                                TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: "unified", partial_mode, selection_bg, wrap: true },
                                             ))
                                             .into_any_element()
                                     } else {
@@ -4150,7 +4398,8 @@ impl Render for DiffViewer {
                                             .pl(px(8.))
                                             .pr(px(12.))
                                             .child(Self::render_styled_text(
-                                                window, styled, effective_bg, &typography, &ink, text_color, false,
+                                                window, styled, effective_bg, &typography, &ink, text_color,
+                                                TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: "unified", partial_mode, selection_bg, wrap: false },
                                             ))
                                             .into_any_element()
                                     };
@@ -4407,6 +4656,7 @@ impl Render for DiffViewer {
 
                                     let view_sbs_line = view.clone();
                                     let view_sbs_line_drag = view.clone();
+                                    let drag_layouts = text_layouts.clone();
                                     let mut row_div = div()
                                         .id(ElementId::NamedInteger(
                                             "sbs-line".into(),
@@ -4434,7 +4684,7 @@ impl Render for DiffViewer {
                                                 if event.dragging() {
                                                     view_sbs_line_drag
                                                         .update(cx, |this, cx| {
-                                                            this.extend_mouse_selection(i, cx);
+                                                            this.extend_mouse_selection_at(i, event.position, &drag_layouts, cx);
                                                         })
                                                         .ok();
                                                 }
@@ -4506,7 +4756,7 @@ impl Render for DiffViewer {
                                                     &typography,
                                                     &ink,
                                                     text_color,
-                                                    true,
+                                                    TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: side, partial_mode, selection_bg, wrap: true },
                                                 ));
                                             div()
                                                 .h_flex()
@@ -4542,7 +4792,7 @@ impl Render for DiffViewer {
                                                     &typography,
                                                     &ink,
                                                     text_color,
-                                                    false,
+                                                    TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: side, partial_mode, selection_bg, wrap: false },
                                                 ));
                                             div()
                                                 .h_flex()
@@ -4893,6 +5143,7 @@ impl Render for DiffViewer {
 
                                     let view_row = view.clone();
                                     let view_row_drag = view.clone();
+                                    let drag_layouts = text_layouts.clone();
                                     let mut row_div = div()
                                         .id(ElementId::NamedInteger("tw-row".into(), i as u64))
                                         .w_full()
@@ -4923,7 +5174,7 @@ impl Render for DiffViewer {
                                                 if event.dragging() {
                                                     view_row_drag
                                                         .update(cx, |this, cx| {
-                                                            this.extend_mouse_selection(i, cx);
+                                                            this.extend_mouse_selection_at(i, event.position, &drag_layouts, cx);
                                                         })
                                                         .ok();
                                                 }
@@ -4972,7 +5223,7 @@ impl Render for DiffViewer {
                                                     &typography,
                                                     &ink,
                                                     text_color,
-                                                    true,
+                                                    TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: side, partial_mode, selection_bg, wrap: true },
                                                 ));
                                             let mut col = div()
                                                 .flex_1()
@@ -5014,7 +5265,7 @@ impl Render for DiffViewer {
                                                     &typography,
                                                     &ink,
                                                     text_color,
-                                                    false,
+                                                    TextInteraction { layouts: text_layouts.clone(), view: view.clone(), selection: text_selection, row: i, lane: side, partial_mode, selection_bg, wrap: false },
                                                 ));
                                             let mut col = div()
                                                 .flex_1()
@@ -5472,6 +5723,33 @@ impl Render for DiffViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_highlights_gaps_between_sparse_word_diff_spans() {
+        let word_bg = gpui::hsla(0.2, 0.7, 0.3, 1.0);
+        let selection_bg = gpui::hsla(0.6, 0.7, 0.3, 1.0);
+        let mut line = StyledLine::plain("before changed after");
+        line.highlights.push((
+            7..14,
+            HighlightStyle {
+                background_color: Some(word_bg),
+                ..HighlightStyle::default()
+            },
+        ));
+        line.apply_selection(2..18, selection_bg);
+        for byte in 0..line.text.len() {
+            let style = line
+                .highlights
+                .iter()
+                .find(|(range, _)| range.contains(&byte))
+                .unwrap()
+                .1;
+            assert_eq!(
+                style.background_color,
+                (2..18).contains(&byte).then_some(selection_bg)
+            );
+        }
+    }
 
     #[test]
     fn horizontal_width_is_seeded_from_code_not_a_clipped_heading() {
@@ -7908,6 +8186,136 @@ mod view_tests {
 
             assert_eq!(cursor_and_top_row(&probe), (Some(top_before), top_before));
         }
+    }
+
+    #[test]
+    fn character_selection_copies_a_fragment_and_preserves_raw_tabs() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        let mut diff = one_hunk_diff();
+        diff.hunks[0].lines[1] = DiffLine::Addition("\treturn \"世界\"  ".into());
+        show(&mut probe, diff, DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.begin_text_selection(
+                    super::TextPoint { row: 2, byte: 1 },
+                    "unified",
+                    false,
+                    cx,
+                );
+                viewer.extend_text_selection(super::TextPoint { row: 2, byte: 7 }, "unified", cx);
+                viewer.copy_selection(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("return")
+                );
+                assert!(viewer.selected_lines.is_none());
+                assert_eq!(viewer.highlighted_row, Some(2));
+
+                // Reverse drag includes the original tab, not four display spaces.
+                viewer.begin_text_selection(
+                    super::TextPoint { row: 2, byte: 8 },
+                    "unified",
+                    false,
+                    cx,
+                );
+                viewer.extend_text_selection(super::TextPoint { row: 2, byte: 0 }, "unified", cx);
+                viewer.copy_selection(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("\treturn ")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn split_copy_skips_padding_but_keeps_real_empty_source_lines() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.display_mode = super::DiffDisplayMode::SideBySide;
+                let pair = |left: Option<&str>| super::SideBySideRow::Pair {
+                    left_num: left.map(|_| 1),
+                    left_styled: super::StyledLine::plain(left.unwrap_or("").to_owned()),
+                    left_kind: if left.is_some() {
+                        super::SideBySideLineKind::Context
+                    } else {
+                        super::SideBySideLineKind::Empty
+                    },
+                    right_num: Some(1),
+                    right_styled: super::StyledLine::plain("right"),
+                    right_kind: super::SideBySideLineKind::Context,
+                };
+                viewer.sbs_rows = std::sync::Arc::new(vec![
+                    pair(Some("a")),
+                    pair(None),
+                    pair(Some("")),
+                    pair(Some("b")),
+                ]);
+                viewer.begin_text_selection(
+                    super::TextPoint { row: 0, byte: 0 },
+                    "sbs-left",
+                    false,
+                    cx,
+                );
+                viewer.extend_text_selection(super::TextPoint { row: 3, byte: 1 }, "sbs-left", cx);
+                viewer.copy_selection(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("a\n\nb")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn text_selection_stays_in_its_column_and_shift_extends_it() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                viewer.toggle_display_mode(cx);
+                let anchor = super::TextPoint { row: 1, byte: 1 };
+                viewer.begin_text_selection(anchor, "sbs-left", false, cx);
+                viewer.extend_text_selection(super::TextPoint { row: 2, byte: 5 }, "sbs-right", cx);
+                assert_eq!(viewer.text_selection.unwrap().head, anchor);
+                let head = super::TextPoint { row: 1, byte: 5 };
+                viewer.begin_text_selection(head, "sbs-left", true, cx);
+                let selection = viewer.text_selection.unwrap();
+                assert_eq!(selection.anchor, anchor);
+                assert_eq!(selection.head, head);
+            });
+        });
+    }
+
+    #[test]
+    fn gutter_mode_and_file_changes_clear_character_selection() {
+        let mut probe = ViewTest::open(StagingProbe::new);
+        show(&mut probe, one_hunk_diff(), DiffSource::Worktree);
+        probe.draw();
+        probe.update(|probe, _, cx| {
+            probe.viewer.update(cx, |viewer, cx| {
+                let point = super::TextPoint { row: 1, byte: 2 };
+                viewer.begin_text_selection(point, "unified", false, cx);
+                viewer.begin_mouse_selection(2, false, cx);
+                assert!(viewer.text_selection.is_none());
+                assert_eq!(viewer.selected_lines, Some(2..3));
+                viewer.begin_text_selection(point, "unified", false, cx);
+                viewer.toggle_partial_mode(cx);
+                assert!(viewer.text_selection.is_none());
+                viewer.begin_text_selection(point, "unified", false, cx);
+                viewer.toggle_display_mode(cx);
+                assert!(viewer.text_selection.is_none());
+                viewer.begin_text_selection(point, "sbs-left", false, cx);
+                viewer.set_diff_loading("other.go".into(), DiffSource::Worktree, cx);
+                assert!(viewer.text_selection.is_none());
+                assert!(!viewer.mouse_selecting);
+            });
+        });
     }
 
     #[test]
