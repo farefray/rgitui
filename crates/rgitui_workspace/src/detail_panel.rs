@@ -147,6 +147,8 @@ fn format_absolute_date(timestamp: i64) -> String {
 pub enum WorkingChangesAction {
     StageFile(String),
     UnstageFile(String),
+    StageFiles(Vec<std::path::PathBuf>),
+    UnstageFiles(Vec<std::path::PathBuf>),
     DiscardFile(String),
     StageAll,
     UnstageAll,
@@ -165,6 +167,9 @@ enum WorkingRow {
         count: usize,
         /// Every file below, by kind, whether or not the folder is collapsed.
         tally: working_tree::ChangeTally,
+        /// Literal paths from this section's full status snapshot, not just
+        /// visible/search-matching rows. Arc keeps ordinary renders cheap.
+        action_paths: Arc<Vec<std::path::PathBuf>>,
         staged: bool,
         collapsed: bool,
     },
@@ -315,6 +320,7 @@ fn working_tree_rows(
                     depth: *depth,
                     count: *count,
                     tally: tallies[index],
+                    action_paths: Arc::new(working_tree::directory_paths(files, path)),
                     staged,
                     collapsed: matches.is_none() && collapsed[section].contains(path),
                 },
@@ -1839,7 +1845,9 @@ impl Render for DetailPanel {
                                             }).ok();
                                         }))
                             }
-                            WorkingRow::Directory { path, name, depth, count, tally, staged, collapsed } => {
+                            WorkingRow::Directory { path, name, depth, count, tally, action_paths, staged, collapsed } => {
+                                let action_checkout = checkout.clone();
+                                let action_weak = weak.clone();
                                 div().id(row).h_flex().w_full().h(px(32.))
                                     .pl(px(10. + depth as f32 * 16.)).pr(px(10.)).gap(px(6.))
                                     .hover(move |style| style.bg(hover_bg)).cursor_pointer()
@@ -1849,6 +1857,23 @@ impl Render for DetailPanel {
                                     .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
                                     .child(div().flex_1().min_w_0().child(Label::new(name).size(LabelSize::Small).truncate()))
                                     .child(ChangeTallySummary(tally))
+                                    // Always visible, including on collapsed folders. Clicking
+                                    // the action must not also toggle the folder's expansion.
+                                    .child(IconButton::new(ElementId::NamedInteger("working-folder-stage".into(), row as u64), if staged { IconName::Minus } else { IconName::Plus })
+                                        .size(ButtonSize::Compact)
+                                        .color(if staged { Color::Muted } else { Color::Added })
+                                        .disabled(action_paths.is_empty())
+                                        .tooltip(if staged { t!("detail.unstage_folder.tooltip") } else { t!("detail.stage_folder.tooltip") })
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            if action_paths.is_empty() { return; }
+                                            action_weak.update(cx, |_, cx| {
+                                                cx.emit(DetailPanelEvent::WorkingAction {
+                                                    checkout: action_checkout.clone(),
+                                                    action: if staged { WorkingChangesAction::UnstageFiles(action_paths.as_ref().clone()) } else { WorkingChangesAction::StageFiles(action_paths.as_ref().clone()) },
+                                                });
+                                            }).ok();
+                                        }))
                                     .on_click(move |_: &ClickEvent, window, cx| {
                                         weak.update(cx, |this, cx| {
                                             this.focus_handle.focus(window, cx);
@@ -2864,6 +2889,61 @@ mod tests {
                 "src/nested/deep/new name-λ.rs",
             ]
         );
+    }
+
+    #[test]
+    fn working_folder_actions_keep_full_section_snapshot_when_collapsed_or_searched() {
+        let file = |path: &str| rgitui_git::FileStatus {
+            path: path.into(),
+            kind: FileChangeKind::Modified,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+        };
+        let status = rgitui_git::WorkingTreeStatus {
+            staged: vec![file("src/a.rs"), file("src/staged.rs")],
+            unstaged: vec![
+                file("src/a.rs"),
+                file("src/nested/unstaged.rs"),
+                file("src-other/no.rs"),
+            ],
+        };
+        let trees = [&status.staged, &status.unstaged].map(|files| {
+            working_tree::build_tree(
+                &files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let collapsed = [HashSet::from(["src".into()]), HashSet::from(["src".into()])];
+        for query in [None, Some("a.rs")] {
+            let rows = working_tree_rows(&status, &trees, &collapsed, query);
+            for (staged, expected) in [
+                (true, vec!["src/a.rs", "src/staged.rs"]),
+                (false, vec!["src/a.rs", "src/nested/unstaged.rs"]),
+            ] {
+                let action_paths = rows
+                    .iter()
+                    .find_map(|row| match row {
+                        WorkingRow::Directory {
+                            path,
+                            staged: source,
+                            action_paths,
+                            ..
+                        } if path == "src" && *source == staged => Some(action_paths),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    **action_paths,
+                    expected
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

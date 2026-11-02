@@ -372,6 +372,59 @@ fn remove_linked_worktree(repo_path: &Path, worktree_path: &Path, name: &str) ->
     }
 }
 
+/// Restore only these literal index entries from HEAD. `reset_default` accepts
+/// pathspecs, so names such as `[ab]` could otherwise unstage sibling folders.
+/// No checkout operation is performed: working-tree bytes remain untouched.
+fn unstage_literal_files(repo: &Repository, paths: &[PathBuf]) -> Result<()> {
+    let mut head_index = git2::Index::new()?;
+    match repo.head() {
+        Ok(head) => head_index.read_tree(&head.peel_to_tree()?)?,
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut index = repo.index()?;
+    index.read(true)?;
+    let requested_entries: std::collections::HashSet<_> = paths
+        .iter()
+        .filter_map(|path| index.get_path(path, 0).map(|entry| entry.path))
+        .collect();
+    // Preflight before changing anything: a queued action must not resolve a
+    // newly introduced conflict or let index.add remove an unrelated entry
+    // during a file/directory replacement.
+    for path in paths {
+        if index.conflict_get(path).is_ok() {
+            return Err(error(msg!("git.error.unresolved_conflicts")));
+        }
+        if let Some(restored) = head_index.get_path(path, 0) {
+            for current in index.iter() {
+                let ancestor = |parent: &[u8], child: &[u8]| {
+                    child.starts_with(parent) && child.get(parent.len()) == Some(&b'/')
+                };
+                if !requested_entries.contains(&current.path)
+                    && (ancestor(&current.path, &restored.path)
+                        || ancestor(&restored.path, &current.path))
+                {
+                    return Err(error(msg!(
+                        "git.error.unstage_collision",
+                        path = path.display(),
+                        other = String::from_utf8_lossy(&current.path).into_owned()
+                    )));
+                }
+            }
+        }
+    }
+    for path in paths {
+        if index.get_path(path, 0).is_some() {
+            index.remove_path(path)?;
+        }
+        if let Some(entry) = head_index.get_path(path, 0) {
+            index.add(&entry)?;
+        }
+    }
+    index.write()?;
+    Ok(())
+}
+
 impl GitProject {
     /// Stage specific files in the given worktree.
     pub fn stage_files_at(
@@ -498,21 +551,7 @@ impl GitProject {
                 .background_executor()
                 .spawn(async move {
                     let repo = Repository::open(&worktree_path)?;
-                    if let Ok(head_tree) = repo.head().and_then(|h| h.peel_to_tree()) {
-                        repo.reset_default(Some(&head_tree.into_object()), &task_paths)?;
-                    } else {
-                        let mut index = repo.index()?;
-                        for path in &task_paths {
-                            if let Err(e) = index.remove_path(path) {
-                                log::warn!(
-                                    "Failed to remove path from index during unstage: {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                        }
-                        index.write()?;
-                    }
+                    unstage_literal_files(&repo, &task_paths)?;
                     gather_refresh_data_lightweight_cached(
                         &refresh_repo_path,
                         commit_limit,
@@ -8179,6 +8218,136 @@ mod tests {
         let index = repo.index().unwrap();
         let entry = index.get_path(std::path::Path::new("file.txt"), 0).unwrap();
         assert_eq!(repo.find_blob(entry.id).unwrap().content(), b"incoming\n");
+    }
+
+    #[test]
+    fn unstage_literal_files_restores_head_entries_without_touching_worktree_or_siblings() {
+        let fixture = TempRepo::init();
+        for path in [
+            "src/[ab]/file.txt",
+            "src/[ab]/deleted.txt",
+            "src/a/file.txt",
+        ] {
+            fixture.write_file(path, "base\n");
+            fixture.stage(path);
+        }
+        fixture.commit("base");
+        fixture.write_file("src/[ab]/file.txt", "staged\n");
+        fixture.stage("src/[ab]/file.txt");
+        fixture.write_file("src/[ab]/file.txt", "unstaged\n");
+        fixture.write_file("src/[ab]/new.txt", "new\n");
+        fixture.stage("src/[ab]/new.txt");
+        fs::remove_file(fixture.path().join("src/[ab]/deleted.txt")).unwrap();
+        fixture.write_file("src/a/file.txt", "sibling staged\n");
+        fixture.stage("src/a/file.txt");
+        let repo = fixture.repo();
+        let mut index = repo.index().unwrap();
+        index
+            .remove_path(std::path::Path::new("src/[ab]/deleted.txt"))
+            .unwrap();
+        index.write().unwrap();
+        let paths = [
+            "src/[ab]/file.txt",
+            "src/[ab]/deleted.txt",
+            "src/[ab]/new.txt",
+        ]
+        .map(std::path::PathBuf::from);
+        super::unstage_literal_files(repo, &paths).unwrap();
+        let index = repo.index().unwrap();
+        for path in &paths[..2] {
+            let entry = index.get_path(path, 0).unwrap();
+            assert_eq!(repo.find_blob(entry.id).unwrap().content(), b"base\n");
+        }
+        assert!(index.get_path(&paths[2], 0).is_none());
+        let sibling = index
+            .get_path(std::path::Path::new("src/a/file.txt"), 0)
+            .unwrap();
+        assert_eq!(
+            repo.find_blob(sibling.id).unwrap().content(),
+            b"sibling staged\n"
+        );
+        assert_eq!(
+            fs::read(fixture.path().join(&paths[0])).unwrap(),
+            b"unstaged\n"
+        );
+        assert!(!fixture.path().join(&paths[1]).exists());
+        assert_eq!(fs::read(fixture.path().join(&paths[2])).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn unstage_literal_files_handles_unborn_head_and_preserves_other_entries() {
+        let fixture = TempRepo::init();
+        for path in ["folder/one.txt", "other/two.txt"] {
+            fixture.write_file(path, "new\n");
+            fixture.stage(path);
+        }
+        let repo = fixture.repo();
+        let path = std::path::PathBuf::from("folder/one.txt");
+        super::unstage_literal_files(repo, std::slice::from_ref(&path)).unwrap();
+        // Repeating a stale request is harmless, not an ignored index error.
+        super::unstage_literal_files(repo, std::slice::from_ref(&path)).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(&path, 0).is_none());
+        assert!(index
+            .get_path(std::path::Path::new("other/two.txt"), 0)
+            .is_some());
+        assert_eq!(fs::read(fixture.path().join(path)).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn unstage_literal_files_refuses_collisions_outside_requested_paths() {
+        let fixture = TempRepo::init();
+        fixture.commit_file("top/sub/file.txt", "base\n", "base");
+        fs::remove_dir_all(fixture.path().join("top")).unwrap();
+        fixture.write_file("top", "replacement\n");
+        assert!(run_git(fixture.path(), &["add", "-A"]).status.success());
+        let repo = fixture.repo();
+        let before = fs::read(repo.path().join("index")).unwrap();
+        let restored = std::path::PathBuf::from("top/sub/file.txt");
+        let error =
+            super::unstage_literal_files(repo, std::slice::from_ref(&restored)).unwrap_err();
+        assert!(error.to_string().contains("Unstage both paths together"));
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), before);
+        assert_eq!(
+            fs::read(fixture.path().join("top")).unwrap(),
+            b"replacement\n"
+        );
+        // Explicitly selecting both sides of the replacement is allowed.
+        super::unstage_literal_files(repo, &["top".into(), restored]).unwrap();
+        assert!(repo
+            .index()
+            .unwrap()
+            .get_path(std::path::Path::new("top/sub/file.txt"), 0)
+            .is_some());
+    }
+
+    #[test]
+    fn unstage_literal_files_refuses_new_conflicts_without_writing_index() {
+        let fixture = TempRepo::init();
+        fixture.commit_file("folder/file.txt", "base\n", "base");
+        let blob = fixture.repo().blob(b"conflict\n").unwrap();
+        install_index_conflict(&fixture, "folder/file.txt", 0o100644, blob, blob, blob);
+        let repo = fixture.repo();
+        let before = fs::read(repo.path().join("index")).unwrap();
+        assert!(super::unstage_literal_files(repo, &["folder/file.txt".into()]).is_err());
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), before);
+        assert!(repo.index().unwrap().has_conflicts());
+    }
+
+    #[test]
+    fn unstage_literal_files_targets_linked_checkout_only() {
+        let (fixture, checkout, base, _) = nested_checkout_fixture();
+        fs::write(checkout.join("file.txt"), "linked staged\n").unwrap();
+        let repo = git2::Repository::open(&checkout).unwrap();
+        let path = std::path::PathBuf::from("file.txt");
+        let mut index = repo.index().unwrap();
+        index.add_path(&path).unwrap();
+        index.write().unwrap();
+        super::unstage_literal_files(&repo, std::slice::from_ref(&path)).unwrap();
+        let entry = repo.index().unwrap().get_path(&path, 0).unwrap();
+        assert_eq!(repo.find_blob(entry.id).unwrap().content(), b"base\n");
+        assert_eq!(fs::read(checkout.join(path)).unwrap(), b"linked staged\n");
+        assert_owner_checkout_untouched(&fixture, base);
     }
 
     #[test]

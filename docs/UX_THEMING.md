@@ -143,7 +143,11 @@ working-changes list read as a wall of `Modified` pills with a `+` on every row.
   unstage and discard appear on hover or on the selected row. Folder rows
   summarize their descendants by kind (edits, additions, removals, conflicts),
   and a section with more than 24 files opens with its top-level folders
-  collapsed. Folder expansion is remembered per checkout across visits to
+  collapsed. Each folder has an always-visible `+` (Stage) or `−` (Unstage)
+  action for that section's changes throughout its subtree, including collapsed
+  and search-hidden files. Conflicts are excluded; conflict-only folders disable
+  the action. The action stays bound to the displayed checkout and does not
+  expand/collapse the folder. Folder expansion is remembered per checkout across visits to
   commits. Stage All is the section's tinted primary action; one Expand/Collapse
   All toggle sits beside Path/Tree. Commit file lists use the same status letter.
 - **Commit composer.** The description grows into the panel's spare height, and

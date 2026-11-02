@@ -2861,6 +2861,20 @@ pub(super) fn subscribe_detail_panel(
                                     .detach();
                             })
                         }
+                        WorkingChangesAction::StageFiles(paths) => {
+                            if !paths.is_empty() {
+                                project.update(cx, |project, cx| {
+                                    project.stage_files_at(paths, checkout, cx).detach();
+                                });
+                            }
+                        }
+                        WorkingChangesAction::UnstageFiles(paths) => {
+                            if !paths.is_empty() {
+                                project.update(cx, |project, cx| {
+                                    project.unstage_files_at(paths, checkout, cx).detach();
+                                });
+                            }
+                        }
                         WorkingChangesAction::StageAll => project.update(cx, |project, cx| {
                             project.stage_all_at(checkout, cx).detach();
                         }),

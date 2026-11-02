@@ -2,6 +2,9 @@
 
 ### Added
 
+- **Stage or unstage a folder in the Working changes tree.** Each folder has
+  a `+` or `−` action for its changes, including nested, collapsed and
+  search-hidden files. Conflicts remain excluded.
 - **The interface can be shown in another language.** *Settings → Appearance →
   Language* lists *Match system language* and every installed translation,
   each written in its own script with a count of the strings it still leaves
@@ -20,6 +23,9 @@
 
 ### Fixed
 
+- **Unstage individual files or folders safely.** Unstage now restores exact
+  index entries from HEAD instead of a tree passed as a reset target. Filenames
+  containing wildcard characters cannot accidentally unstage sibling paths.
 - **Retrying a failed force push pushed without `--force`.** The retry decided
   whether to force by looking for "force push" in the failure message, which
   never contained it, so the retry was a plain push that the remote rejected.

@@ -4,7 +4,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, PathBuf};
 
-use rgitui_git::FileChangeKind;
+use rgitui_git::{FileChangeKind, FileStatus};
+
+/// Snapshot literal changed file paths, not a directory pathspec. Folder actions
+/// include hidden descendants (collapse/search do not narrow the operation), but
+/// never resolve conflicts or include similarly named sibling directories.
+pub(super) fn directory_paths(files: &[FileStatus], directory: &str) -> Vec<PathBuf> {
+    let directory = PathBuf::from(directory);
+    files
+        .iter()
+        .filter(|file| file.kind != FileChangeKind::Conflicted && file.path.starts_with(&directory))
+        .map(|file| file.path.clone())
+        .collect()
+}
 
 /// Sections with more files than this open with their top-level folders
 /// collapsed, so the folder summaries fit on screen before any scrolling.
@@ -507,6 +519,39 @@ mod tests {
         assert!(!visible
             .iter()
             .any(|&row| matches!(rows[row], TreeRow::File { depth: 1, .. })));
+    }
+
+    #[test]
+    fn folder_actions_include_nested_changes_not_conflicts_or_siblings() {
+        use FileChangeKind::*;
+        let files = [
+            ("docs/work/direct.md", Modified),
+            ("docs/work/nested/new.md", Untracked),
+            ("docs/work/deleted.md", Deleted),
+            ("docs/work/conflict.md", Conflicted),
+            ("docs/work-other/no.md", Modified),
+            ("docs/other/no.md", Added),
+            ("root.txt", Modified),
+            ("docs/work/[literal]*.md", Modified),
+        ]
+        .map(|(path, kind)| FileStatus {
+            path: path.into(),
+            kind,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+        });
+        assert_eq!(
+            directory_paths(&files, "docs/work"),
+            vec![
+                PathBuf::from("docs/work/direct.md"),
+                PathBuf::from("docs/work/nested/new.md"),
+                PathBuf::from("docs/work/deleted.md"),
+                PathBuf::from("docs/work/[literal]*.md"),
+            ]
+        );
+        assert!(directory_paths(&files, "missing").is_empty());
+        assert!(directory_paths(&files[3..4], "docs/work").is_empty());
     }
 
     #[test]
