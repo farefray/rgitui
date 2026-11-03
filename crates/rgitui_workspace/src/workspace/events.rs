@@ -2603,6 +2603,10 @@ pub(super) fn subscribe_graph(
                         proj.checkout_commit_at(oid, &worktree_path, cx).detach();
                     });
                 }
+                GraphViewEvent::CopyRefName(name) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
+                    this.show_toast(t!("detail.copied"), ToastKind::Success, cx);
+                }
                 GraphViewEvent::CopyCommitSha(sha) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone()));
                     let short = &sha[..7.min(sha.len())];

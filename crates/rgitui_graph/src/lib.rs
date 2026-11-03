@@ -279,6 +279,25 @@ fn ref_entries(refs: &[RefLabel], checkouts: &HashMap<String, BranchCheckout>) -
     entries
 }
 
+/// Names belonging to the first branch in badge order. This keeps a commit with
+/// several refs deterministic and prefers a local branch over its remote ref.
+fn context_copy_names(
+    refs: &[RefLabel],
+    checkouts: &HashMap<String, BranchCheckout>,
+) -> (Option<String>, Option<String>) {
+    let branch = ref_entries(refs, checkouts)
+        .into_iter()
+        .find_map(|entry| match entry.label {
+            RefLabel::LocalBranch(name) | RefLabel::RemoteBranch(name) => Some(name),
+            _ => None,
+        });
+    let worktree = branch
+        .as_ref()
+        .and_then(|name| checkouts.get(name))
+        .map(|checkout| checkout.name.clone());
+    (branch, worktree)
+}
+
 /// Width of the commit graph context menu.
 const CONTEXT_MENU_WIDTH: f32 = 200.0;
 /// Height of a single context-menu action row (`.h(px(26.))`).
@@ -318,6 +337,8 @@ enum GraphMenuAction {
     InteractiveRebase,
     SquashSelected,
     CopySha,
+    CopyBranchName,
+    CopyWorktreeName,
     CopyMessage,
     CopyAuthor,
     CopyDate,
@@ -433,6 +454,16 @@ const GRAPH_MENU_ITEMS: &[GraphMenuItem] = &[
     )
     .grouped(),
     GraphMenuItem::new(
+        key!("graph.menu.copy_branch_name"),
+        IconName::Copy,
+        GraphMenuAction::CopyBranchName,
+    ),
+    GraphMenuItem::new(
+        key!("graph.menu.copy_worktree_name"),
+        IconName::Copy,
+        GraphMenuAction::CopyWorktreeName,
+    ),
+    GraphMenuItem::new(
         key!("graph.menu.copy_msg"),
         IconName::Edit,
         GraphMenuAction::CopyMessage,
@@ -472,6 +503,21 @@ fn menu_items_for_selection(selected_commits: usize) -> Vec<&'static GraphMenuIt
     GRAPH_MENU_ITEMS
         .iter()
         .filter(|item| squashable || item.action != GraphMenuAction::SquashSelected)
+        .collect()
+}
+
+/// Worktree rows expose only name-copy actions, never commit operations.
+fn menu_items_for_context(
+    selected_commits: usize,
+    menu: &ContextMenuState,
+) -> Vec<&'static GraphMenuItem> {
+    menu_items_for_selection(selected_commits)
+        .into_iter()
+        .filter(|item| match item.action {
+            GraphMenuAction::CopyBranchName => menu.branch_name.is_some(),
+            GraphMenuAction::CopyWorktreeName => menu.worktree_name.is_some(),
+            _ => menu.commit_index.is_some(),
+        })
         .collect()
 }
 
@@ -563,6 +609,7 @@ pub enum GraphViewEvent {
     /// Check out the commit itself, detaching HEAD ("Checkout commit").
     CheckoutCommit(git2::Oid),
     CopyCommitSha(String),
+    CopyRefName(String),
     CopyCommitMessage(String),
     CopyAuthorName(String),
     CopyDate(String),
@@ -661,8 +708,11 @@ fn worktree_list_index_for_path(
 
 /// State for the right-click context menu.
 struct ContextMenuState {
-    /// The index of the commit that was right-clicked.
-    commit_index: usize,
+    /// The commit that was right-clicked, or `None` for a worktree row.
+    commit_index: Option<usize>,
+    /// Raw names captured from the row, never truncated badge text.
+    branch_name: Option<String>,
+    worktree_name: Option<String>,
     /// Screen position where the menu should appear.
     position: Point<Pixels>,
 }
@@ -1598,13 +1648,30 @@ impl GraphView {
     /// The context-menu rows to show for the selection as it stands. See
     /// [`menu_items_for_selection`].
     fn context_menu_items(&self) -> Vec<&'static GraphMenuItem> {
-        menu_items_for_selection(self.selected_commit_count())
+        let Some(menu) = &self.context_menu else {
+            return Vec::new();
+        };
+        menu_items_for_context(self.selected_commit_count(), menu)
     }
 
-    /// The event a context-menu row emits, bound to the commit it was opened on.
-    fn menu_event(action: GraphMenuAction, commit: &CommitInfo) -> GraphViewEvent {
-        let oid = commit.oid;
+    /// The event a context-menu row emits, bound to the row it was opened on.
+    fn menu_event(
+        action: GraphMenuAction,
+        commit: Option<&CommitInfo>,
+        menu: &ContextMenuState,
+    ) -> Option<GraphViewEvent> {
         match action {
+            GraphMenuAction::CopyBranchName => {
+                return menu.branch_name.clone().map(GraphViewEvent::CopyRefName);
+            }
+            GraphMenuAction::CopyWorktreeName => {
+                return menu.worktree_name.clone().map(GraphViewEvent::CopyRefName);
+            }
+            _ => {}
+        }
+        let commit = commit?;
+        let oid = commit.oid;
+        Some(match action {
             GraphMenuAction::CherryPick => GraphViewEvent::CherryPick(oid),
             GraphMenuAction::Revert => GraphViewEvent::RevertCommit(oid),
             GraphMenuAction::Checkout => GraphViewEvent::CheckoutCommit(oid),
@@ -1626,7 +1693,8 @@ impl GraphView {
                 GraphViewEvent::CopyDate(commit.time.format("%Y-%m-%d %H:%M:%S").to_string())
             }
             GraphMenuAction::ViewOnGithub => GraphViewEvent::ViewOnGithub(oid),
-        }
+            GraphMenuAction::CopyBranchName | GraphMenuAction::CopyWorktreeName => return None,
+        })
     }
 
     fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
@@ -1637,8 +1705,15 @@ impl GraphView {
     }
 
     fn show_context_menu(&mut self, index: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(commit) = self.commits.get(index) else {
+            return;
+        };
+        let checkouts = branch_checkouts(&self.worktree_infos);
+        let (branch_name, worktree_name) = context_copy_names(&commit.refs, &checkouts);
         self.context_menu = Some(ContextMenuState {
-            commit_index: index,
+            commit_index: Some(index),
+            branch_name,
+            worktree_name,
             position,
         });
         cx.notify();
@@ -3660,123 +3735,125 @@ impl Render for GraphView {
 
         // Context menu overlay
         if let Some(ref menu_state) = self.context_menu {
-            if let Some(commit) = self.commits.get(menu_state.commit_index) {
-                let pos = menu_state.position;
-                let weak = cx.weak_entity();
+            let commit = menu_state
+                .commit_index
+                .and_then(|index| self.commits.get(index));
+            let pos = menu_state.position;
+            let weak = cx.weak_entity();
 
-                let menu_bg = colors.elevated_surface_background;
-                let menu_border = colors.border;
-                let menu_hover = colors.ghost_element_hover;
-                let menu_active = colors.ghost_element_active;
-                let menu_accent = colors.text_accent;
+            let menu_bg = colors.elevated_surface_background;
+            let menu_border = colors.border;
+            let menu_hover = colors.ghost_element_hover;
+            let menu_active = colors.ghost_element_active;
+            let menu_accent = colors.text_accent;
 
-                let items = self.context_menu_items();
+            let items = self.context_menu_items();
 
-                // Placement and visible height, clamped to the container. Shared
-                // with the dismiss hit-test so both agree on the menu rectangle.
-                let (clamped_x, clamped_y, menu_w, menu_h) = self.context_menu_geometry(pos);
+            // Placement and visible height, clamped to the container. Shared
+            // with the dismiss hit-test so both agree on the menu rectangle.
+            let (clamped_x, clamped_y, menu_w, menu_h) = self.context_menu_geometry(pos);
 
-                let mut menu = div()
-                    .id("graph-context-menu")
-                    .absolute()
-                    .left(clamped_x)
-                    .top(clamped_y)
-                    .v_flex()
-                    .min_w(menu_w)
-                    .max_h(menu_h)
-                    .overflow_y_scroll()
-                    .py(px(3.))
-                    .bg(menu_bg)
-                    .border_1()
-                    .border_color(menu_border)
-                    .rounded(px(6.))
-                    .elevation_3(cx)
-                    // Prevent left-click on menu from dismissing via container handler
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                            cx.stop_propagation();
-                        },
-                    )
-                    // Prevent right-click on menu from opening another menu
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
-                            cx.stop_propagation();
-                        },
-                    )
-                    // Prevent hover from leaking through to graph rows
-                    .on_mouse_move(|_: &MouseMoveEvent, _: &mut Window, cx: &mut App| {
+            let mut menu = div()
+                .id("graph-context-menu")
+                .absolute()
+                .left(clamped_x)
+                .top(clamped_y)
+                .v_flex()
+                .min_w(menu_w)
+                .max_h(menu_h)
+                .overflow_y_scroll()
+                .py(px(3.))
+                .bg(menu_bg)
+                .border_1()
+                .border_color(menu_border)
+                .rounded(px(6.))
+                .elevation_3(cx)
+                // Prevent left-click on menu from dismissing via container handler
+                .on_mouse_down(
+                    MouseButton::Left,
+                    |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
-                    });
+                    },
+                )
+                // Prevent right-click on menu from opening another menu
+                .on_mouse_down(
+                    MouseButton::Right,
+                    |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    },
+                )
+                // Prevent hover from leaking through to graph rows
+                .on_mouse_move(|_: &MouseMoveEvent, _: &mut Window, cx: &mut App| {
+                    cx.stop_propagation();
+                });
 
-                for (idx, item) in items.iter().enumerate() {
-                    if item.separator_before {
-                        menu = menu.child(
-                            div()
-                                .w_full()
-                                .h(px(1.))
-                                .my(px(2.))
-                                .mx(px(8.))
-                                .bg(colors.border_variant),
-                        );
-                    }
-
-                    // Built here rather than in the click handler so the row
-                    // captures the commit the menu was opened on, even if the
-                    // selection moves before the click lands.
-                    let event = Self::menu_event(item.action, commit);
-                    let weak = weak.clone();
-                    let (icon_color, label_color) = if item.destructive {
-                        (Color::Error, Color::Error)
-                    } else {
-                        (Color::Muted, Color::Default)
-                    };
-
+            for (idx, item) in items.iter().enumerate() {
+                if item.separator_before {
                     menu = menu.child(
                         div()
-                            .id(ElementId::NamedInteger("ctx-action".into(), idx as u64))
-                            .h_flex()
                             .w_full()
-                            .h(px(CONTEXT_MENU_ITEM_HEIGHT))
-                            .px(px(8.))
-                            .mx(px(4.))
-                            .gap(px(6.))
-                            .items_center()
-                            .cursor_pointer()
-                            .rounded(px(3.))
-                            .hover(move |s| s.bg(menu_hover).border_l_2().border_color(menu_accent))
-                            .active(move |s| s.bg(menu_active))
-                            .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                                let event = event.clone();
-                                weak.update(cx, |this: &mut GraphView, cx| {
-                                    this.context_menu = None;
-                                    cx.emit(event);
-                                    cx.notify();
-                                })
-                                .ok();
-                            })
-                            .child(
-                                Icon::new(item.icon)
-                                    .size(IconSize::XSmall)
-                                    .color(icon_color),
-                            )
-                            .child(
-                                Label::new(rgitui_i18n::translate(item.label))
-                                    .size(LabelSize::XSmall)
-                                    .color(label_color),
-                            ),
+                            .h(px(1.))
+                            .my(px(2.))
+                            .mx(px(8.))
+                            .bg(colors.border_variant),
                     );
                 }
 
-                let menu = menu.with_animation(
-                    "graph-context-menu-entrance",
-                    Animation::new(Duration::from_millis(100))
-                        .with_easing(|t| 1.0 - (1.0 - t).powi(5)),
-                    |el, delta| el.opacity(delta),
+                // Built here rather than in the click handler so the row
+                // captures the commit the menu was opened on, even if the
+                // selection moves before the click lands.
+                let Some(event) = Self::menu_event(item.action, commit, menu_state) else {
+                    continue;
+                };
+                let weak = weak.clone();
+                let (icon_color, label_color) = if item.destructive {
+                    (Color::Error, Color::Error)
+                } else {
+                    (Color::Muted, Color::Default)
+                };
+
+                menu = menu.child(
+                    div()
+                        .id(ElementId::NamedInteger("ctx-action".into(), idx as u64))
+                        .h_flex()
+                        .w_full()
+                        .h(px(CONTEXT_MENU_ITEM_HEIGHT))
+                        .px(px(8.))
+                        .mx(px(4.))
+                        .gap(px(6.))
+                        .items_center()
+                        .cursor_pointer()
+                        .rounded(px(3.))
+                        .hover(move |s| s.bg(menu_hover).border_l_2().border_color(menu_accent))
+                        .active(move |s| s.bg(menu_active))
+                        .on_click(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                            let event = event.clone();
+                            weak.update(cx, |this: &mut GraphView, cx| {
+                                this.context_menu = None;
+                                cx.emit(event);
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .child(
+                            Icon::new(item.icon)
+                                .size(IconSize::XSmall)
+                                .color(icon_color),
+                        )
+                        .child(
+                            Label::new(rgitui_i18n::translate(item.label))
+                                .size(LabelSize::XSmall)
+                                .color(label_color),
+                        ),
                 );
-                container = container.child(menu);
             }
+
+            let menu = menu.with_animation(
+                "graph-context-menu-entrance",
+                Animation::new(Duration::from_millis(100)).with_easing(|t| 1.0 - (1.0 - t).powi(5)),
+                |el, delta| el.opacity(delta),
+            );
+            container = container.child(menu);
         }
 
         if let Some(details) = self.ref_details.clone() {
@@ -4444,6 +4521,8 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
     // the row would otherwise read identically to a worktree whose branch simply
     // failed to load.
     let branch_name = branch_name.filter(|branch| !branch.is_empty());
+    let menu_branch_name = branch_name.clone();
+    let menu_worktree_name = worktree_name.clone();
     let worktree_label = SharedString::from(worktree_name);
     let branch_label = branch_name
         .clone()
@@ -4506,6 +4585,18 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
         })
         .active(move |s| s.bg(row_active_bg))
         .tooltip(Tooltip::text(enter_tooltip))
+        .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+            view.update(cx, |this, cx| {
+                this.context_menu = Some(ContextMenuState {
+                    commit_index: None,
+                    branch_name: menu_branch_name.clone(),
+                    worktree_name: Some(menu_worktree_name.clone()),
+                    position: event.position,
+                });
+                cx.notify();
+            })
+            .ok();
+        })
         .on_click(
             move |_event: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 view_click
@@ -5149,6 +5240,91 @@ mod tests {
     }
 
     use menu_items_for_selection as menu_items;
+
+    fn copy_menu(
+        commit_index: Option<usize>,
+        branch: Option<&str>,
+        worktree: Option<&str>,
+    ) -> ContextMenuState {
+        ContextMenuState {
+            commit_index,
+            branch_name: branch.map(str::to_owned),
+            worktree_name: worktree.map(str::to_owned),
+            position: point(px(0.), px(0.)),
+        }
+    }
+
+    #[test]
+    fn name_copy_actions_follow_the_context_row() {
+        let actions = |menu: &ContextMenuState| {
+            menu_items_for_context(3, menu)
+                .into_iter()
+                .map(|item| item.action)
+                .collect::<Vec<_>>()
+        };
+        let worktree = copy_menu(None, Some("feature/full-name"), Some("checkout"));
+        assert_eq!(
+            actions(&worktree),
+            vec![
+                GraphMenuAction::CopyBranchName,
+                GraphMenuAction::CopyWorktreeName
+            ]
+        );
+        assert_eq!(
+            actions(&copy_menu(None, None, Some("detached"))),
+            vec![GraphMenuAction::CopyWorktreeName]
+        );
+        let commit = actions(&copy_menu(Some(0), None, None));
+        assert!(commit.contains(&GraphMenuAction::CopySha));
+        assert!(!commit.contains(&GraphMenuAction::CopyBranchName));
+        assert!(!commit.contains(&GraphMenuAction::CopyWorktreeName));
+        assert_eq!(
+            context_menu_height(&menu_items_for_context(0, &worktree)),
+            2.0 * CONTEXT_MENU_ITEM_HEIGHT + CONTEXT_MENU_VERTICAL_PADDING
+        );
+        match GraphView::menu_event(GraphMenuAction::CopyBranchName, None, &worktree) {
+            Some(GraphViewEvent::CopyRefName(name)) => assert_eq!(name, "feature/full-name"),
+            other => panic!("unexpected copy event: {other:?}"),
+        }
+        assert!(GraphView::menu_event(GraphMenuAction::Checkout, None, &worktree).is_none());
+    }
+
+    #[test]
+    fn copy_names_prefer_the_displayed_local_branch_and_preserve_full_names() {
+        let branch = "feature/a-very-long-branch-name".to_string();
+        let checkouts = HashMap::from([(
+            branch.clone(),
+            BranchCheckout {
+                name: "checkout-name".into(),
+                path: PathBuf::from("/repo/checkout-name"),
+                is_current: true,
+            },
+        )]);
+        let refs = vec![
+            RefLabel::RemoteBranch(format!("origin/{branch}")),
+            RefLabel::LocalBranch("other".into()),
+            RefLabel::LocalBranch(branch.clone()),
+            RefLabel::Head,
+        ];
+        assert_eq!(
+            context_copy_names(&refs, &checkouts),
+            (Some(branch), Some("checkout-name".into()))
+        );
+        assert_eq!(
+            context_copy_names(
+                &[RefLabel::Tag("v1".into()), RefLabel::Head],
+                &HashMap::new()
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            context_copy_names(
+                &[RefLabel::RemoteBranch("origin/remote-only".into())],
+                &HashMap::new()
+            ),
+            (Some("origin/remote-only".into()), None)
+        );
+    }
 
     #[test]
     fn squash_is_offered_only_once_two_commits_are_selected() {
