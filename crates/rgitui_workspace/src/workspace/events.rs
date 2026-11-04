@@ -13,7 +13,7 @@ use rgitui_git::{
     RebaseEntryAction, RebasePlanEntry, Signature,
 };
 use rgitui_graph::{GraphView, GraphViewEvent, WorktreeGraphInfo};
-use rgitui_i18n::{msg, Message};
+use rgitui_i18n::{msg, t, Message};
 
 use crate::{
     cache::LruCache, BisectView, BisectViewEvent, BlameView, BlameViewEvent, BranchDialog,
