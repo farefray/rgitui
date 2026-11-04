@@ -869,6 +869,7 @@ english_messages! {
     "sidebar.checkout_tag.tooltip" => "Checkout tag",
     "sidebar.conflict_resolver.tooltip" => "Open conflict resolver",
     "sidebar.copy_branch.tooltip" => "Copy branch name",
+    "sidebar.copy_worktree_path" => "Copy worktree path",
     "sidebar.current_tag" => "(viewing)",
     "sidebar.delete_branch.tooltip" => "Delete branch",
     "sidebar.delete_tag.tooltip" => "Delete tag",

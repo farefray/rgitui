@@ -21,8 +21,9 @@ use rgitui_i18n::{key, t};
 use rgitui_settings::{Compactness, SettingsState};
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
 use rgitui_ui::{
-    Badge, Button, ButtonSize, ButtonStyle, CheckState, Checkbox, DiffStat, IconButton, IconName,
-    Label, LabelSize, Scrollbar, TextInput, TextInputEvent, Tooltip,
+    Badge, Button, ButtonSize, ButtonStyle, CheckState, Checkbox, ContextMenu, ContextMenuItem,
+    DiffStat, IconButton, IconName, Label, LabelSize, Scrollbar, TextInput, TextInputEvent,
+    Tooltip,
 };
 
 use crate::keymap;
@@ -268,6 +269,33 @@ fn section_list_row(items: &[SidebarItem], index: usize) -> Option<(SidebarSecti
             SidebarItem::SectionHeader(section) => Some((*section, index - header_index - 1)),
             _ => None,
         })
+}
+
+/// Capture the clicked row's values, not its index: a refresh can reorder rows
+/// while the menu is open. Copying must never switch the inspected checkout.
+#[derive(Debug, Clone, PartialEq)]
+struct CopyContextMenuState {
+    branch: Option<String>,
+    worktree_path: Option<String>,
+    position: Point<Pixels>,
+}
+
+impl CopyContextMenuState {
+    fn for_branch(name: String, position: Point<Pixels>) -> Self {
+        Self {
+            branch: Some(name),
+            worktree_path: None,
+            position,
+        }
+    }
+
+    fn for_worktree(worktree: &WorktreeInfo, position: Point<Pixels>) -> Self {
+        Self {
+            branch: worktree.branch.clone().filter(|_| !worktree.head_detached),
+            worktree_path: Some(rgitui_git::display_path(&worktree.path)),
+            position,
+        }
+    }
 }
 
 /// State for the right-click stash context menu.
@@ -558,6 +586,8 @@ pub struct Sidebar {
     my_branches_active: bool,
     /// Current user email for "My Branches" filtering.
     current_user_email: Option<String>,
+    /// Right-click copy actions for branches and worktrees.
+    copy_context_menu: Option<CopyContextMenuState>,
     /// Right-click context menu for stashes.
     stash_context_menu: Option<StashContextMenuState>,
     /// Cached bounds of the sidebar panel container (updated via on_allocate).
@@ -728,6 +758,7 @@ impl Sidebar {
             hovered_popover_trigger: None,
             my_branches_active: false,
             current_user_email: None,
+            copy_context_menu: None,
             stash_context_menu: None,
             container_bounds: Bounds::new(Point::new(px(0.), px(0.)), Size::new(px(0.), px(0.))),
             local_branches_scroll: UniformListScrollHandle::new(),
@@ -741,6 +772,73 @@ impl Sidebar {
         }
     }
 
+    fn show_copy_context_menu(
+        &mut self,
+        menu: CopyContextMenuState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stash_context_menu = None;
+        self.open_popover = None;
+        self.copy_context_menu = Some(menu);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn render_copy_context_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let state = self.copy_context_menu.as_ref()?;
+        let mut menu = ContextMenu::new().item(
+            ContextMenuItem::new(t!("sidebar.copy_branch.tooltip"))
+                .disabled(state.branch.is_none())
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(menu) = this.copy_context_menu.take() {
+                        if let Some(branch) = menu.branch {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(branch));
+                        }
+                        cx.notify();
+                    }
+                })),
+        );
+        if state.worktree_path.is_some() {
+            menu = menu.item(
+                ContextMenuItem::new(t!("sidebar.copy_worktree_path")).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(menu) = this.copy_context_menu.take() {
+                            if let Some(path) = menu.worktree_path {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+                            }
+                            cx.notify();
+                        }
+                    },
+                )),
+            );
+        }
+        Some(
+            deferred(
+                anchored()
+                    .position(state.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .id("sidebar-copy-context-menu")
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                if this.copy_context_menu.take().is_some() {
+                                    cx.notify();
+                                }
+                            }))
+                            .child(menu),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Show the stash context menu at the given window-relative position.
     fn show_stash_context_menu(
         &mut self,
@@ -748,6 +846,8 @@ impl Sidebar {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        self.copy_context_menu = None;
+        self.open_popover = None;
         self.stash_context_menu = Some(StashContextMenuState {
             stash_index,
             position,
@@ -792,6 +892,8 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.copy_context_menu = None;
+        self.stash_context_menu = None;
         if self.open_popover == Some(popover) {
             self.open_popover = None;
         } else {
@@ -1028,7 +1130,10 @@ impl Sidebar {
         let last = self.cached_nav_items.len().saturating_sub(1);
         match cmd {
             CommandId::Cancel => {
-                if self.open_popover.take().is_some() {
+                let copy_menu = self.copy_context_menu.take();
+                let stash_menu = self.stash_context_menu.take();
+                let popover = self.open_popover.take();
+                if copy_menu.is_some() || stash_menu.is_some() || popover.is_some() {
                     cx.notify();
                 } else {
                     cx.propagate();
@@ -2435,6 +2540,8 @@ impl Render for Sidebar {
 
                         let w_click = w.clone();
                         let branch_name_for_click = name.clone();
+                        let w_menu = w.clone();
+                        let branch_name_for_menu = name.clone();
 
                         let mut item = div()
                             .id(ElementId::NamedInteger("local-branch".into(), i as u64))
@@ -2465,6 +2572,16 @@ impl Render for Sidebar {
                                         cx.emit(SidebarEvent::BranchSelected(branch_name_for_click.to_string()));
                                     });
                                 }
+                            })
+                            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                cx.stop_propagation();
+                                let _ = w_menu.update(cx, |this, cx| {
+                                    this.show_copy_context_menu(
+                                        CopyContextMenuState::for_branch(branch_name_for_menu.to_string(), event.position),
+                                        window,
+                                        cx,
+                                    );
+                                });
                             });
 
                         if is_head {
@@ -3088,6 +3205,8 @@ impl Render for Sidebar {
                             let name: SharedString = branch.name.clone().into();
                             let remote_branch_name = name.clone();
                             let w_item = w.clone();
+                            let w_menu = w.clone();
+                            let branch_name_for_menu = name.clone();
 
                             div()
                                 .id(ElementId::NamedInteger("remote-branch".into(), i as u64))
@@ -3122,6 +3241,19 @@ impl Render for Sidebar {
                                         }
                                     },
                                 )
+                                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = w_menu.update(cx, |this, cx| {
+                                        this.show_copy_context_menu(
+                                            CopyContextMenuState::for_branch(
+                                                branch_name_for_menu.to_string(),
+                                                event.position,
+                                            ),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                })
                                 .child(
                                     div()
                                         .w(px(14.))
@@ -3799,6 +3931,8 @@ impl Render for Sidebar {
                                 });
                                 let w_sel = w.clone();
                                 let w_rm = w.clone();
+                                let w_menu = w.clone();
+                                let worktree_menu = CopyContextMenuState::for_worktree(worktree, Point::default());
 
                                 div()
                                     .id(ElementId::NamedInteger(
@@ -3833,6 +3967,16 @@ impl Render for Sidebar {
                                         let _ = w_sel.clone().update(cx, |this: &mut Sidebar, cx| {
                                             this.selected_worktree = Some(worktree_index);
                                             cx.emit(SidebarEvent::WorktreeSelected(worktree_index));
+                                        });
+                                    })
+                                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = w_menu.update(cx, |this, cx| {
+                                            this.show_copy_context_menu(
+                                                CopyContextMenuState { position: event.position, ..worktree_menu.clone() },
+                                                window,
+                                                cx,
+                                            );
                                         });
                                     })
                                     .child(
@@ -4645,6 +4789,9 @@ impl Render for Sidebar {
             .child(content);
 
         let mut panel = panel.child(scroll_div);
+        if let Some(menu) = self.render_copy_context_menu(cx) {
+            panel = panel.child(menu);
+        }
 
         if let Some(ref menu_state) = self.stash_context_menu {
             let menu_bg = colors.elevated_surface_background;
@@ -5564,7 +5711,7 @@ mod tests {
 
     // --- filter_local_branch_indices tests ---
 
-    fn make_branch(name: &str) -> BranchInfo {
+    pub(super) fn make_branch(name: &str) -> BranchInfo {
         BranchInfo {
             name: name.to_string(),
             is_head: false,
@@ -5766,16 +5913,17 @@ mod tests {
 mod popover_view_tests {
     use gpui::prelude::*;
     use gpui::{div, point, px, Context, Entity, MouseButton, Render, Window};
-    use rgitui_git::{FileChangeKind, FileStatus};
+    use rgitui_git::{BranchInfo, FileChangeKind, FileStatus, RepoState, WorktreeInfo};
     use rgitui_test_support::ViewTest;
 
-    use super::{ChangeList, Sidebar, SidebarPopover};
+    use super::{ChangeList, Sidebar, SidebarEvent, SidebarItem, SidebarPopover, SidebarSection};
 
     const SIDEBAR_WIDTH: f32 = 400.0;
 
     /// The sidebar beside an empty panel standing in for the commit graph.
     struct Host {
         sidebar: Entity<Sidebar>,
+        events: Vec<SidebarEvent>,
     }
 
     impl Host {
@@ -5792,7 +5940,14 @@ mod popover_view_tests {
                 };
                 sidebar.update_status(vec![file.clone()], vec![file], cx);
             });
-            Self { sidebar }
+            cx.subscribe(&sidebar, |host, _, event: &SidebarEvent, _| {
+                host.events.push(event.clone());
+            })
+            .detach();
+            Self {
+                sidebar,
+                events: Vec::new(),
+            }
         }
     }
 
@@ -5853,6 +6008,197 @@ mod popover_view_tests {
         host.simulate_click(point(px(40.), px(900.)), MouseButton::Left);
 
         assert_eq!(open_popover(&host), None);
+    }
+
+    fn worktree(name: &str, branch: Option<&str>, is_current: bool) -> WorktreeInfo {
+        WorktreeInfo {
+            name: name.into(),
+            path: std::env::temp_dir().join("repo with spaces").join(name),
+            is_locked: false,
+            is_current,
+            branch: branch.map(str::to_owned),
+            head_detached: branch.is_none(),
+            head_oid: None,
+            head_unborn: false,
+            status: None,
+            state: RepoState::Clean,
+        }
+    }
+
+    fn copy_menu_host() -> ViewTest<Host> {
+        let mut host = ViewTest::open(Host::new);
+        host.update(|host, _, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "escape",
+                crate::keymap::actions::Cancel,
+                None,
+            )]);
+            host.sidebar.update(cx, |sidebar, cx| {
+                sidebar.expanded_sections = vec![
+                    SidebarSection::LocalBranches,
+                    SidebarSection::RemoteBranches,
+                    SidebarSection::Worktrees,
+                ];
+                sidebar.update_branches(
+                    vec![
+                        BranchInfo {
+                            is_head: true,
+                            ..super::tests::make_branch("main")
+                        },
+                        BranchInfo {
+                            is_remote: true,
+                            ..super::tests::make_branch("origin/feature/full-branch-name")
+                        },
+                    ],
+                    cx,
+                );
+                sidebar.update_worktrees(
+                    vec![
+                        worktree("main", Some("main"), true),
+                        worktree("linked", Some("feature/full-branch-name"), false),
+                        worktree("detached", None, false),
+                    ],
+                    cx,
+                );
+            });
+        });
+        host.draw();
+        host
+    }
+
+    fn right_click_row(host: &mut ViewTest<Host>, item: SidebarItem) -> gpui::Point<gpui::Pixels> {
+        let position = host.read(|host, cx| {
+            let sidebar = host.sidebar.read(cx);
+            let index = sidebar
+                .cached_nav_items
+                .iter()
+                .position(|row| *row == item)
+                .unwrap();
+            let density = cx
+                .global::<rgitui_settings::SettingsState>()
+                .settings()
+                .compactness;
+            // A previous menu can cover later rows; click to its left to
+            // exercise retargeting via an outside right-click.
+            let x = if sidebar.copy_context_menu.is_some() {
+                16.
+            } else {
+                40.
+            };
+            point(
+                px(x),
+                px(density.spacing(32.) + (index as f32 + 0.5) * density.spacing(24.)),
+            )
+        });
+        host.simulate_click(position, MouseButton::Right);
+        host.draw();
+        assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_some()));
+        assert!(host.read(|host, _| host.events.is_empty()));
+        position
+    }
+
+    fn clipboard(host: &ViewTest<Host>) -> Option<String> {
+        host.read(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+    }
+
+    #[test]
+    fn right_click_copies_local_and_remote_branch_names_without_selecting() {
+        let mut host = copy_menu_host();
+        for (row, expected) in [
+            (SidebarItem::LocalBranch(0), "main"),
+            (
+                SidebarItem::RemoteBranch(0),
+                "origin/feature/full-branch-name",
+            ),
+        ] {
+            let position = right_click_row(&mut host, row);
+            host.simulate_click(position + point(px(20.), px(18.)), MouseButton::Left);
+            assert_eq!(clipboard(&host).as_deref(), Some(expected));
+            assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_none()));
+            assert!(host.read(|host, _| host.events.is_empty()));
+        }
+    }
+
+    #[test]
+    fn worktree_menu_copies_full_branch_and_path_without_switching_checkout() {
+        let mut host = copy_menu_host();
+        for index in [0, 1] {
+            let position = right_click_row(&mut host, SidebarItem::Worktree(index));
+            let expected_branch =
+                host.read(|host, cx| host.sidebar.read(cx).worktrees[index].branch.clone());
+            host.simulate_click(position + point(px(20.), px(18.)), MouseButton::Left);
+            assert_eq!(clipboard(&host), expected_branch);
+
+            let position = right_click_row(&mut host, SidebarItem::Worktree(index));
+            let expected_path = host.read(|host, cx| {
+                rgitui_git::display_path(&host.sidebar.read(cx).worktrees[index].path)
+            });
+            host.simulate_click(position + point(px(20.), px(46.)), MouseButton::Left);
+            assert_eq!(clipboard(&host).as_deref(), Some(expected_path.as_str()));
+            assert!(host.read(|host, cx| host.sidebar.read(cx).selected_worktree.is_none()));
+            assert!(host.read(|host, _| host.events.is_empty()));
+        }
+    }
+
+    #[test]
+    fn detached_worktree_disables_branch_copy_but_keeps_path_copy() {
+        let mut host = copy_menu_host();
+        host.update(|_, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()))
+        });
+        let position = right_click_row(&mut host, SidebarItem::Worktree(2));
+        assert!(host.read(|host, cx| host
+            .sidebar
+            .read(cx)
+            .copy_context_menu
+            .as_ref()
+            .unwrap()
+            .branch
+            .is_none()));
+        host.simulate_click(position + point(px(20.), px(18.)), MouseButton::Left);
+        assert_eq!(clipboard(&host).as_deref(), Some("unchanged"));
+        assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_some()));
+        host.simulate_click(position + point(px(20.), px(46.)), MouseButton::Left);
+        assert!(clipboard(&host).unwrap().ends_with("detached"));
+        assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_none()));
+    }
+
+    #[test]
+    fn copy_menu_keeps_clicked_values_across_a_refresh() {
+        let mut host = copy_menu_host();
+        let position = right_click_row(&mut host, SidebarItem::Worktree(1));
+        let expected = host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.clone());
+        host.update(|host, _, cx| {
+            host.sidebar.update(cx, |sidebar, cx| {
+                sidebar.update_worktrees(vec![worktree("different", Some("other"), true)], cx);
+            });
+        });
+        host.draw();
+        host.simulate_click(position + point(px(20.), px(46.)), MouseButton::Left);
+        assert_eq!(clipboard(&host), expected.unwrap().worktree_path);
+    }
+
+    #[test]
+    fn copy_menu_closes_outside_and_on_escape_and_retargets_on_right_click() {
+        let mut host = copy_menu_host();
+        right_click_row(&mut host, SidebarItem::Worktree(0));
+        right_click_row(&mut host, SidebarItem::Worktree(2));
+        assert!(host.read(|host, cx| host
+            .sidebar
+            .read(cx)
+            .copy_context_menu
+            .as_ref()
+            .unwrap()
+            .worktree_path
+            .as_ref()
+            .unwrap()
+            .ends_with("detached")));
+        host.simulate_click(point(px(SIDEBAR_WIDTH + 300.), px(300.)), MouseButton::Left);
+        assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_none()));
+
+        right_click_row(&mut host, SidebarItem::Worktree(1));
+        host.simulate_keystroke("escape");
+        assert!(host.read(|host, cx| host.sidebar.read(cx).copy_context_menu.is_none()));
     }
 
     #[test]
