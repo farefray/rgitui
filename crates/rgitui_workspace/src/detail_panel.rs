@@ -574,6 +574,16 @@ fn flatten_tree(
     }
 }
 
+/// All directory keys, including compacted paths, for the collapse-all action.
+fn tree_directory_keys(rows: &[CachedTreeRow]) -> HashSet<String> {
+    rows.iter()
+        .filter_map(|row| match &row.kind {
+            CachedTreeRowKind::Dir { key } => Some(key.to_string()),
+            CachedTreeRowKind::File(_) => None,
+        })
+        .collect()
+}
+
 /// Indices of `rows` visible given the set of collapsed directory keys. A
 /// collapsed directory hides every row deeper than it until the next row at or
 /// above its depth; a single threshold suffices because an outer collapse
@@ -1051,6 +1061,20 @@ impl DetailPanel {
         }
         self.remember_working_collapses();
         self.rebuild_working_rows();
+        self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn set_commit_directories_collapsed(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        self.collapsed_dirs = if collapse {
+            self.cached_file_tree
+                .as_ref()
+                .map(|cached| tree_directory_keys(&cached.tree_rows))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        self.rebuild_visible_tree_rows();
         self.file_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
@@ -2641,23 +2665,72 @@ impl Render for DetailPanel {
             }
             content = content.child(header);
 
-            // Show search hint when not searching and there are files
-            if !is_searching && total_file_count > 0 {
+            // Keep view controls beside the files, not just in the panel toolbar.
+            if total_file_count > 0 {
+                let tree_mode = self.file_view_mode == FileViewMode::Tree;
+                let any_collapsed = !self.collapsed_dirs.is_empty();
                 content = content.child(
                     div()
                         .h_flex()
                         .w_full()
                         .flex_shrink_0()
-                        .h(px(22.))
+                        .min_h(px(28.))
                         .px_2()
-                        .items_center()
                         .gap_1()
+                        .child(div().flex_1().min_w_0().when(!is_searching, |el| {
+                            el.child(
+                                Label::new(t!("detail.search_files_hint"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder)
+                                    .truncate(),
+                            )
+                        }))
+                        .when(tree_mode, |el| {
+                            el.child(
+                                Button::new(
+                                    "commit-expand-toggle",
+                                    if any_collapsed {
+                                        t!("detail.expand_all")
+                                    } else {
+                                        t!("detail.collapse_all")
+                                    },
+                                )
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .disabled(is_searching)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_commit_directories_collapsed(!any_collapsed, cx);
+                                    },
+                                )),
+                            )
+                        })
                         .child(
-                            Label::new(t!("detail.search_files_hint"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
+                            Button::new("commit-path-view", t!("detail.path_view"))
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .selected(!tree_mode)
+                                .disabled(is_searching)
+                                .tooltip(t!("detail.switch_to_flat.tooltip"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.file_view_mode != FileViewMode::Flat {
+                                        this.request_file_view_mode_toggle(cx);
+                                    }
+                                })),
                         )
-                        .child(div().flex_1()),
+                        .child(
+                            Button::new("commit-tree-view", t!("detail.tree_view"))
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .selected(tree_mode)
+                                .disabled(is_searching)
+                                .tooltip(t!("detail.switch_to_tree.tooltip"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.file_view_mode != FileViewMode::Tree {
+                                        this.request_file_view_mode_toggle(cx);
+                                    }
+                                })),
+                        ),
                 );
             }
 
@@ -3564,6 +3637,55 @@ mod tests {
         collapsed.insert("src".to_string());
         let visible = visible_tree_row_indices(&cached.tree_rows, &collapsed);
         assert_eq!(tree_labels(&cached, &visible), vec!["src", "README.md"]);
+    }
+
+    #[test]
+    fn commit_tree_collapse_all_and_expand_all() {
+        let files = vec![
+            make_file_diff("src/main.rs", FileChangeKind::Modified),
+            make_file_diff("src/nested/lib.rs", FileChangeKind::Added),
+            make_file_diff("docs/guide.md", FileChangeKind::Deleted),
+            make_file_diff("README.md", FileChangeKind::Modified),
+        ];
+        let cached = build_cached_file_tree(&files);
+        let mut collapsed = tree_directory_keys(&cached.tree_rows);
+        assert_eq!(
+            collapsed,
+            HashSet::from(["src".into(), "src/nested".into(), "docs".into()])
+        );
+        let visible = visible_tree_row_indices(&cached.tree_rows, &collapsed);
+        assert_eq!(
+            tree_labels(&cached, &visible),
+            vec!["docs", "src", "README.md"]
+        );
+
+        // Search still reveals matching leaves beneath collapsed folders.
+        let matches = HashSet::from([1]);
+        let searched = searched_tree_row_indices(&cached.tree_rows, &matches);
+        assert_eq!(
+            tree_labels(&cached, &searched),
+            vec!["src", "nested", "lib.rs"]
+        );
+        assert_eq!(collapsed.len(), 3);
+
+        collapsed.clear();
+        let expanded = visible_tree_row_indices(&cached.tree_rows, &collapsed);
+        assert_eq!(expanded, (0..cached.tree_rows.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn commit_tree_directory_keys_handle_compacted_and_root_only_paths() {
+        let compacted = build_cached_file_tree(&[make_file_diff(
+            "one/two/three/file.rs",
+            FileChangeKind::Added,
+        )]);
+        assert_eq!(
+            tree_directory_keys(&compacted.tree_rows),
+            HashSet::from(["one/two/three".into()])
+        );
+        let root_only = build_cached_file_tree(&[make_file_diff("file.rs", FileChangeKind::Added)]);
+        assert!(tree_directory_keys(&root_only.tree_rows).is_empty());
+        assert!(tree_directory_keys(&[]).is_empty());
     }
 
     #[test]
