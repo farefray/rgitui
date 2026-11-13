@@ -50,7 +50,7 @@ struct StatusCache<'a>(&'a GitProject);
 
 impl HeapSize for StatusCache<'_> {
     fn heap_size(&self, census: &mut Census) -> usize {
-        match self.0.worktree_status_cache.lock() {
+        match self.0.refresh_caches.worktree_status.lock() {
             Ok(cache) => cache.heap_size(census),
             // A poisoned lock means a background refresh panicked. Reporting
             // zero would be a lie, but so would blocking a measurement on it;
@@ -62,7 +62,8 @@ impl HeapSize for StatusCache<'_> {
 
     fn heap_count(&self) -> Option<usize> {
         self.0
-            .worktree_status_cache
+            .refresh_caches
+            .worktree_status
             .lock()
             .ok()
             .map(|cache| cache.len())
@@ -150,7 +151,7 @@ mod tests {
         let mut project = project();
         project.tags = vec![TagInfo {
             name: LONG_NAME.to_string(),
-            oid: git2::Oid::zero(),
+            oid: git2::Oid::ZERO_SHA1,
             message: None,
         }];
 
@@ -168,7 +169,7 @@ mod tests {
     #[test]
     fn the_status_cache_reports_the_worktrees_it_holds_status_for() {
         let project = project();
-        if let Ok(mut cache) = project.worktree_status_cache.lock() {
+        if let Ok(mut cache) = project.refresh_caches.worktree_status.lock() {
             cache.insert(
                 PathBuf::from("/repos/rgitui/worktrees/feature"),
                 (7, WorkingTreeStatus::default()),
@@ -187,7 +188,7 @@ mod tests {
     fn a_snapshot_reached_twice_is_charged_to_the_first_path_only() {
         let mut project = project();
         project.recent_commits = Arc::new(vec![CommitInfo {
-            oid: git2::Oid::zero(),
+            oid: git2::Oid::ZERO_SHA1,
             short_id: "abc1234".to_string(),
             summary: LONG_NAME.to_string(),
             message: LONG_NAME.to_string(),

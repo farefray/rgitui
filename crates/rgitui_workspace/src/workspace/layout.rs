@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
     canvas, div, px, App, ClickEvent, Context, CursorStyle, DragMoveEvent, ElementId, MouseButton,
-    MouseDownEvent, Render, SharedString, Window,
+    MouseDownEvent, Render, SharedString, StyleRefinement, Window,
 };
 use rgitui_i18n::{t, tp};
 use rgitui_theme::{ActiveTheme, Color, StyledExt};
@@ -698,6 +698,10 @@ impl Render for Workspace {
             let expanded = expandable && self.operations.failure_details_expanded;
             let full_details = details.clone().filter(|_| expanded);
             let details = details.filter(|_| !expanded);
+            let offers_autostash = update
+                .pull
+                .is_some_and(|pull| pull.blocked_by_local_changes);
+            let retry_target = self.operations.last_failed_git_operation_target.clone();
 
             let header = div()
                 .h_flex()
@@ -738,19 +742,47 @@ impl Render for Workspace {
                             )
                         }),
                 )
+                // A pull stopped by uncommitted changes fails the same way
+                // however often it is retried, so the card leads with the one
+                // retry that gets past them.
                 .when_some(
-                    self.operations
-                        .last_failed_git_operation_target
-                        .clone()
-                        .filter(|_| update.retryable),
+                    retry_target.clone().filter(|_| offers_autostash),
+                    |el, retry_target| {
+                        let retry_update = update.clone();
+                        el.child(
+                            Button::new("operation-pull-autostash", t!("common.pull_autostash"))
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                                    this.retry_git_operation(
+                                        &retry_update,
+                                        &retry_target,
+                                        true,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    },
+                )
+                .when_some(
+                    retry_target.filter(|_| update.retryable),
                     |el, retry_target| {
                         let retry_update = update.clone();
                         el.child(
                             Button::new("operation-retry", t!("common.retry"))
                                 .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Filled)
+                                .style(if offers_autostash {
+                                    ButtonStyle::Outlined
+                                } else {
+                                    ButtonStyle::Filled
+                                })
                                 .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                                    this.retry_git_operation(&retry_update, &retry_target, cx);
+                                    this.retry_git_operation(
+                                        &retry_update,
+                                        &retry_target,
+                                        false,
+                                        cx,
+                                    );
                                 })),
                         )
                     },
@@ -1102,7 +1134,7 @@ impl Render for Workspace {
                             .when(sidebar_focused, |el| {
                                 el.border_t_2().border_color(focus_accent)
                             })
-                            .child(active_tab.sidebar.clone())
+                            .child(active_tab.sidebar.clone().cached(fill_container()))
                             // Resize handle straddles the right border
                             .child(
                                 div()
@@ -1193,7 +1225,7 @@ impl Render for Workspace {
                                         .when(graph_focused, |el| {
                                             el.border_t_2().border_color(focus_accent)
                                         })
-                                        .child(active_tab.graph.clone()),
+                                        .child(active_tab.graph.clone().cached(fill_container())),
                                 )
                                 .when(!graph_focused_layout, |el| el.child(
                                     div()
@@ -1495,7 +1527,12 @@ impl Render for Workspace {
                                     })
                                     .child(tab_bar)
                                     .when(bottom_panel_mode == BottomPanelMode::Diff, |el| {
-                                        el.child(active_tab.diff_viewer.clone())
+                                        el.child(
+                                            active_tab
+                                                .diff_viewer
+                                                .clone()
+                                                .cached(fill_rest_of_column()),
+                                        )
                                     })
                                     .when(bottom_panel_mode == BottomPanelMode::Blame, |el| {
                                         el.child(active_tab.blame_view.clone())
@@ -1795,7 +1832,14 @@ impl Render for Workspace {
                                     })
                                     .when(
                                         active_tab.right_panel_mode == RightPanelMode::Details,
-                                        |el| el.child(active_tab.detail_panel.clone()),
+                                        |el| {
+                                            el.child(
+                                                active_tab
+                                                    .detail_panel
+                                                    .clone()
+                                                    .cached(fill_container()),
+                                            )
+                                        },
                                     )
                                     .when(
                                         active_tab.right_panel_mode == RightPanelMode::Issues,
@@ -1851,7 +1895,7 @@ impl Render for Workspace {
                                     div()
                                         .h(px(commit_input_height))
                                         .flex_shrink_0()
-                                        .child(active_tab.commit_panel.clone()),
+                                        .child(active_tab.commit_panel.clone().cached(fill_container())),
                                 )
                             })
                             // Width resize handle on left edge
@@ -3366,4 +3410,26 @@ mod head_display_name_tests {
     fn nothing_known_still_says_detached() {
         assert_eq!(head_display_name(None, None), "detached");
     }
+}
+
+// The main panels are embedded as cached views: gpui reuses a panel's last
+// layout and paint until that panel is notified, so a hover or selection in one
+// panel no longer re-renders, re-lays-out and re-paints every other. Without
+// it, every frame rebuilt the whole window and taffy's layout pass alone was
+// around a third of the main thread's frame time.
+//
+// A cached view is laid out from the style given here rather than measured
+// from its contents, so each one sits in a container that already decides its
+// size. Panels must `cx.notify()` whenever what they render changes, which
+// gpui then propagates; globals they read are covered by
+// `Workspace::_appearance_subscriptions`.
+
+/// A panel filling the container the workspace sized for it.
+fn fill_container() -> StyleRefinement {
+    StyleRefinement::default().size_full()
+}
+
+/// A panel taking the rest of a column below a header.
+fn fill_rest_of_column() -> StyleRefinement {
+    StyleRefinement::default().flex_1().min_h_0().w_full()
 }

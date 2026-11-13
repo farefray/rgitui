@@ -1,6 +1,6 @@
 [package]
 name = "rgitui_settings"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 
@@ -16,4 +16,4 @@ dirs.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 log.workspace = true
-keyring = { version = "3.6.2", default-features = false, features = ["linux-native", "apple-native", "windows-native"] }
+keyring = "4.2.0"

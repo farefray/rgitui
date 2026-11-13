@@ -119,7 +119,7 @@ impl PreviewSide {
         };
         let mut rgba = decoded.into_rgba8();
         // GPUI's renderer expects BGRA, not the decoder's RGBA.
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         Self::Ready {

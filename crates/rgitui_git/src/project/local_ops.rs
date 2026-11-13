@@ -11,6 +11,9 @@ use rgitui_settings::current_git_auth_runtime;
 use crate::types::*;
 
 use super::auth::inject_https_credentials;
+use super::autostash::{
+    keep_pending_autostash, pending_autostash, restore_autostash, AutostashRestore,
+};
 use super::refresh::{gather_refresh_data, gather_refresh_data_lightweight_cached};
 use super::worktree_patch::{clean_worktree_bytes, smudge_canonical_bytes};
 use super::{ensure_clean_worktree, head_branch_name, GitProject, GitProjectEvent, RefreshData};
@@ -103,8 +106,125 @@ fn run_continue_subcommand(worktree_path: &Path, subcommand: &str) -> Result<Str
     Ok(summary)
 }
 
+/// Run `git rebase --abort` in `worktree_path`.
+///
+/// libgit2 cannot abort a rebase the git CLI started — it refuses to open one
+/// that has a todo list, which is every rebase git has run since it moved to
+/// the sequencer. Git puts the branch back on the commit it started from and
+/// reapplies its own autostash.
+fn run_rebase_abort(worktree_path: &Path) -> Result<()> {
+    let output = super::git_command()
+        .current_dir(worktree_path)
+        .args(["rebase", "--abort"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("Failed to execute git rebase --abort")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!("git rebase --abort failed: {}", detail);
+    }
+    Ok(())
+}
+
+/// Abort the merge, rebase, cherry-pick or revert stopped in `worktree_path`,
+/// putting the index and working tree back as the operation found them.
+///
+/// If git stashed uncommitted changes before the operation started (see
+/// [`super::autostash`]), they are reapplied and the result is returned. The
+/// stash was taken from the commit the abort goes back to, so that leaves the
+/// tree exactly as it was before the operation.
+pub(super) fn abort_in_progress_operation(
+    worktree_path: &Path,
+) -> Result<Option<AutostashRestore>> {
+    let repo = Repository::open(worktree_path)?;
+    // Read before anything is cleaned up: aborting a rebase deletes the
+    // directory git recorded the stash in.
+    let autostash = pending_autostash(&repo);
+
+    if matches!(
+        repo.state(),
+        git2::RepositoryState::Rebase
+            | git2::RepositoryState::RebaseInteractive
+            | git2::RepositoryState::RebaseMerge
+    ) {
+        // Mid-rebase, HEAD is detached on whichever commit the rebase had
+        // reached. Resetting to it, as the other operations below do, would
+        // leave it there with the branch nowhere in sight, so the rebase is
+        // handed back to git, which also reapplies its own autostash.
+        drop(repo);
+        run_rebase_abort(worktree_path)?;
+        let repo = Repository::open(worktree_path)?;
+        let conflicted = repo.index()?.has_conflicts();
+        return Ok(autostash.map(|_| {
+            if conflicted {
+                AutostashRestore::Conflicted
+            } else {
+                AutostashRestore::Applied
+            }
+        }));
+    }
+
+    let head = repo.head()?.peel_to_commit()?;
+    repo.reset(
+        head.as_object(),
+        git2::ResetType::Hard,
+        Some(git2::build::CheckoutBuilder::new().force()),
+    )?;
+    repo.cleanup_state()?;
+
+    Ok(autostash.map(|pending| restore_autostash(worktree_path, &pending)))
+}
+
+/// Carry the operation stopped in `worktree_path` forward, returning a one-line
+/// summary and, when git had stashed uncommitted changes before the operation,
+/// how reapplying them went.
+pub(super) fn continue_in_progress_operation(
+    worktree_path: &Path,
+) -> Result<(String, Option<AutostashRestore>)> {
+    let repo = Repository::open(worktree_path)?;
+    let state = RepoState::from_git2(repo.state());
+
+    if repo.index()?.has_conflicts() {
+        return Err(error(msg!("git.error.unresolved_conflicts")));
+    }
+
+    match state.continue_subcommand() {
+        Some("merge") => {
+            // libgit2 commits the merge, so giving back what git stashed
+            // before it falls to us as well.
+            let pending = pending_autostash(&repo);
+            let summary = finish_merge_commit(&repo)?;
+            drop(repo);
+            let autostash = pending.map(|pending| restore_autostash(worktree_path, &pending));
+            Ok((summary, autostash))
+        }
+        Some(subcommand) => {
+            drop(repo);
+            let summary = run_continue_subcommand(worktree_path, subcommand)?;
+            // Git reapplies its own autostash when it finishes the operation.
+            // It still exits successfully when that conflicts, leaving
+            // unmerged entries behind a finished operation as the only sign.
+            let repo = Repository::open(worktree_path)?;
+            let autostash = (repo.state() == git2::RepositoryState::Clean
+                && repo.index()?.has_conflicts())
+            .then_some(AutostashRestore::Conflicted);
+            Ok((summary, autostash))
+        }
+        None => Err(error(msg!(
+            "git.error.nothing_to_continue",
+            operation = state.operation()
+        ))),
+    }
+}
+
 /// Renders up to three paths inline, summarising the rest, for error messages.
-fn format_path_list(paths: &[String]) -> Message {
+pub(super) fn format_path_list(paths: &[String]) -> Message {
     const SHOWN: usize = 3;
     let shown = paths.len().min(SHOWN);
     let list = paths[..shown].join(", ");
@@ -317,7 +437,7 @@ fn is_registered_worktree(repo_path: &Path, worktree_path: &Path) -> Result<bool
     let names = repo.worktrees()?;
     Ok(names
         .iter()
-        .flatten()
+        .filter_map(|name| name.ok().flatten())
         .filter_map(|name| repo.find_worktree(name).ok())
         .any(|worktree| super::refresh::worktree_identity(worktree.path()) == wanted))
 }
@@ -438,7 +558,7 @@ impl GitProject {
         let task_paths = paths.clone();
         let worktree_path = worktree_path.to_path_buf();
         let refresh_repo_path = self.repo_path.clone();
-        let worktree_cache = self.worktree_status_cache.clone();
+        let worktree_cache = self.refresh_caches.clone();
         let author_filter = self.commit_author_filter.clone();
         let commit_limit = self.commit_limit;
         let branch_name = self.head_branch.clone();
@@ -487,7 +607,12 @@ impl GitProject {
                     match result {
                         Ok(data) => {
                             this.apply_refresh_data(data);
-                            this.refresh_ahead_behind(cx);
+                            // Changing the index or worktree moves no ref, so the carried
+                            // ahead/behind and merged flags still hold; walk history only
+                            // if something left them unknown.
+                            if this.needs_graph_state_refresh() {
+                                this.refresh_ahead_behind(cx);
+                            }
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Stage,
@@ -531,7 +656,7 @@ impl GitProject {
         let task_paths = paths.clone();
         let worktree_path = worktree_path.to_path_buf();
         let refresh_repo_path = self.repo_path.clone();
-        let worktree_cache = self.worktree_status_cache.clone();
+        let worktree_cache = self.refresh_caches.clone();
         let author_filter = self.commit_author_filter.clone();
         let commit_limit = self.commit_limit;
         let branch_name = self.head_branch.clone();
@@ -566,7 +691,12 @@ impl GitProject {
                     match result {
                         Ok(data) => {
                             this.apply_refresh_data(data);
-                            this.refresh_ahead_behind(cx);
+                            // Changing the index or worktree moves no ref, so the carried
+                            // ahead/behind and merged flags still hold; walk history only
+                            // if something left them unknown.
+                            if this.needs_graph_state_refresh() {
+                                this.refresh_ahead_behind(cx);
+                            }
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Unstage,
@@ -607,7 +737,7 @@ impl GitProject {
         log::info!("stage_all");
         let worktree_path = worktree_path.to_path_buf();
         let refresh_repo_path = self.repo_path.clone();
-        let worktree_cache = self.worktree_status_cache.clone();
+        let worktree_cache = self.refresh_caches.clone();
         let author_filter = self.commit_author_filter.clone();
         let commit_limit = self.commit_limit;
         let branch_name = self.head_branch.clone();
@@ -659,7 +789,12 @@ impl GitProject {
                     match result {
                         Ok(data) => {
                             this.apply_refresh_data(data);
-                            this.refresh_ahead_behind(cx);
+                            // Changing the index or worktree moves no ref, so the carried
+                            // ahead/behind and merged flags still hold; walk history only
+                            // if something left them unknown.
+                            if this.needs_graph_state_refresh() {
+                                this.refresh_ahead_behind(cx);
+                            }
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Stage,
@@ -696,7 +831,7 @@ impl GitProject {
         log::info!("unstage_all");
         let worktree_path = worktree_path.to_path_buf();
         let refresh_repo_path = self.repo_path.clone();
-        let worktree_cache = self.worktree_status_cache.clone();
+        let worktree_cache = self.refresh_caches.clone();
         let author_filter = self.commit_author_filter.clone();
         let commit_limit = self.commit_limit;
         let branch_name = self.head_branch.clone();
@@ -714,6 +849,7 @@ impl GitProject {
                     let repo = Repository::open(&worktree_path)?;
                     if let Ok(head) = repo.head() {
                         let obj = head.peel(git2::ObjectType::Any)?;
+                        keep_pending_autostash(&repo, &worktree_path)?;
                         repo.reset(&obj, git2::ResetType::Mixed, None)?;
                     }
                     gather_refresh_data_lightweight_cached(
@@ -730,7 +866,12 @@ impl GitProject {
                     match result {
                         Ok(data) => {
                             this.apply_refresh_data(data);
-                            this.refresh_ahead_behind(cx);
+                            // Changing the index or worktree moves no ref, so the carried
+                            // ahead/behind and merged flags still hold; walk history only
+                            // if something left them unknown.
+                            if this.needs_graph_state_refresh() {
+                                this.refresh_ahead_behind(cx);
+                            }
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Unstage,
@@ -787,7 +928,7 @@ impl GitProject {
             cx,
         );
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result: anyhow::Result<(git2::Oid, RefreshData)> = cx
+            let result: anyhow::Result<(git2::Oid, Option<AutostashRestore>, RefreshData)> = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repository::open(&worktree_path)?;
@@ -931,19 +1072,24 @@ impl GitProject {
                     };
 
                     // Clear MERGE_HEAD/MERGE_MSG so the repository leaves the
-                    // 'Merging' state once the merge commit has been created.
-                    if finalizing_merge {
+                    // 'Merging' state once the merge commit has been created,
+                    // then give back whatever git stashed before the merge.
+                    let autostash = if finalizing_merge {
+                        let pending = pending_autostash(&repo);
                         repo.cleanup_state()?;
-                    }
+                        pending.map(|pending| restore_autostash(&worktree_path, &pending))
+                    } else {
+                        None
+                    };
 
                     let data = gather_refresh_data(&refresh_repo_path, commit_limit)?;
-                    Ok((oid, data))
+                    Ok((oid, autostash, data))
                 })
                 .await;
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| match result {
-                    Ok((oid, data)) => {
+                    Ok((oid, autostash, data)) => {
                         this.apply_refresh_data(data);
                         this.complete_op(
                             operation_id,
@@ -960,6 +1106,9 @@ impl GitProject {
                             ),
                             cx,
                         );
+                        if let Some(restore) = autostash {
+                            this.report_autostash_restore(restore, branch_name.clone(), cx);
+                        }
                         cx.emit(GitProjectEvent::RepositoryChanged);
                         cx.notify();
                         Ok(oid)
@@ -1944,7 +2093,7 @@ impl GitProject {
         );
         let worktree_path = worktree_path.to_path_buf();
         let refresh_repo_path = self.repo_path.clone();
-        let worktree_cache = self.worktree_status_cache.clone();
+        let worktree_cache = self.refresh_caches.clone();
         let author_filter = self.commit_author_filter.clone();
         let commit_limit = self.commit_limit;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -1997,7 +2146,12 @@ impl GitProject {
                     match result {
                         Ok(data) => {
                             this.apply_refresh_data(data);
-                            this.refresh_ahead_behind(cx);
+                            // Changing the index or worktree moves no ref, so the carried
+                            // ahead/behind and merged flags still hold; walk history only
+                            // if something left them unknown.
+                            if this.needs_graph_state_refresh() {
+                                this.refresh_ahead_behind(cx);
+                            }
                             this.complete_op(
                                 operation_id,
                                 GitOperationKind::Discard,
@@ -2150,6 +2304,7 @@ impl GitProject {
                 .spawn(async move {
                     let repo = Repository::open(&worktree_path)?;
                     let head_commit = repo.head()?.peel_to_commit()?;
+                    keep_pending_autostash(&repo, &worktree_path)?;
                     repo.reset(head_commit.as_object(), git2::ResetType::Hard, None)?;
                     gather_refresh_data(&repo_path, commit_limit)
                 })
@@ -2221,6 +2376,7 @@ impl GitProject {
                 .spawn(async move {
                     let repo = Repository::open(&worktree_path)?;
                     let commit = repo.find_commit(oid)?;
+                    keep_pending_autostash(&repo, &worktree_path)?;
                     repo.reset(commit.as_object(), git2::ResetType::Hard, None)?;
                     gather_refresh_data(&repo_path, commit_limit)
                 })
@@ -2361,6 +2517,7 @@ impl GitProject {
                 .spawn(async move {
                     let repo = Repository::open(&worktree_path)?;
                     let commit = repo.find_commit(oid)?;
+                    keep_pending_autostash(&repo, &worktree_path)?;
                     repo.reset(commit.as_object(), git2::ResetType::Mixed, None)?;
                     gather_refresh_data(&repo_path, commit_limit)
                 })
@@ -2433,7 +2590,7 @@ impl GitProject {
                     let repo = Repository::open(&worktree_path)?;
                     ensure_clean_worktree(&repo, GitOperationKind::Revert.name())?;
                     let commit = repo.find_commit(oid)?;
-                    let summary = commit.summary().unwrap_or("").to_string();
+                    let summary = commit.summary().ok().flatten().unwrap_or("").to_string();
                     let mut opts = git2::RevertOptions::new();
                     repo.revert(&commit, Some(&mut opts))?;
                     let has_conflicts = repo.index()?.has_conflicts();
@@ -2523,7 +2680,7 @@ impl GitProject {
                     let repo = Repository::open(&worktree_path)?;
                     ensure_clean_worktree(&repo, GitOperationKind::CherryPick.name())?;
                     let commit = repo.find_commit(oid)?;
-                    let summary = commit.summary().unwrap_or("").to_string();
+                    let summary = commit.summary().ok().flatten().unwrap_or("").to_string();
                     let mut opts = git2::CherrypickOptions::new();
                     repo.cherrypick(&commit, Some(&mut opts))?;
                     let has_conflicts = repo.index()?.has_conflicts();
@@ -2607,34 +2764,19 @@ impl GitProject {
             cx,
         );
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result: anyhow::Result<RefreshData> = cx
+            let result: anyhow::Result<(Option<AutostashRestore>, RefreshData)> = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = Repository::open(&worktree_path)?;
-
-                    if repo.state() == git2::RepositoryState::Rebase
-                        || repo.state() == git2::RepositoryState::RebaseInteractive
-                        || repo.state() == git2::RepositoryState::RebaseMerge
-                    {
-                        if let Ok(mut rebase) = repo.open_rebase(None) {
-                            let _ = rebase.abort();
-                        }
-                    }
-                    let head = repo.head()?.peel_to_commit()?;
-                    repo.reset(
-                        head.as_object(),
-                        git2::ResetType::Hard,
-                        Some(git2::build::CheckoutBuilder::new().force()),
-                    )?;
-                    repo.cleanup_state()?;
-                    gather_refresh_data(&repo_path, commit_limit)
+                    let autostash = abort_in_progress_operation(&worktree_path)?;
+                    let data = gather_refresh_data(&repo_path, commit_limit)?;
+                    Ok((autostash, data))
                 })
                 .await;
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
                     match result {
-                        Ok(data) => {
+                        Ok((autostash, data)) => {
                             this.apply_refresh_data(data);
                             this.complete_op(
                                 operation_id,
@@ -2643,6 +2785,9 @@ impl GitProject {
                                 (Some(msg!("git.abort.detail")), None, branch_name.clone()),
                                 cx,
                             );
+                            if let Some(restore) = autostash {
+                                this.report_autostash_restore(restore, branch_name.clone(), cx);
+                            }
                             cx.emit(GitProjectEvent::RepositoryChanged);
                         }
                         Err(e) => {
@@ -2695,41 +2840,19 @@ impl GitProject {
             cx,
         );
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result: anyhow::Result<(String, RefreshData)> = cx
+            let result: anyhow::Result<(String, Option<AutostashRestore>, RefreshData)> = cx
                 .background_executor()
                 .spawn(async move {
-                    let repo = Repository::open(&worktree_path)?;
-                    let state = RepoState::from_git2(repo.state());
-
-                    let index = repo.index()?;
-                    if index.has_conflicts() {
-                        return Err(error(msg!("git.error.unresolved_conflicts")));
-                    }
-                    drop(index);
-
-                    let summary = match state.continue_subcommand() {
-                        Some("merge") => finish_merge_commit(&repo)?,
-                        Some(subcommand) => {
-                            drop(repo);
-                            run_continue_subcommand(&worktree_path, subcommand)?
-                        }
-                        None => {
-                            return Err(error(msg!(
-                                "git.error.nothing_to_continue",
-                                operation = state.operation()
-                            )));
-                        }
-                    };
-
+                    let (summary, autostash) = continue_in_progress_operation(&worktree_path)?;
                     let data = gather_refresh_data(&repo_path, commit_limit)?;
-                    Ok((summary, data))
+                    Ok((summary, autostash, data))
                 })
                 .await;
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
                     match result {
-                        Ok((summary, data)) => {
+                        Ok((summary, autostash, data)) => {
                             this.apply_refresh_data(data);
                             this.complete_op(
                                 operation_id,
@@ -2738,6 +2861,9 @@ impl GitProject {
                                 (Some(Message::verbatim(summary)), None, branch_name.clone()),
                                 cx,
                             );
+                            if let Some(restore) = autostash {
+                                this.report_autostash_restore(restore, branch_name.clone(), cx);
+                            }
                             cx.emit(GitProjectEvent::RepositoryChanged);
                         }
                         Err(e) => {
@@ -3952,7 +4078,7 @@ fn write_conflict_index_resolution(
     let git_path = file_path.as_os_str().as_encoded_bytes().to_vec();
 
     let mut input = Vec::new();
-    write!(input, "0 {}\t", git2::Oid::zero())?;
+    write!(input, "0 {}\t", git2::Oid::ZERO_SHA1)?;
     input.extend_from_slice(&git_path);
     input.push(0);
     if let Some((mode, oid)) = resolved {
@@ -7293,7 +7419,7 @@ mod tests {
         let repo = git2::Repository::open(path).unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         let head = repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(head.summary(), Some("feature change"));
+        assert_eq!(head.summary().unwrap(), Some("feature change"));
     }
 
     #[test]
@@ -7532,7 +7658,7 @@ mod tests {
         // Get stash OID using a separate repo instance for stash_foreach
         let stash_oid = {
             let mut r = git2::Repository::open(path).unwrap();
-            let mut found = git2::Oid::zero();
+            let mut found = git2::Oid::ZERO_SHA1;
             r.stash_foreach(|_i, _msg, oid| {
                 found = *oid;
                 false
@@ -7925,7 +8051,10 @@ mod tests {
         repo.tag_lightweight("v2.0.0", &obj, false).unwrap();
 
         let tag_names = repo.tag_names(None).unwrap();
-        let tags: Vec<_> = tag_names.iter().flatten().collect();
+        let tags: Vec<_> = tag_names
+            .iter()
+            .filter_map(|name| name.ok().flatten())
+            .collect();
         assert!(tags.contains(&"v1.0.0"));
         assert!(tags.contains(&"v1.0.1"));
         assert!(tags.contains(&"v2.0.0"));
@@ -8191,7 +8320,7 @@ mod tests {
 
     fn assert_owner_checkout_untouched(fixture: &TempRepo, base: git2::Oid) {
         let repo = git2::Repository::open(fixture.path()).unwrap();
-        assert_eq!(repo.head().unwrap().shorthand(), Some("main"));
+        assert_eq!(repo.head().unwrap().shorthand().ok(), Some("main"));
         assert_eq!(repo.head().unwrap().target(), Some(base));
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         assert_eq!(
@@ -8355,7 +8484,7 @@ mod tests {
         let (fixture, checkout, base, target) = nested_checkout_fixture();
         super::checkout_branch_in_worktree(&checkout, "incoming").unwrap();
         let repo = git2::Repository::open(&checkout).unwrap();
-        assert_eq!(repo.head().unwrap().shorthand(), Some("incoming"));
+        assert_eq!(repo.head().unwrap().shorthand().ok(), Some("incoming"));
         assert_nested_checkout_target(&checkout, target);
         assert_owner_checkout_untouched(&fixture, base);
     }
@@ -8373,7 +8502,7 @@ mod tests {
             .unwrap();
         super::checkout_branch_in_worktree(&checkout, "origin/remote-topic").unwrap();
         let repo = git2::Repository::open(&checkout).unwrap();
-        assert_eq!(repo.head().unwrap().shorthand(), Some("remote-topic"));
+        assert_eq!(repo.head().unwrap().shorthand().ok(), Some("remote-topic"));
         let branch = repo
             .find_branch("remote-topic", git2::BranchType::Local)
             .unwrap();
@@ -8426,7 +8555,7 @@ mod tests {
         let (_, conflict) = super::merge_branch_in_worktree(&checkout, "incoming").unwrap();
         assert!(!conflict);
         let repo = git2::Repository::open(&checkout).unwrap();
-        assert_eq!(repo.head().unwrap().shorthand(), Some("inspected"));
+        assert_eq!(repo.head().unwrap().shorthand().ok(), Some("inspected"));
         assert_nested_checkout_target(&checkout, target);
         assert_owner_checkout_untouched(&fixture, base);
     }
@@ -8463,7 +8592,7 @@ mod tests {
         assert!(super::checkout_tag_in_worktree(&checkout, "release").is_err());
         assert!(super::merge_branch_in_worktree(&checkout, "incoming").is_err());
         let repo = git2::Repository::open(&checkout).unwrap();
-        assert_eq!(repo.head().unwrap().shorthand(), Some("inspected"));
+        assert_eq!(repo.head().unwrap().shorthand().ok(), Some("inspected"));
         assert_eq!(repo.head().unwrap().target(), Some(base));
         assert_eq!(
             fs::read(checkout.join("file.txt")).unwrap(),
@@ -8557,7 +8686,7 @@ mod tests {
 
         assert_ne!(new_oid, head);
         let new_commit = repo.find_commit(new_oid).unwrap();
-        assert_eq!(new_commit.summary().unwrap(), "add file.txt");
+        assert_eq!(new_commit.summary().unwrap(), Some("add file.txt"));
     }
 
     #[test]
@@ -8598,7 +8727,7 @@ mod tests {
         let amended = repo
             .find_commit(repo.head().unwrap().target().unwrap())
             .unwrap();
-        assert_eq!(amended.summary().unwrap(), "updated message");
+        assert_eq!(amended.summary().unwrap(), Some("updated message"));
     }
 
     #[test]

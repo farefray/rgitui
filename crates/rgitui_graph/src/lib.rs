@@ -1,5 +1,6 @@
 #[cfg(feature = "perf")]
 mod heap_size;
+mod paint;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -9,10 +10,11 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, img, point, px, uniform_list, Animation, AnimationExt, App, Bounds, ClickEvent,
-    Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle, ListSizingBehavior,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, Render,
-    ScrollHandle, ScrollStrategy, SharedString, Size, UniformListScrollHandle, WeakEntity, Window,
+    canvas, div, img, point, px, uniform_list, Animation, AnimationExt, App, BorderStyle, Bounds,
+    ClickEvent, Context, CursorStyle, ElementId, Entity, EventEmitter, FocusHandle,
+    ListSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathBuilder,
+    Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, Size,
+    UniformListScrollHandle, WeakEntity, Window,
 };
 use rgitui_git::{
     compact_ref_labels, compute_graph, CommitInfo, FileChangeKind, GraphEdge, GraphRow, RefLabel,
@@ -519,64 +521,6 @@ fn menu_items_for_context(
             _ => menu.commit_index.is_some(),
         })
         .collect()
-}
-
-/// Pre-computed unit circle vertex offsets (cos, sin) for 36-step circles.
-/// Computed once and reused across all frames to avoid per-frame trig calls.
-fn unit_circle_offsets() -> &'static [(f32, f32)] {
-    use std::sync::OnceLock;
-    static OFFSETS: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
-    OFFSETS.get_or_init(|| {
-        let steps = 36_usize;
-        (0..=steps)
-            .map(|s| {
-                let angle = (s as f32) * std::f32::consts::TAU / (steps as f32);
-                (angle.cos(), angle.sin())
-            })
-            .collect()
-    })
-}
-
-/// Build a filled circle path from pre-computed unit circle offsets.
-fn build_filled_circle(cx_x: Pixels, cy_y: Pixels, radius: f32) -> Option<gpui::Path<Pixels>> {
-    let offsets = unit_circle_offsets();
-    let mut path = PathBuilder::fill();
-    for (i, &(cos, sin)) in offsets.iter().enumerate() {
-        // Skip the last (duplicate of first, only needed for stroke closure)
-        if i >= 36 {
-            break;
-        }
-        let x = cx_x + px(radius * cos);
-        let y = cy_y + px(radius * sin);
-        if i == 0 {
-            path.move_to(point(x, y));
-        } else {
-            path.line_to(point(x, y));
-        }
-    }
-    path.close();
-    path.build().ok()
-}
-
-/// Build a stroked circle path from pre-computed unit circle offsets.
-fn build_stroked_circle(
-    cx_x: Pixels,
-    cy_y: Pixels,
-    radius: f32,
-    stroke_width: Pixels,
-) -> Option<gpui::Path<Pixels>> {
-    let offsets = unit_circle_offsets();
-    let mut path = PathBuilder::stroke(stroke_width);
-    for (i, &(cos, sin)) in offsets.iter().enumerate() {
-        let x = cx_x + px(radius * cos);
-        let y = cy_y + px(radius * sin);
-        if i == 0 {
-            path.move_to(point(x, y));
-        } else {
-            path.line_to(point(x, y));
-        }
-    }
-    path.build().ok()
 }
 
 /// Pre-computed quarter-circle arc offsets (sin, 1-cos) for 12-segment arcs.
@@ -1392,8 +1336,9 @@ impl GraphView {
     }
 
     /// Mark that all available commits have been loaded (disables "load more").
-    pub fn set_all_loaded(&mut self, loaded: bool) {
+    pub fn set_all_loaded(&mut self, loaded: bool, cx: &mut Context<Self>) {
         self.all_commits_loaded = loaded;
+        cx.notify();
     }
 
     /// Record whether HEAD is detached. Checking out a commit a branch already
@@ -2958,7 +2903,7 @@ impl Render for GraphView {
                                             match commit_click_selection(
                                                 event.click_count(),
                                                 modifiers.shift,
-                                                modifiers.secondary(),
+                                                modifiers.secondary(cx),
                                             ) {
                                                 CommitClickSelection::Inspect => this.select_list_index(i, cx),
                                                 CommitClickSelection::Extend => this.extend_selection_to_list_index(i, cx),
@@ -3245,32 +3190,21 @@ impl Render for GraphView {
                                             // The HEAD commit is haloed so it can be found at a glance.
                                             if is_head_row {
                                                 let glow_r = node_radius + 3.5 * compact_mul;
-                                                if let Some(glow) = build_stroked_circle(cx_x, cy_y, glow_r, px(2.0)) {
-                                                    window.paint_path(glow, gpui::Hsla { a: 0.45, ..node_color });
-                                                }
+                                                paint::paint_ring(window, point(cx_x, cy_y), px(glow_r), px(2.0), gpui::Hsla { a: 0.45, ..node_color }, BorderStyle::Solid);
                                             }
                                             if avatar_node {
                                                 // An opaque disc tinted and ringed with the lane; the
                                                 // photo or initials are laid over it.
-                                                if let Some(disc) = build_filled_circle(cx_x, cy_y, node_radius) {
-                                                    window.paint_path(disc, row_opaque_bg);
-                                                }
-                                                if let Some(tint) = build_filled_circle(cx_x, cy_y, node_radius) {
-                                                    window.paint_path(tint, gpui::Hsla { a: 0.3, ..node_color });
-                                                }
-                                                if let Some(ring) = build_stroked_circle(cx_x, cy_y, node_radius - 1.0, px(2.0)) {
-                                                    window.paint_path(ring, node_color);
-                                                }
+                                                let center = point(cx_x, cy_y);
+                                                paint::paint_disc(window, center, px(node_radius), row_opaque_bg);
+                                                paint::paint_disc(window, center, px(node_radius), gpui::Hsla { a: 0.3, ..node_color });
+                                                paint::paint_ring(window, center, px(node_radius - 1.0), px(2.0), node_color, BorderStyle::Solid);
                                             } else {
-                                                if let Some(dot) = build_filled_circle(cx_x, cy_y, node_radius) {
-                                                    window.paint_path(dot, node_color);
-                                                }
+                                                paint::paint_disc(window, point(cx_x, cy_y), px(node_radius), node_color);
                                                 // Among plain dots a merge needs a ring to stand apart;
                                                 // beside avatars its smaller size already does that.
                                                 if is_merge_commit && !show_avatars {
-                                                    if let Some(ring) = build_stroked_circle(cx_x, cy_y, node_radius + 2.5, px(1.5)) {
-                                                        window.paint_path(ring, gpui::Hsla { a: 0.6, ..node_color });
-                                                    }
+                                                    paint::paint_ring(window, point(cx_x, cy_y), px(node_radius + 2.5), px(1.5), gpui::Hsla { a: 0.6, ..node_color }, BorderStyle::Solid);
                                                 }
                                             }
                                         },
@@ -4780,68 +4714,36 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                                     }
                                 }
 
-                                // Background ring to occlude lines behind the dot
+                                let center = point(cx_x, cy_y);
+                                // Background disc to occlude lines behind the dot
                                 let ring_r = if avatar_nodes { 9.0_f32 } else { 7.0 } * compact_mul;
-                                let steps = 32_usize;
-                                let mut ring = PathBuilder::fill();
-                                for s in 0..steps {
-                                    let angle = (s as f32) * std::f32::consts::TAU / (steps as f32);
-                                    let x = cx_x + px(ring_r * angle.cos());
-                                    let y = cy_y + px(ring_r * angle.sin());
-                                    if s == 0 {
-                                        ring.move_to(point(x, y));
-                                    } else {
-                                        ring.line_to(point(x, y));
-                                    }
-                                }
-                                ring.close();
-                                if let Ok(built_ring) = ring.build() {
-                                    window.paint_path(built_ring, bg);
-                                }
+                                paint::paint_disc(window, center, px(ring_r), bg);
 
-                                // Hollow circle (stroke only, no fill) to distinguish from commits
                                 // Hollow, and as large as the avatars it sits among.
                                 let dot_radius =
                                     if avatar_nodes { 7.0_f32 } else { 5.0 } * compact_mul;
-                                let mut circle = PathBuilder::stroke(px(2.0));
-                                for s in 0..=steps {
-                                    let angle = (s as f32) * std::f32::consts::TAU / (steps as f32);
-                                    let x = cx_x + px(dot_radius * angle.cos());
-                                    let y = cy_y + px(dot_radius * angle.sin());
-                                    if s == 0 {
-                                        circle.move_to(point(x, y));
-                                    } else {
-                                        circle.line_to(point(x, y));
-                                    }
-                                }
-                                if let Ok(built_circle) = circle.build() {
-                                    window.paint_path(built_circle, node_color);
-                                }
+                                paint::paint_ring(
+                                    window,
+                                    center,
+                                    px(dot_radius),
+                                    px(2.0),
+                                    node_color,
+                                    BorderStyle::Solid,
+                                );
 
                                 // Dashed outer ring to further distinguish
                                 let outer_r = dot_radius + 3.0 * compact_mul;
-                                let dash_count = 8_usize;
-                                let arc_per_dash =
-                                    std::f32::consts::TAU / (dash_count as f32 * 2.0);
-                                for d in 0..dash_count {
-                                    let start_angle =
-                                        d as f32 * std::f32::consts::TAU / dash_count as f32;
-                                    let end_angle = start_angle + arc_per_dash;
-                                    let mut dash = PathBuilder::stroke(px(1.5));
-                                    let sx = cx_x + px(outer_r * start_angle.cos());
-                                    let sy = cy_y + px(outer_r * start_angle.sin());
-                                    dash.move_to(point(sx, sy));
-                                    let ex = cx_x + px(outer_r * end_angle.cos());
-                                    let ey = cy_y + px(outer_r * end_angle.sin());
-                                    dash.line_to(point(ex, ey));
-                                    if let Ok(built_dash) = dash.build() {
-                                        let dash_color = gpui::Hsla {
-                                            a: 0.6,
-                                            ..node_color
-                                        };
-                                        window.paint_path(built_dash, dash_color);
-                                    }
-                                }
+                                paint::paint_ring(
+                                    window,
+                                    center,
+                                    px(outer_r),
+                                    px(1.5),
+                                    gpui::Hsla {
+                                        a: 0.6,
+                                        ..node_color
+                                    },
+                                    BorderStyle::Dashed,
+                                );
                             },
                         )
                         .size_full(),

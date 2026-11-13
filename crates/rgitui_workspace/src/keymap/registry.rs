@@ -74,6 +74,8 @@ commands! {
         Fetch "secondary-shift-r" if has_remotes;
         /// Fetch from and integrate with the tracked remote branch.
         Pull unbound if has_remotes;
+        /// Pull, stashing uncommitted changes first and reapplying them after.
+        PullAutostash unbound if has_remotes;
         /// Update the remote ref along with associated objects.
         Push unbound if has_remotes;
         /// Push every open repository.
@@ -786,7 +788,7 @@ mod tests {
         );
         for id in [CommandId::SwitchRepository, CommandId::PreviousRepository] {
             for (keys, _) in id.default_bindings() {
-                assert!(gpui::Keystroke::parse(keys).is_ok());
+                assert!(crate::keymap::parse_keystroke(keys).is_ok());
             }
             assert!(id.in_palette());
         }
@@ -924,7 +926,7 @@ mod tests {
             // A chord always starts with a modifier in this registry.
             return false;
         };
-        let Ok(keystroke) = gpui::Keystroke::parse(single) else {
+        let Ok(keystroke) = crate::keymap::parse_keystroke(single) else {
             return false;
         };
         let modifiers = keystroke.modifiers;

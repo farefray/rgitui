@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-rgitui is a GPU-accelerated **desktop** Git client (not a TUI, despite the name) built on GPUI — Zed's UI framework, pinned to a specific Zed git rev in the root `Cargo.toml`. Rust toolchain is pinned to 1.97.1 via `rust-toolchain.toml`.
+rgitui is a GPU-accelerated **desktop** Git client (not a TUI, despite the name) built on GPUI — Zed's UI framework, pinned to a specific Zed git rev in the root `Cargo.toml`. Rust toolchain is pinned to 1.98.1 via `rust-toolchain.toml`.
 
 ## Commands
 
@@ -42,14 +42,15 @@ Example flow: `GraphView` emits `CommitSelected(oid)` → `subscribe_graph` spaw
 `GitProject` (`src/project/mod.rs`) is the central entity; it caches a repo snapshot (branches, tags, remotes, stashes, worktrees, status, recent commits) and emits `GitProjectEvent` (`StatusChanged`, `HeadChanged`, `RefsChanged`, `OperationUpdated`, ...). Operations are split across `src/project/{local_ops,network,rebase,bisect,blame,file_history,reflog,submodule,search,diff,refresh,auth,watcher}.rs`.
 
 - **git2 vs CLI**: local operations use git2 (libgit2). Network/auth operations (fetch, pull, push) shell out to the `git` CLI via `run_git_network_command` in `src/project/auth.rs`; `search.rs` shells out to `git grep`.
+- **Pull and uncommitted changes**: `run_pull` (`network.rs`) takes a `PullLocalChanges` — let git decide (the default), `--autostash`, or refuse up front — from the `pull_local_changes` setting or the explicit *Pull with AutoStash* command, and reports a refusal caused by uncommitted changes as typed data (`GitOperationUpdate::pull`), which is what makes the failure banner offer the autostash retry. When git autostashes and then stops on a conflict it parks the stash in `MERGE_AUTOSTASH` or `rebase-merge/autostash`, not in the stash list, and only git's own continue/abort reapply it. Any path that concludes or aborts an operation with libgit2 must go through `autostash.rs` (`pending_autostash` before, `restore_autostash` after; `keep_pending_autostash` before a libgit2 reset, which clears that state too) or the user's changes are stranded. Rebases are aborted with `git rebase --abort`; libgit2 cannot open a rebase the CLI started.
 - **Async pattern** (the threading rule for the whole app): never do git2/FS/HTTP work on the UI thread. Ops call `begin_operation(...)` (monotonic id, emits `OperationUpdated`), do the heavy work in `cx.background_executor().spawn(...)` producing a `Send` `RefreshData` snapshot, then apply it on the UI thread inside `this.update(...)` via `apply_refresh_data`, which bumps `refresh_generation` (stale async results are dropped by comparing generations).
-- **File watcher** (`src/project/watcher.rs`): `notify` watcher + a 300ms poll loop fingerprinting `.git` state; on change, debounces 200ms then runs a lightweight cached refresh.
+- **File watcher** (`src/project/watcher.rs`): `notify` watcher + a 300ms poll loop fingerprinting `.git` state; on change, debounces 200ms then runs a lightweight cached refresh. Cached refreshes (the watcher's, and stage/unstage/discard) share `RefreshCaches` (`src/project/refresh.rs`): per-worktree status, and the last commit list, which is handed back without running `git log` while the refs, HEAD, limit and author filter are unchanged. Don't start `git` subprocesses on paths that run per keystroke or per file save; key them on what they depend on, or wait for the input to settle (blame/history prefetch waits 250ms).
 - **Undo**: `UndoStack` in `rgitui_workspace/src/workspace/undo.rs` — pure and unit-tested, 20-entry cap, 60s TTL; each `UndoAction` stamps repo+worktree paths so undo routes to the originating tab.
 
 ### Rendering crates
 
 - `rgitui_diff` (`src/lib.rs`): `DiffViewer` receives a `FileDiff` via `set_diff`; precomputes rows per `DiffDisplayMode` (Unified/SideBySide/ThreeWay) into a virtualized list; LRU display cache; syntect highlighting in a process-wide `OnceLock`, with `similar`-based intra-line word-diff merged on top. Emits stage/unstage hunk/line request events back to the workspace.
-- `rgitui_graph` (`src/lib.rs`): `GraphView` renders lane layout computed in `rgitui_git::compute_graph` (`src/graph.rs`); rows in a `uniform_list`, edges/nodes drawn with `gpui::canvas` + `PathBuilder` using precomputed trig tables.
+- `rgitui_graph` (`src/lib.rs`): `GraphView` renders lane layout computed in `rgitui_git::compute_graph` (`src/graph.rs`); rows in a `uniform_list`, drawn per row with `gpui::canvas`. Straight lanes, dots and rings are quads (`paint_vertical_lane`, `src/paint.rs`); only curves use `PathBuilder`, and nothing a row paints may leave its bounds. Each separate run of paths costs gpui a full-window MSAA render pass, and painting into a neighbouring row chains draw order down the list so runs stop merging — together these made the graph GPU-bound on integrated GPUs.
 
 ### UI, theme, settings, AI
 

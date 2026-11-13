@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(c.cap, 200);
         assert_eq!(c.weight_budget.as_ref().unwrap().limit, 64 * 1024 * 1024);
         assert_eq!(encoded_image_bytes(&diff), 11);
-        c.insert(git2::Oid::zero(), diff);
+        c.insert(git2::Oid::ZERO_SHA1, diff);
         assert_eq!(c.weight_budget.as_ref().unwrap().used, 11);
     }
 

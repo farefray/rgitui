@@ -120,7 +120,7 @@ mod tests {
         WorktreeGraphInfo {
             name: name.to_string(),
             is_current: true,
-            head_oid: Some(git2::Oid::zero()),
+            head_oid: Some(git2::Oid::ZERO_SHA1),
             head_unborn: false,
             staged_count: 1,
             unstaged_count: 2,

@@ -164,6 +164,26 @@ impl FromStr for AutoFetchInterval {
     }
 }
 
+/// What a pull does when tracked files have uncommitted changes.
+///
+/// Untracked files never count: git refuses on its own, naming the file, when
+/// a pull would overwrite one, and neither a stash nor a clean-tree check
+/// covers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PullLocalChanges {
+    /// Run the pull and leave the decision to git, which refuses only when an
+    /// incoming commit touches a file with uncommitted changes. Git's own
+    /// `merge.autoStash` and `rebase.autoStash` settings apply.
+    #[default]
+    GitDecides,
+    /// Pull with `--autostash`: git stashes the changes, integrates the remote
+    /// branch, and reapplies them.
+    Autostash,
+    /// Refuse to pull until the changes are committed, stashed or discarded.
+    RequireClean,
+}
+
 impl Compactness {
     pub fn multiplier(&self) -> f32 {
         match self {
@@ -259,8 +279,15 @@ pub struct AppSettings {
     pub author_column_width: f32,
     #[serde(default = "default_date_column_width")]
     pub date_column_width: f32,
+    /// Widest the commit graph column may grow, in pixels. The column fits the
+    /// lanes on screen up to this width and clips anything further right.
+    #[serde(default = "default_graph_column_max_width")]
+    pub graph_column_max_width: f32,
     #[serde(default)]
     pub auto_fetch_interval: AutoFetchInterval,
+    /// What Pull does when tracked files have uncommitted changes.
+    #[serde(default)]
+    pub pull_local_changes: PullLocalChanges,
     #[serde(default = "default_confirm_destructive")]
     pub confirm_destructive_operations: bool,
     #[serde(default = "default_auto_check_updates")]
@@ -338,6 +365,12 @@ fn default_author_column_width() -> f32 {
 
 fn default_date_column_width() -> f32 {
     100.0
+}
+
+/// Room for twelve lanes, matching the graph column's own sizing: one lane of
+/// slack plus the left padding.
+fn default_graph_column_max_width() -> f32 {
+    270.0
 }
 
 fn default_confirm_destructive() -> bool {
@@ -823,7 +856,9 @@ impl Default for AppSettings {
             show_hash_column: false,
             author_column_width: default_author_column_width(),
             date_column_width: default_date_column_width(),
+            graph_column_max_width: default_graph_column_max_width(),
             auto_fetch_interval: AutoFetchInterval::default(),
+            pull_local_changes: PullLocalChanges::default(),
             confirm_destructive_operations: default_confirm_destructive(),
             auto_check_updates: default_auto_check_updates(),
             last_update_check_at: None,
@@ -1881,6 +1916,31 @@ mod tests {
             let restored: AppSettings =
                 serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
             assert_eq!(restored.show_hash_column, visible);
+        }
+    }
+
+    // ── Pull with uncommitted changes ─────────────────────────────
+
+    /// A settings file written before the choice existed has to load, and to
+    /// the default that leaves the decision with git.
+    #[test]
+    fn settings_without_a_pull_policy_let_git_decide() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("empty settings parse");
+        assert_eq!(settings.pull_local_changes, PullLocalChanges::GitDecides);
+    }
+
+    #[test]
+    fn pull_policy_round_trips_by_its_snake_case_name() {
+        for (policy, name) in [
+            (PullLocalChanges::GitDecides, "\"git_decides\""),
+            (PullLocalChanges::Autostash, "\"autostash\""),
+            (PullLocalChanges::RequireClean, "\"require_clean\""),
+        ] {
+            assert_eq!(serde_json::to_string(&policy).unwrap(), name);
+            assert_eq!(
+                serde_json::from_str::<PullLocalChanges>(name).unwrap(),
+                policy
+            );
         }
     }
 

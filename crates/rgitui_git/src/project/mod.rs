@@ -1,5 +1,6 @@
 mod argsafe;
 mod auth;
+mod autostash;
 mod bisect;
 mod blame;
 #[cfg(feature = "perf")]
@@ -23,12 +24,11 @@ use git2::{Repository, StatusOptions};
 use gpui::{AsyncApp, Context, EventEmitter, Task, WeakEntity};
 use messages::{error, error_message};
 use rgitui_i18n::{msg, Message};
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::types::*;
 
@@ -203,7 +203,7 @@ fn head_branch_name(repo: &Repository) -> Result<String> {
     }
     head.shorthand()
         .map(str::to_string)
-        .ok_or_else(|| error(msg!("git.error.branch_name_unknown")))
+        .map_err(|_| error(msg!("git.error.branch_name_unknown")))
 }
 
 /// Whether the working tree or index carries changes to **tracked** files.
@@ -255,14 +255,17 @@ fn default_remote_name(repo: &Repository) -> Result<String> {
         return Err(error(msg!("git.error.no_remotes")));
     }
 
-    if remote_names.iter().flatten().any(|name| name == "origin") {
+    if remote_names
+        .iter()
+        .filter_map(|name| name.ok().flatten())
+        .any(|name| name == "origin")
+    {
         return Ok("origin".to_string());
     }
 
     let name = remote_names
         .iter()
-        .flatten()
-        .next()
+        .find_map(|name| name.ok().flatten())
         .map(str::to_string)
         .ok_or_else(|| error(msg!("git.error.no_usable_remotes")))?;
     // Read straight out of .git/config, which git does not validate.
@@ -340,7 +343,9 @@ pub struct RefreshData {
     pub stashes: Vec<StashEntry>,
     pub worktrees: Vec<WorktreeInfo>,
     pub status: WorkingTreeStatus,
-    pub recent_commits: Vec<CommitInfo>,
+    /// Shared rather than owned: a refresh that finds the refs unchanged hands
+    /// back the list it loaded last time instead of a copy.
+    pub recent_commits: Arc<Vec<CommitInfo>>,
     /// Whether there are more commits beyond the loaded limit.
     pub has_more_commits: bool,
     /// The remote default branch (e.g. "main", "master"), detected from
@@ -411,9 +416,10 @@ pub struct GitProject {
     commit_author_filter: Option<String>,
     /// Maximum number of commits to load (configurable via settings).
     commit_limit: usize,
-    /// Per-worktree status cache shared between GitProject::refresh() and the watcher loop.
-    /// Keyed by worktree path; value is (fingerprint, cached WorkingTreeStatus).
-    worktree_status_cache: Arc<Mutex<refresh::WorktreeStatusCache>>,
+    /// What refreshes reuse from one to the next, shared between
+    /// `GitProject::refresh()`, the watcher loop and operation refreshes: the
+    /// per-worktree status cache and the last commit list.
+    refresh_caches: Arc<refresh::RefreshCaches>,
     /// Monotonic counter bumped on every `apply_refresh_data`. The watcher uses it
     /// to discard a stale lightweight refresh that would otherwise clobber a newer
     /// full/operation refresh that landed while the watcher's snapshot was in flight.
@@ -477,7 +483,7 @@ impl GitProject {
             current_user_email: None,
             commit_author_filter: None,
             commit_limit: 1000,
-            worktree_status_cache: Arc::new(Mutex::new(HashMap::new())),
+            refresh_caches: Arc::default(),
             refresh_generation: 0,
             commit_query_generation: 0,
             load_more_in_flight: false,
@@ -516,7 +522,7 @@ impl GitProject {
             current_user_email: None,
             commit_author_filter: None,
             commit_limit: refresh::normalize_commit_limit(commit_limit),
-            worktree_status_cache: Arc::new(Mutex::new(HashMap::new())),
+            refresh_caches: Arc::default(),
             refresh_generation: 0,
             commit_query_generation: 0,
             load_more_in_flight: false,
@@ -548,8 +554,7 @@ impl GitProject {
         branch_name: Option<String>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        let id = self.next_operation_id;
-        self.next_operation_id += 1;
+        let id = self.allocate_operation_id();
         cx.emit(GitProjectEvent::OperationUpdated(GitOperationUpdate {
             id,
             kind,
@@ -560,8 +565,17 @@ impl GitProject {
             branch_name,
             worktree_path: None,
             retryable: false,
+            pull: None,
         }));
         cx.notify();
+        id
+    }
+
+    /// The id for an operation that is reported only once it has finished, so
+    /// it never shows as running.
+    pub(crate) fn allocate_operation_id(&mut self) -> u64 {
+        let id = self.next_operation_id;
+        self.next_operation_id += 1;
         id
     }
 
@@ -581,7 +595,7 @@ impl GitProject {
         }
     }
 
-    fn operation_worktree(&self, id: u64) -> Option<PathBuf> {
+    pub(crate) fn operation_worktree(&self, id: u64) -> Option<PathBuf> {
         self.operation_worktrees.get(&id).cloned()
     }
 
@@ -603,6 +617,7 @@ impl GitProject {
             branch_name: names.2,
             worktree_path: self.operation_worktree(id),
             retryable: false,
+            pull: None,
         }));
     }
 
@@ -625,6 +640,7 @@ impl GitProject {
             branch_name: names.1,
             worktree_path: self.operation_worktree(id),
             retryable: names.2,
+            pull: None,
         }));
     }
 
@@ -919,7 +935,7 @@ impl GitProject {
         self.stashes = data.stashes;
         self.worktrees = data.worktrees;
         self.status = Arc::new(data.status);
-        self.recent_commits = Arc::new(data.recent_commits);
+        self.recent_commits = data.recent_commits;
         self.has_more_commits = data.has_more_commits;
         self.default_branch = data.default_branch;
         self.current_user_email = data.current_user_email;

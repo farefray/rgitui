@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     px, AsyncWindowContext, BorrowAppContext as _, Keystroke, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, Point, ScrollDelta, ScrollEvent,
+    ScrollSource, TouchPhase, Window,
 };
 
 use crate::driver::{Condition, Scenario, Settle, Step};
@@ -101,7 +101,8 @@ async fn execute(step: &Step, cx: &mut AsyncWindowContext) -> anyhow::Result<()>
             repeat,
             settle,
         } => {
-            let keystroke = Keystroke::parse(key)
+            let keystroke = cx
+                .update(|_, cx| Keystroke::parse_with_os(key, cx.platform_info().os))?
                 .map_err(|error| anyhow::anyhow!("cannot parse keystroke {key:?}: {error}"))?;
             let mut pacer = Pacer::new(*settle);
             for _ in 0..*repeat {
@@ -124,11 +125,36 @@ async fn execute(step: &Step, cx: &mut AsyncWindowContext) -> anyhow::Result<()>
             for _ in 0..*repeat {
                 cx.update(|window, cx| {
                     window.dispatch_event(
-                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        PlatformInput::Scroll(ScrollEvent {
                             position,
                             delta: ScrollDelta::Pixels(Point::new(px(0.0), px(*delta_y))),
                             modifiers: Modifiers::default(),
                             touch_phase: TouchPhase::Moved,
+                            source: ScrollSource::Pointer,
+                        }),
+                        cx,
+                    );
+                })?;
+                pacer.wait(cx).await;
+            }
+        }
+
+        Step::Hover {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            steps,
+            settle,
+        } => {
+            let mut pacer = Pacer::new(*settle);
+            for (x, y) in crate::driver::hover_path(*from_x, *from_y, *to_x, *to_y, *steps) {
+                cx.update(|window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: Point::new(px(x), px(y)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
                         }),
                         cx,
                     );
@@ -430,17 +456,25 @@ fn dirty_tracked_files(repo_path: &std::path::Path, count: usize) -> anyhow::Res
     let tree = repo.head()?.peel_to_commit()?.tree()?;
 
     let mut paths = Vec::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
         if paths.len() >= count {
             return git2::TreeWalkResult::Abort;
         }
         if entry.kind() == Some(git2::ObjectType::Blob) {
-            if let Some(name) = entry.name() {
+            if let Ok(name) = entry.name() {
                 paths.push(format!("{dir}{name}"));
             }
         }
         git2::TreeWalkResult::Ok
-    })?;
+    });
+    // libgit2 reports a walk the callback stopped as an error (`GIT_EUSER`).
+    // Here that only means enough files were found, so it is a failure only
+    // when it came up short.
+    if let Err(error) = walked {
+        if paths.len() < count {
+            return Err(error.into());
+        }
+    }
 
     let mut touched = 0;
     for path in paths {
@@ -458,4 +492,38 @@ fn dirty_tracked_files(repo_path: &std::path::Path, count: usize) -> anyhow::Res
         }
     }
     Ok(touched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dirty_tracked_files;
+
+    /// A repository with one commit of `files` tracked files.
+    fn repo_with_files(files: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        for n in 0..files {
+            let name = format!("file{n}.txt");
+            std::fs::write(dir.path().join(&name), "line\n").unwrap();
+            index.add_path(std::path::Path::new(&name)).unwrap();
+        }
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("perf", "perf@example.com").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn dirtying_fewer_files_than_the_tree_holds_stops_the_walk_without_failing() {
+        let dir = repo_with_files(5);
+        assert_eq!(dirty_tracked_files(dir.path(), 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn dirtying_more_files_than_the_tree_holds_dirties_all_of_them() {
+        let dir = repo_with_files(2);
+        assert_eq!(dirty_tracked_files(dir.path(), 10).unwrap(), 2);
+    }
 }

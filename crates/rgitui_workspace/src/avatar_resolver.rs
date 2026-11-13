@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures::future::select;
 use futures::future::Either;
 use futures::AsyncReadExt;
-use gpui::{App, AsyncApp};
+use gpui::{App, AsyncApp, ImgResourceLoader, Resource, SharedUri};
 use http_client::HttpClient;
 use rgitui_ui::AvatarCache;
 
@@ -32,20 +32,30 @@ pub fn resolve_avatars(authors: Vec<(String, String)>, cx: &mut App) {
         cx.set_global(AvatarCache::new());
     }
 
-    let to_fetch: Vec<(String, String)> = {
+    let (to_fetch, known_urls): (Vec<(String, String)>, Vec<String>) = {
         let cache = cx.global_mut::<AvatarCache>();
-        authors
+        let mut known_urls = Vec::new();
+        let to_fetch = authors
             .into_iter()
             .filter(|(_name, email)| {
                 if cache.needs_fetch(email) {
                     cache.mark_pending(email);
                     true
                 } else {
+                    if let Some(url) = cache.avatar_url(email) {
+                        known_urls.push(url.to_string());
+                    }
                     false
                 }
             })
-            .collect()
+            .collect();
+        (to_fetch, known_urls)
     };
+
+    // Avatars resolved in an earlier session have a URL but no image yet.
+    for url in known_urls {
+        preload_avatar_image(url, cx);
+    }
 
     log::debug!("resolve_avatars: {} authors need fetch", to_fetch.len());
 
@@ -72,6 +82,7 @@ pub fn resolve_avatars(authors: Vec<(String, String)>, cx: &mut App) {
                         Some(url) => {
                             log::info!("avatar resolved: email={} url={}", email, url);
                             cache.set_resolved(email.clone(), url.clone());
+                            preload_avatar_image(url.clone(), cx);
                         }
                         None => {
                             log::debug!("avatar not found: email={}", email);
@@ -89,6 +100,15 @@ pub fn resolve_avatars(authors: Vec<(String, String)>, cx: &mut App) {
         })
         .detach();
     }
+}
+
+/// Starts loading an avatar's image as soon as its URL is known.
+///
+/// Loaded under the same key `img(url)` uses, so the image is usually ready by
+/// the time a row draws it. A view that draws it while it is still loading is
+/// redrawn by gpui when it lands. A no-op for an image already in the cache.
+fn preload_avatar_image(url: String, cx: &mut App) {
+    cx.fetch_asset::<ImgResourceLoader>(&Resource::Uri(SharedUri::from(url)));
 }
 
 /// Drain resolved `(email, url)` pairs from `rx`, debounce briefly to coalesce
