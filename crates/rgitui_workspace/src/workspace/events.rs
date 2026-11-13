@@ -2605,6 +2605,13 @@ pub(super) fn subscribe_graph(
                         proj.checkout_commit_at(oid, &worktree_path, cx).detach();
                     });
                 }
+                GraphViewEvent::MergeBranch(name) => {
+                    let name = name.clone();
+                    let worktree_path = this.effective_worktree_path(cx);
+                    project.update(cx, |proj, cx| {
+                        proj.merge_branch_at(&name, &worktree_path, cx).detach();
+                    });
+                }
                 GraphViewEvent::CopyRefName(name) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()));
                     this.show_toast(t!("detail.copied"), ToastKind::Success, cx);

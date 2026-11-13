@@ -300,6 +300,22 @@ fn context_copy_names(
     (branch, worktree)
 }
 
+/// The branch "Merge into current branch" offers for a commit: the first
+/// branch in badge order that HEAD is not on. A commit whose only branch is the
+/// current one has nothing to merge, so it gets none.
+fn merge_candidate(
+    refs: &[RefLabel],
+    checkouts: &HashMap<String, BranchCheckout>,
+) -> Option<String> {
+    ref_entries(refs, checkouts)
+        .into_iter()
+        .filter(|entry| !entry.is_head)
+        .find_map(|entry| match entry.label {
+            RefLabel::LocalBranch(name) | RefLabel::RemoteBranch(name) => Some(name),
+            _ => None,
+        })
+}
+
 /// Width of the commit graph context menu.
 const CONTEXT_MENU_WIDTH: f32 = 200.0;
 /// Height of a single context-menu action row (`.h(px(26.))`).
@@ -331,6 +347,7 @@ enum GraphMenuAction {
     CherryPick,
     Revert,
     Checkout,
+    MergeBranch,
     CreateBranch,
     CreateTag,
     BisectGood,
@@ -406,6 +423,13 @@ const GRAPH_MENU_ITEMS: &[GraphMenuItem] = &[
         key!("graph.menu.checkout"),
         IconName::Check,
         GraphMenuAction::Checkout,
+    ),
+    // Only offered when the row carries a branch other than the one checked
+    // out — see `merge_candidate`.
+    GraphMenuItem::new(
+        key!("graph.menu.merge_branch"),
+        IconName::GitMerge,
+        GraphMenuAction::MergeBranch,
     ),
     GraphMenuItem::new(
         key!("graph.menu.create_branch"),
@@ -518,6 +542,7 @@ fn menu_items_for_context(
         .filter(|item| match item.action {
             GraphMenuAction::CopyBranchName => menu.branch_name.is_some(),
             GraphMenuAction::CopyWorktreeName => menu.worktree_name.is_some(),
+            GraphMenuAction::MergeBranch => menu.merge_branch.is_some(),
             _ => menu.commit_index.is_some(),
         })
         .collect()
@@ -554,6 +579,8 @@ pub enum GraphViewEvent {
     CheckoutCommit(git2::Oid),
     CopyCommitSha(String),
     CopyRefName(String),
+    /// Merge this branch into the checked-out branch.
+    MergeBranch(String),
     CopyCommitMessage(String),
     CopyAuthorName(String),
     CopyDate(String),
@@ -657,6 +684,8 @@ struct ContextMenuState {
     /// Raw names captured from the row, never truncated badge text.
     branch_name: Option<String>,
     worktree_name: Option<String>,
+    /// The branch "Merge into current branch" would merge, if any.
+    merge_branch: Option<String>,
     /// Screen position where the menu should appear.
     position: Point<Pixels>,
 }
@@ -1612,6 +1641,9 @@ impl GraphView {
             GraphMenuAction::CopyWorktreeName => {
                 return menu.worktree_name.clone().map(GraphViewEvent::CopyRefName);
             }
+            GraphMenuAction::MergeBranch => {
+                return menu.merge_branch.clone().map(GraphViewEvent::MergeBranch);
+            }
             _ => {}
         }
         let commit = commit?;
@@ -1638,7 +1670,9 @@ impl GraphView {
                 GraphViewEvent::CopyDate(commit.time.format("%Y-%m-%d %H:%M:%S").to_string())
             }
             GraphMenuAction::ViewOnGithub => GraphViewEvent::ViewOnGithub(oid),
-            GraphMenuAction::CopyBranchName | GraphMenuAction::CopyWorktreeName => return None,
+            GraphMenuAction::CopyBranchName
+            | GraphMenuAction::CopyWorktreeName
+            | GraphMenuAction::MergeBranch => return None,
         })
     }
 
@@ -1655,10 +1689,12 @@ impl GraphView {
         };
         let checkouts = branch_checkouts(&self.worktree_infos);
         let (branch_name, worktree_name) = context_copy_names(&commit.refs, &checkouts);
+        let merge_branch = merge_candidate(&commit.refs, &checkouts);
         self.context_menu = Some(ContextMenuState {
             commit_index: Some(index),
             branch_name,
             worktree_name,
+            merge_branch,
             position,
         });
         cx.notify();
@@ -3739,6 +3775,12 @@ impl Render for GraphView {
                 let Some(event) = Self::menu_event(item.action, commit, menu_state) else {
                     continue;
                 };
+                let label = match (&item.action, &menu_state.merge_branch) {
+                    (GraphMenuAction::MergeBranch, Some(branch)) => {
+                        t!("graph.menu.merge_branch", branch = branch)
+                    }
+                    _ => rgitui_i18n::translate(item.label),
+                };
                 let weak = weak.clone();
                 let (icon_color, label_color) = if item.destructive {
                     (Color::Error, Color::Error)
@@ -3775,9 +3817,10 @@ impl Render for GraphView {
                                 .color(icon_color),
                         )
                         .child(
-                            Label::new(rgitui_i18n::translate(item.label))
+                            Label::new(label)
                                 .size(LabelSize::XSmall)
-                                .color(label_color),
+                                .color(label_color)
+                                .truncate(),
                         ),
                 );
             }
@@ -4525,6 +4568,7 @@ fn render_working_tree_row(params: WorkingTreeRowParams) -> gpui::AnyElement {
                     commit_index: None,
                     branch_name: menu_branch_name.clone(),
                     worktree_name: Some(menu_worktree_name.clone()),
+                    merge_branch: None,
                     position: event.position,
                 });
                 cx.notify();
@@ -5152,6 +5196,7 @@ mod tests {
             commit_index,
             branch_name: branch.map(str::to_owned),
             worktree_name: worktree.map(str::to_owned),
+            merge_branch: None,
             position: point(px(0.), px(0.)),
         }
     }
@@ -5189,6 +5234,61 @@ mod tests {
             other => panic!("unexpected copy event: {other:?}"),
         }
         assert!(GraphView::menu_event(GraphMenuAction::Checkout, None, &worktree).is_none());
+    }
+
+    #[test]
+    fn merge_is_offered_for_a_branch_head_is_not_on() {
+        let checkouts = HashMap::from([(
+            "main".to_string(),
+            BranchCheckout {
+                name: "repo".into(),
+                path: PathBuf::from("/repo"),
+                is_current: true,
+            },
+        )]);
+        // HEAD's own branch has nothing to merge.
+        assert_eq!(
+            merge_candidate(
+                &[RefLabel::LocalBranch("main".into()), RefLabel::Head],
+                &checkouts
+            ),
+            None
+        );
+        // Another branch at HEAD's commit is still a candidate.
+        assert_eq!(
+            merge_candidate(
+                &[
+                    RefLabel::LocalBranch("main".into()),
+                    RefLabel::LocalBranch("feature".into()),
+                    RefLabel::Head,
+                ],
+                &checkouts
+            ),
+            Some("feature".into())
+        );
+        assert_eq!(
+            merge_candidate(&[RefLabel::RemoteBranch("origin/topic".into())], &checkouts),
+            Some("origin/topic".into())
+        );
+        assert_eq!(
+            merge_candidate(&[RefLabel::Tag("v1".into())], &checkouts),
+            None
+        );
+
+        let with_merge = ContextMenuState {
+            merge_branch: Some("feature".into()),
+            ..copy_menu(Some(0), Some("feature"), None)
+        };
+        assert!(menu_items_for_context(1, &with_merge)
+            .iter()
+            .any(|item| item.action == GraphMenuAction::MergeBranch));
+        assert!(!menu_items_for_context(1, &copy_menu(Some(0), None, None))
+            .iter()
+            .any(|item| item.action == GraphMenuAction::MergeBranch));
+        match GraphView::menu_event(GraphMenuAction::MergeBranch, None, &with_merge) {
+            Some(GraphViewEvent::MergeBranch(name)) => assert_eq!(name, "feature"),
+            other => panic!("unexpected merge event: {other:?}"),
+        }
     }
 
     #[test]

@@ -277,14 +277,18 @@ fn section_list_row(items: &[SidebarItem], index: usize) -> Option<(SidebarSecti
 struct CopyContextMenuState {
     branch: Option<String>,
     worktree_path: Option<String>,
+    /// Whether the menu offers merging `branch` into the current branch.
+    /// The current branch itself has nothing to merge.
+    mergeable: bool,
     position: Point<Pixels>,
 }
 
 impl CopyContextMenuState {
-    fn for_branch(name: String, position: Point<Pixels>) -> Self {
+    fn for_branch(name: String, is_head: bool, position: Point<Pixels>) -> Self {
         Self {
             branch: Some(name),
             worktree_path: None,
+            mergeable: !is_head,
             position,
         }
     }
@@ -293,8 +297,14 @@ impl CopyContextMenuState {
         Self {
             branch: worktree.branch.clone().filter(|_| !worktree.head_detached),
             worktree_path: Some(rgitui_git::display_path(&worktree.path)),
+            mergeable: false,
             position,
         }
+    }
+
+    /// The branch the menu's merge item merges, if it shows one.
+    fn merge_branch(&self) -> Option<&str> {
+        self.branch.as_deref().filter(|_| self.mergeable)
     }
 }
 
@@ -800,6 +810,21 @@ impl Sidebar {
                     }
                 })),
         );
+        if let Some(branch) = state.merge_branch() {
+            menu = menu.separator().item(
+                ContextMenuItem::new(t!("sidebar.merge_branch.menu", branch = branch)).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(menu) = this.copy_context_menu.take() {
+                            if let Some(branch) = menu.merge_branch() {
+                                cx.emit(SidebarEvent::MergeBranch(branch.to_string()));
+                            }
+                            cx.notify();
+                        }
+                    }),
+                ),
+            );
+        }
         if state.worktree_path.is_some() {
             menu = menu.item(
                 ContextMenuItem::new(t!("sidebar.copy_worktree_path")).on_click(cx.listener(
@@ -2577,7 +2602,11 @@ impl Render for Sidebar {
                                 cx.stop_propagation();
                                 let _ = w_menu.update(cx, |this, cx| {
                                     this.show_copy_context_menu(
-                                        CopyContextMenuState::for_branch(branch_name_for_menu.to_string(), event.position),
+                                        CopyContextMenuState::for_branch(
+                                            branch_name_for_menu.to_string(),
+                                            is_head,
+                                            event.position,
+                                        ),
                                         window,
                                         cx,
                                     );
@@ -3247,6 +3276,7 @@ impl Render for Sidebar {
                                         this.show_copy_context_menu(
                                             CopyContextMenuState::for_branch(
                                                 branch_name_for_menu.to_string(),
+                                                false,
                                                 event.position,
                                             ),
                                             window,
@@ -5189,6 +5219,21 @@ mod tests {
     use super::*;
     use rgitui_git::{BranchInfo, FileChangeKind, FileStatus};
     use std::path::PathBuf;
+
+    #[test]
+    fn branch_menu_offers_merge_for_every_branch_but_the_current_one() {
+        let other = CopyContextMenuState::for_branch("feature".into(), false, Point::default());
+        assert_eq!(other.merge_branch(), Some("feature"));
+        let current = CopyContextMenuState::for_branch("main".into(), true, Point::default());
+        assert_eq!(current.merge_branch(), None);
+        let worktree = CopyContextMenuState {
+            branch: Some("feature".into()),
+            worktree_path: Some("/repo/feature".into()),
+            mergeable: false,
+            position: Point::default(),
+        };
+        assert_eq!(worktree.merge_branch(), None);
+    }
 
     #[test]
     fn viewing_worktree_marker_follows_inspection_not_repository_origin() {
